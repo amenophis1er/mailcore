@@ -1,7 +1,8 @@
 // Google Calendar backend over the REST API, same methods as the Exchange
 // calendar (ews-calendar.js): findCalendars / findEvents / getEvent /
 // createEvent / updateEvent / deleteEvent / respondToEvent / getFreeBusy /
-// selfEmail. Tokens come from google-auth.js (keychain).
+// selfEmail. Access tokens come from the accessToken function the caller
+// passes (google-auth.js builds one over the caller's token store).
 //
 // Ids: event = "<calendarId>/<eventId>" (Google expands recurrences into
 // instances with their own ids, so an occurrence id works for every call);
@@ -11,7 +12,6 @@
 // Ported from Amen's buddi calendar plugin (Apache-2.0) and extended with
 // attendees, invitations, replies and free/busy.
 
-import { accessToken } from './google-auth.js';
 import { localZone, freeBusyRow, eventShape } from './cal-common.js';
 import { zonedTime, addDays, dateIn } from './ical.js';
 
@@ -21,8 +21,10 @@ const enc = encodeURIComponent;
 const RESPONSE = { accepted: 'Accept', tentative: 'Tentative', declined: 'Decline', needsAction: 'NoResponseReceived' };
 
 export class GoogleCalendar {
-  constructor({ account, email = '', timeZone }) {
+  constructor({ account, email = '', timeZone, accessToken }) {
     this.account = account;
+    if (typeof accessToken !== 'function') throw new Error(`account "${account}": Google calendar needs an access token source (credentials.google)`);
+    this.accessToken = accessToken;
     this.self = String(email || '').toLowerCase();
     this.tz = localZone(timeZone);
     this.changeKeyIsId = true;
@@ -34,7 +36,7 @@ export class GoogleCalendar {
   async send({ method, path, query = {}, body, headers = {} }, retry = true) {
     const url = new URL(`${API}${path}`);
     for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-    const token = await accessToken(this.account, { force: !retry });
+    const token = await this.accessToken(this.account, { force: !retry });
     const res = await fetch(url, {
       method, body: body === undefined ? undefined : JSON.stringify(body),
       headers: { authorization: `Bearer ${token}`, accept: 'application/json', ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...headers },
@@ -44,7 +46,7 @@ export class GoogleCalendar {
     const text = await res.text();
     let data = null;
     try { data = text.trim() ? JSON.parse(text) : null; } catch {}
-    if (res.status === 401) { const e = new Error(`Google no longer accepts the sign-in for "${this.account}" — run: mailwatcher google-login ${this.account}`); e.code = 'MAIL_AUTH'; throw e; }
+    if (res.status === 401) { const e = new Error(`Google no longer accepts the sign-in for "${this.account}" — sign in to Google again`); e.code = 'MAIL_AUTH'; throw e; }
     return { status: res.status, etag: res.headers.get('etag') || data?.etag || null, data };
   }
 

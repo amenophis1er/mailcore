@@ -1,4 +1,4 @@
-// Rule matching: same semantics as the old extension — comma/semicolon
+// Rule matching: comma/semicolon
 // separated case-insensitive substrings; senders match name OR address.
 
 export function splitList(value) {
@@ -30,4 +30,16 @@ export function inQuietHours(q) {
   const start = sh * 60 + sm;
   const end = eh * 60 + em;
   return start <= end ? cur >= start && cur < end : cur >= start || cur < end;
+}
+
+/** rule.account (a name, a list, or "a, b") scopes a rule to those accounts; none = every account. */
+export function accountOk(rule, account) {
+  if (!rule.account) return true;
+  const list = Array.isArray(rule.account) ? rule.account : String(rule.account).split(/[,;]/);
+  return list.map((s) => String(s).trim()).includes(account);
+}
+
+/** The first enabled rule that matches `item` of `account`, or null. */
+export function matchRule(rules, item, account) {
+  return (rules || []).find((r) => r && r.enabled !== false && accountOk(r, account) && ruleMatches(r, item)) || null;
 }

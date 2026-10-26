@@ -1,6 +1,6 @@
 // EWS (Exchange Web Services) client over NTLM.
 // Talks SOAP to /EWS/Exchange.asmx — the server advertises NTLM/Negotiate,
-// so every call authenticates with the AD username/password from config.
+// so every call authenticates with the AD username/password it is given.
 
 import httpntlm from 'httpntlm';
 import { XMLParser } from 'fast-xml-parser';
@@ -18,6 +18,11 @@ const parser = new XMLParser({
   processEntities: false
 });
 
+/** Parse an EWS SOAP response the way the client does (exported for tests). */
+export function parseEws(xml) {
+  return parser.parse(xml);
+}
+
 export class EwsClient {
   constructor({ host, username, password, domain = '', email = '' }) {
     this.url = host.replace(/\/$/, '') + '/EWS/Exchange.asmx';
@@ -33,7 +38,7 @@ export class EwsClient {
     const json = await this.post(envelope(`<m:ResolveNames ReturnFullContactData="false"><m:UnresolvedEntry>${esc(this.username)}</m:UnresolvedEntry></m:ResolveNames>`));
     const res = toArray(dig(json, 'Envelope.Body.ResolveNamesResponse.ResponseMessages.ResolveNamesResponseMessage.ResolutionSet.Resolution'))[0];
     this.self = textOf(res?.Mailbox?.EmailAddress).toLowerCase();
-    if (!this.self) throw new Error(`cannot resolve my own address from "${this.username}" — set "email" on the account in config.json`);
+    if (!this.self) throw new Error(`cannot resolve my own address from "${this.username}" — set "email" on the account`);
     return this.self;
   }
 

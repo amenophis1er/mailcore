@@ -9,7 +9,7 @@
 
 import ical from 'node-ical';
 
-export const PRODID = '-//mailwatcher//calendar//EN';
+export const PRODID = '-//mailcore//calendar//EN';
 
 // --- time helpers -------------------------------------------------------------
 

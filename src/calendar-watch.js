@@ -1,32 +1,34 @@
-// Daemon side of the calendar: keeps a snapshot of the next `lookaheadDays`
-// of one Exchange account's default calendar, refreshed on push
-// (ews-stream calendar subscription) and every `pollMinutes`, and
+// Calendar watcher for one account: keeps a snapshot of the next
+// `lookaheadDays` of the default calendar, refreshed on demand (call
+// refresh() on a push, e.g. the EWS stream's calendar notifications) and
+// every `pollMinutes`, and
 //
-//   - emits `calendar` events on the bus when an event is created, updated,
-//     cancelled or deleted (new invitations and cancellations also notify),
-//   - fires `reminder` events `remindMinutes` before each event starts
-//     (desktop notification + sound, quiet hours respected).
+//   - emits 'changes' with the events created, updated, cancelled or deleted
+//     since the last refresh (`loud` marks new invitations from others and
+//     cancellations, the ones worth interrupting someone for),
+//   - emits 'reminder' `remindMinutes` before each event starts.
 //
-// Snapshot: ~/.mailwatcher/calendar-<account>.json — survives restarts so a
-// daemon restart neither re-announces every event nor repeats reminders.
+// Snapshot: a { load(), save() } store (default <dataDir>/calendar-<account>.json)
+// so a restart neither re-announces every event nor repeats reminders.
+// Notifications, sounds and quiet hours are the caller's.
 
-import fs from 'node:fs';
 import path from 'node:path';
-import { withAuthRetry } from './client.js';
-import { HOME_DIR, loadConfig, loadRulesDoc } from './config.js';
-import { inQuietHours } from './rules.js';
-import { playSound, notifyMac } from './notify.js';
+import { EventEmitter } from 'node:events';
+import { jsonFileStore, memoryStore } from './store.js';
 
 const KEY_FIELDS = ['subject', 'start', 'end', 'location', 'isCancelled', 'organizerEmail'];
-const MAX_NOTIFY_PER_REFRESH = 3;
 
-export function startCalendarWatch({ account, bus, log }) {
-  const snapPath = path.join(HOME_DIR, `calendar-${account}.json`);
-  let snap = { baselined: false, events: {}, fired: {} };
-  try { snap = { ...snap, ...JSON.parse(fs.readFileSync(snapPath, 'utf8')) }; } catch {}
-  const save = () => { try { fs.writeFileSync(snapPath, JSON.stringify(snap), { mode: 0o600 }); } catch {} };
-  const settings = () => loadConfig().accounts[account]?.calendar || {};
-  const quiet = () => inQuietHours(loadRulesDoc().quietHours);
+/**
+ * watchCalendar(core, { account, snapshot?, settings?, log? }) → EventEmitter & { refresh(), stop() }
+ *   settings: () => { lookaheadDays, pollMinutes, remindMinutes } (default: the account's calendar block)
+ */
+export function watchCalendar(core, { account, snapshot, settings, log = () => {}, start = true } = {}) {
+  const fresh = () => ({ baselined: false, events: {}, fired: {} });
+  const store = snapshot || (core.dataDir ? jsonFileStore(path.join(core.dataDir, `calendar-${account}.json`), fresh) : memoryStore(fresh));
+  let snap = { ...fresh(), ...(store.load() || {}) };
+  const save = () => { try { store.save(snap); } catch {} };
+  const cfgOf = settings || (() => core.accounts[account]?.calendar || {});
+  const out = new EventEmitter();
 
   let refreshing = false;
   let again = false;
@@ -34,10 +36,10 @@ export function startCalendarWatch({ account, bus, log }) {
     if (refreshing) { again = true; return; }
     refreshing = true;
     try {
-      const cfg = settings();
-      const start = new Date(Date.now() - 3600e3);
-      const end = new Date(Date.now() + (cfg.lookaheadDays || 7) * 86400e3);
-      const list = await withAuthRetry((c) => c.findEvents({ start, end, limit: 500 }), null, account);
+      const cfg = cfgOf();
+      const from = new Date(Date.now() - 3600e3);
+      const to = new Date(Date.now() + (cfg.lookaheadDays || 7) * 86400e3);
+      const list = await core.withClient(account, (c) => c.findEvents({ start: from, end: to, limit: 500 }));
       const next = {};
       for (const e of list) next[e.id] = pick(e);
       const changes = snap.baselined ? diff(snap.events, next) : [];
@@ -46,40 +48,30 @@ export function startCalendarWatch({ account, bus, log }) {
       // forget reminder marks of events that are gone
       for (const k of Object.keys(snap.fired)) if (!next[k.split('|')[0]]) delete snap.fired[k];
       save();
-      if (changes.length) announce(changes, cfg);
-      else if (!changes.length && list.length) log(`[${account}] calendar: ${list.length} upcoming event(s), no change`);
+      if (changes.length) {
+        for (const ch of changes) {
+          const ev = ch.event;
+          // an invitation from someone else (not my own appointment, which Google/CalDAV also label with an organizer), or a cancellation
+          ch.loud = (ch.action === 'created' && ev.isMeeting && ev.myResponse !== 'Organizer' && !ev.isCancelled) || ch.action === 'cancelled';
+          log(`[${account}] calendar ${ch.action}: ${ev.subject} (${ev.start})`);
+        }
+        out.emit('changes', changes);
+      } else if (list.length) log(`[${account}] calendar: ${list.length} upcoming event(s), no change`);
     } catch (e) {
       log(`[${account}] calendar refresh failed: ${e.message}`);
+      out.emit('failure', e);
     } finally {
       refreshing = false;
       if (again) { again = false; setTimeout(refresh, 1000); }
     }
   };
 
-  const announce = (changes, cfg) => {
-    const q = quiet();
-    let notified = 0;
-    for (const ch of changes) {
-      const ev = ch.event;
-      log(`[${account}] calendar ${ch.action}: ${ev.subject} (${ev.start})`);
-      bus.emit('calendar', { action: ch.action, account, ...ev, ...(ch.previous ? { previous: ch.previous } : {}), quiet: q });
-      // only invitations and cancellations deserve an interruption
-      // an invitation from someone else (not my own appointment, which Google/CalDAV also label with an organizer)
-      const loud = (ch.action === 'created' && ev.isMeeting && ev.myResponse !== 'Organizer' && !ch.event.isCancelled) || ch.action === 'cancelled';
-      if (!loud || q || cfg.notify === false || notified >= MAX_NOTIFY_PER_REFRESH) continue;
-      notified++;
-      if (notified === 1 && cfg.sound !== false) playSound(cfg.sound || 'ding');
-      notifyMac(ch.action === 'cancelled' ? '📅 Cancelled' : '📅 New invitation', `${ev.subject}\n${when(ev)}`);
-    }
-  };
-
   // --- reminders: one check per minute over the snapshot --------------------
   const tickReminders = () => {
-    const cfg = settings();
+    const cfg = cfgOf();
     const minutesList = (Array.isArray(cfg.remindMinutes) ? cfg.remindMinutes : [cfg.remindMinutes]).map(Number).filter((n) => n >= 0);
     if (!minutesList.length) return;
     const now = Date.now();
-    const q = quiet();
     let dirty = false;
     for (const ev of Object.values(snap.events)) {
       if (ev.isCancelled || ev.allDay) continue;
@@ -93,25 +85,30 @@ export function startCalendarWatch({ account, bus, log }) {
         snap.fired[key] = now;
         dirty = true;
         log(`[${account}] reminder (${m} min): ${ev.subject}`);
-        bus.emit('reminder', { account, minutes: m, ...ev, quiet: q });
-        if (q || cfg.notify === false) continue;
-        if (cfg.sound !== false) playSound(cfg.sound || 'ding');
-        notifyMac(`⏰ In ${m} min: ${ev.subject}`, `${when(ev)}${ev.location ? '\n' + ev.location : ''}`);
+        out.emit('reminder', { account, minutes: m, ...ev });
       }
     }
     if (dirty) save();
   };
 
-  refresh();
-  const pollTimer = setInterval(refresh, Math.max(1, Number(settings().pollMinutes) || 5) * 60e3);
-  const remindTimer = setInterval(tickReminders, 60e3);
-  return {
-    refresh: () => setTimeout(refresh, 1500), // let the server settle after a push
-    stop() { clearInterval(pollTimer); clearInterval(remindTimer); }
+  let pollTimer = null;
+  let remindTimer = null;
+  out.start = () => {
+    if (pollTimer) return out;
+    refresh();
+    pollTimer = setInterval(refresh, Math.max(1, Number(cfgOf().pollMinutes) || 5) * 60e3);
+    remindTimer = setInterval(tickReminders, 60e3);
+    return out;
   };
+  out.refresh = () => setTimeout(refresh, 1500); // let the server settle after a push
+  out.refreshNow = refresh;
+  out.checkReminders = tickReminders;
+  out.stop = () => { clearInterval(pollTimer); clearInterval(remindTimer); pollTimer = remindTimer = null; };
+  if (start) setImmediate(out.start); // listeners attach first
+  return out;
 }
 
-function pick(e) {
+export function pick(e) {
   return {
     id: e.id, subject: e.subject, start: e.start, end: e.end, allDay: e.allDay, location: e.location,
     organizerName: e.organizerName, organizerEmail: e.organizerEmail, isMeeting: e.isMeeting,
@@ -119,7 +116,7 @@ function pick(e) {
   };
 }
 
-function diff(before, after) {
+export function diff(before, after) {
   const out = [];
   for (const [id, ev] of Object.entries(after)) {
     const old = before[id];
@@ -129,11 +126,4 @@ function diff(before, after) {
   }
   for (const [id, ev] of Object.entries(before)) if (!after[id]) out.push({ action: 'deleted', event: ev });
   return out;
-}
-
-function when(ev) {
-  const d = new Date(ev.start);
-  if (isNaN(d)) return ev.start;
-  if (ev.allDay) return d.toLocaleDateString();
-  return d.toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
 }

@@ -57,7 +57,7 @@ export class ImapClient {
   }
 
   async selfEmail() {
-    if (!this.self) throw new Error('set "email" on the IMAP account in config.json');
+    if (!this.self) throw new Error('set "email" on the IMAP account');
     return this.self;
     this.client = null;
     this.folderMap = null;

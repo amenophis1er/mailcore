@@ -46,7 +46,7 @@ export class CaldavCalendar {
   constructor({ server, service, username, password, email = '', hostPattern, timeZone, account }) {
     const preset = CALDAV_SERVICES[service];
     this.server = (server || preset?.server || '').replace(/\/?$/, '/');
-    if (!this.server) throw new Error(`account "${account}": set "server" (or service: icloud | fastmail) in config.json`);
+    if (!this.server) throw new Error(`account "${account}": set "server" (or service: icloud | fastmail)`);
     this.hostPattern = hostPattern || preset?.hostPattern || new URL(this.server).hostname;
     this.username = username;
     this.password = password;
@@ -67,7 +67,7 @@ export class CaldavCalendar {
       if (!hostCovered(this.hostPattern, u.hostname)) throw new Error(`the server sent us to ${u.hostname}, outside this account's server (${this.hostPattern})`);
       const res = await fetch(url, {
         method, body, redirect: 'manual',
-        headers: { authorization: 'Basic ' + Buffer.from(`${this.username}:${this.password}`).toString('base64'), 'user-agent': 'mailwatcher', ...headers },
+        headers: { authorization: 'Basic ' + Buffer.from(`${this.username}:${this.password}`).toString('base64'), 'user-agent': 'mailcore', ...headers },
         signal: AbortSignal.timeout(TIMEOUT_MS)
       });
       const location = res.headers.get('location');
@@ -133,7 +133,7 @@ export class CaldavCalendar {
   async selfEmail() {
     if (this.self) return this.self;
     await this.discover();
-    if (!this.self) throw new Error(`cannot tell my own address on ${this.hostPattern} — set "email" on the account in config.json`);
+    if (!this.self) throw new Error(`cannot tell my own address on ${this.hostPattern} — set "email" on the account`);
     return this.self;
   }
 

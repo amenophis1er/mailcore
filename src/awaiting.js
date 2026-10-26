@@ -4,13 +4,10 @@
 // Threads are keyed by Exchange ConversationId when there is one, else by the
 // Message-ID / In-Reply-To chain, else by the normalized subject. Inbound mail
 // comes from the encrypted cache (headers, recipients, bulk flag and body
-// are there for everything the daemon has seen); my own messages come from
+// are there for everything the watcher has seen); my own messages come from
 // Sent Items on the server, plus my own mail found in the inbox. Nothing
 // here needs a model: the judgment stays with whoever reads the result.
 
-import { withAuthRetry, selectAccounts, readMessage } from './client.js';
-import * as cache from './cache.js';
-import { loadConfig } from './config.js';
 
 const MAX_BODY_FETCHES = 40; // inbound candidates without a cached body/recipients → one GetItem each, at most
 const SENT_PAGE = 100;
@@ -55,7 +52,7 @@ export function snippet(text, n = 200) {
   return t.length > n ? t.slice(0, n - 1) + '…' : t;
 }
 
-function looksBulk(m) {
+export function looksBulk(m) {
   if (m.isBulk === true) return true;
   const e = String(m.fromEmail || '').toLowerCase();
   if (!e) return true;
@@ -94,168 +91,181 @@ export function groupThreads(messages) {
   return threads;
 }
 
-/** Sent Items since `sinceIso`, paged, as list items (fromMe: true). */
-async function fetchSent(account, sinceIso, onError) {
-  const out = [];
-  for (let offset = 0; offset < SENT_MAX; offset += SENT_PAGE) {
-    let page;
-    try {
-      page = await withAuthRetry((c) => c.findInbox({ folder: 'sent', sinceIso, limit: SENT_PAGE, offset }), null, account);
-    } catch (e) {
-      onError?.(account, e);
-      break;
-    }
-    out.push(...page.map((m) => ({ ...m, fromMe: true })));
-    if (page.length < SENT_PAGE) break;
-  }
-  return out;
-}
-
 /**
- * awaitingReply({ account?, days = 28, limit = 50, includeCc = true, since? })
- * → { threads: [...], scanned: { inbound, sent }, cursor }
+ * awaitingReply and getThread bound to one mailcore instance (its accounts,
+ * clients and cache).
  */
-export async function awaitingReply({ account, days = 28, limit = 50, includeCc = true, since, onError } = {}) {
-  const names = selectAccounts(account);
-  const sinceIso = new Date(Date.now() - Math.max(1, days) * 86400e3).toISOString();
-  const results = [];
-  let scannedInbound = 0;
-  let scannedSent = 0;
-  for (const name of names) {
-    let me = '';
-    try { me = await withAuthRetry((c) => c.selfEmail(), null, name); } catch (e) { onError?.(name, e); continue; }
-    const aliases = new Set([me, ...(loadConfig().accounts[name]?.aliases || []).map((a) => String(a).toLowerCase())]);
-    const isMe = (addr) => aliases.has(String(addr || '').toLowerCase());
+export function awaitingApi(core) {
+  const withAuthRetry = (fn, onRefresh, account) => core.withAuthRetry(fn, onRefresh, account);
+  const selectAccounts = (account) => core.selectAccounts(account);
+  const readMessage = (id, opts) => core.read(id, opts);
+  const cache = core.cache;
 
-    // inbound: the cache first (complete for what the daemon has seen), else the server
-    let inbound = [];
-    if (cache.cachedAccounts().includes(name)) inbound = cache.cachedSince(name, sinceIso);
-    if (!inbound.length) {
-      for (let offset = 0; offset < 1000; offset += 100) {
-        let page = [];
-        try { page = await withAuthRetry((c) => c.findInbox({ sinceIso, limit: 100, offset }), null, name); } catch (e) { onError?.(name, e); break; }
-        inbound.push(...page);
-        if (page.length < 100) break;
+  /** Sent Items since `sinceIso`, paged, as list items (fromMe: true). */
+  async function fetchSent(account, sinceIso, onError) {
+    const out = [];
+    for (let offset = 0; offset < SENT_MAX; offset += SENT_PAGE) {
+      let page;
+      try {
+        page = await withAuthRetry((c) => c.findInbox({ folder: 'sent', sinceIso, limit: SENT_PAGE, offset }), null, account);
+      } catch (e) {
+        onError?.(account, e);
+        break;
+      }
+      out.push(...page.map((m) => ({ ...m, fromMe: true })));
+      if (page.length < SENT_PAGE) break;
+    }
+    return out;
+  }
+
+  /**
+   * awaitingReply({ account?, days = 28, limit = 50, includeCc = true, since? })
+   * → { threads: [...], scanned: { inbound, sent }, cursor }
+   */
+  async function awaitingReply({ account, days = 28, limit = 50, includeCc = true, since, onError } = {}) {
+    const names = selectAccounts(account);
+    const sinceIso = new Date(Date.now() - Math.max(1, days) * 86400e3).toISOString();
+    const results = [];
+    let scannedInbound = 0;
+    let scannedSent = 0;
+    for (const name of names) {
+      let me = '';
+      try { me = await withAuthRetry((c) => c.selfEmail(), null, name); } catch (e) { onError?.(name, e); continue; }
+      const aliases = new Set([me, ...(core.accounts[name]?.aliases || []).map((a) => String(a).toLowerCase())]);
+      const isMe = (addr) => aliases.has(String(addr || '').toLowerCase());
+
+      // inbound: the cache first (complete for what the daemon has seen), else the server
+      let inbound = [];
+      if (cache.cachedAccounts().includes(name)) inbound = cache.cachedSince(name, sinceIso);
+      if (!inbound.length) {
+        for (let offset = 0; offset < 1000; offset += 100) {
+          let page = [];
+          try { page = await withAuthRetry((c) => c.findInbox({ sinceIso, limit: 100, offset }), null, name); } catch (e) { onError?.(name, e); break; }
+          inbound.push(...page);
+          if (page.length < 100) break;
+        }
+      }
+      scannedInbound += inbound.length;
+      const sent = await fetchSent(name, sinceIso, onError);
+      scannedSent += sent.length;
+
+      const all = [...inbound.map((m) => ({ ...m, fromMe: isMe(m.fromEmail) })), ...sent];
+      const threads = groupThreads(all);
+      const candidates = [];
+      for (const [key, list] of threads) {
+        const last = list[list.length - 1];
+        if (last.fromMe) continue;
+        if (CALENDAR_SUBJECT.test(last.subject || '')) continue;
+        if (looksBulk(last)) continue; // headers prove bulk; the sender/body heuristics catch the automated mail that carries none
+        if (since && new Date(last.received) <= new Date(since)) continue;
+        candidates.push({ key, list, last });
+      }
+      // bulk flag from the headers for candidates the cache has not judged yet (one batched call, persisted)
+      const unjudged = candidates.map((c) => c.last).filter((m) => m.isBulk == null && m.id);
+      if (unjudged.length) {
+        try {
+          const flags = await withAuthRetry((c) => c.bulkFlags(unjudged.map((m) => m.id)), null, name);
+          for (const m of unjudged) if (flags.has(m.id)) { m.isBulk = flags.get(m.id); try { cache.setBulk(m.id, m.isBulk); } catch {} }
+        } catch (e) { onError?.(name, e); }
+      }
+      // recipients + body for the rest the cache has no body for (bounded)
+      let fetches = 0;
+      for (const c of candidates) {
+        const m = c.last;
+        if (m.isBulk === true || (m.to && m.cc) || fetches >= MAX_BODY_FETCHES) continue;
+        fetches++;
+        try {
+          const full = await readMessage(m.id, { bodyType: 'Text' });
+          Object.assign(m, { to: full.to || [], cc: full.cc || [], isBulk: full.isBulk ?? m.isBulk, bodyText: full.body });
+        } catch (e) { onError?.(name, e); }
+      }
+      for (const { list, last } of candidates) {
+        if (looksBulk(last)) continue; // re-check: the body may have arrived with the fetch
+        const inTo = (last.to || []).some((r) => isMe(r.email));
+        const inCc = (last.cc || []).some((r) => isMe(r.email));
+        let addressed = inTo ? 'to' : inCc ? 'cc' : null;
+        if (!addressed && last.to == null) addressed = 'unknown'; // recipients never fetched (budget) — keep, flagged
+        if (!addressed) continue; // a list or a bulk sender: I am not a recipient
+        if (addressed === 'cc' && !includeCc) continue;
+        const mine = list.filter((m) => m.fromMe);
+        const others = new Map();
+        for (const m of list) {
+          if (!m.fromMe && m.fromEmail && !isMe(m.fromEmail)) others.set(m.fromEmail.toLowerCase(), m.fromName || m.fromEmail);
+          for (const r of [...(m.to || []), ...(m.cc || [])]) if (r.email && !isMe(r.email)) others.set(r.email.toLowerCase(), r.name || r.email);
+        }
+        const body = last.bodyText || '';
+        results.push({
+          account: name,
+          threadId: last.conversationId || list[0].messageId || normalizeSubject(last.subject),
+          subject: last.subject || '(no subject)',
+          lastMessageId: last.id,
+          changeKey: last.changeKey || '',
+          from: last.fromName || last.fromEmail,
+          fromEmail: last.fromEmail,
+          received: last.received,
+          addressed,
+          participants: [...others].map(([email, name]) => ({ name, email })).slice(0, 12),
+          messages: list.length,
+          theirsSinceMyLast: list.slice(mine.length ? list.lastIndexOf(mine[mine.length - 1]) + 1 : 0).filter((m) => !m.fromMe).length,
+          myLastReplyAt: mine.length ? mine[mine.length - 1].received : null,
+          isRead: last.isRead,
+          askedSomething: askedSomething(body),
+          snippet: snippet(body)
+        });
       }
     }
-    scannedInbound += inbound.length;
-    const sent = await fetchSent(name, sinceIso, onError);
-    scannedSent += sent.length;
+    results.sort((a, b) => new Date(b.received) - new Date(a.received));
+    const threads = results.slice(0, Math.max(1, limit));
+    return {
+      threads,
+      scanned: { inbound: scannedInbound, sent: scannedSent, days },
+      cursor: results.length ? results[0].received : since || sinceIso
+    };
+  }
 
-    const all = [...inbound.map((m) => ({ ...m, fromMe: isMe(m.fromEmail) })), ...sent];
-    const threads = groupThreads(all);
-    const candidates = [];
-    for (const [key, list] of threads) {
-      const last = list[list.length - 1];
-      if (last.fromMe) continue;
-      if (CALENDAR_SUBJECT.test(last.subject || '')) continue;
-      if (looksBulk(last)) continue; // headers prove bulk; the sender/body heuristics catch the automated mail that carries none
-      if (since && new Date(last.received) <= new Date(since)) continue;
-      candidates.push({ key, list, last });
+  /**
+   * getThread({ id?, subject?, days = 14, account?, limit = 50 }) → messages of
+   * one thread across Inbox and Sent, oldest first. With `id`, the thread is the
+   * message's ConversationId (Exchange) or Message-ID chain (IMAP); subject
+   * matching is the fallback and the only option without an id.
+   */
+  async function getThread({ id, subject, days = 14, account, limit = 50, onError } = {}) {
+    const span = Math.min(90, Math.max(1, days));
+    let seed = null;
+    if (id) {
+      seed = await readMessage(id, { bodyType: 'Text' });
+      subject = seed.subject;
+      account = seed.account || account || id.split(':')[0];
     }
-    // bulk flag from the headers for candidates the cache has not judged yet (one batched call, persisted)
-    const unjudged = candidates.map((c) => c.last).filter((m) => m.isBulk == null && m.id);
-    if (unjudged.length) {
-      try {
-        const flags = await withAuthRetry((c) => c.bulkFlags(unjudged.map((m) => m.id)), null, name);
-        for (const m of unjudged) if (flags.has(m.id)) { m.isBulk = flags.get(m.id); try { cache.setBulk(m.id, m.isBulk); } catch {} }
-      } catch (e) { onError?.(name, e); }
-    }
-    // recipients + body for the rest the cache has no body for (bounded)
-    let fetches = 0;
-    for (const c of candidates) {
-      const m = c.last;
-      if (m.isBulk === true || (m.to && m.cc) || fetches >= MAX_BODY_FETCHES) continue;
-      fetches++;
-      try {
-        const full = await readMessage(m.id, { bodyType: 'Text' });
-        Object.assign(m, { to: full.to || [], cc: full.cc || [], isBulk: full.isBulk ?? m.isBulk, bodyText: full.body });
-      } catch (e) { onError?.(name, e); }
-    }
-    for (const { list, last } of candidates) {
-      if (looksBulk(last)) continue; // re-check: the body may have arrived with the fetch
-      const inTo = (last.to || []).some((r) => isMe(r.email));
-      const inCc = (last.cc || []).some((r) => isMe(r.email));
-      let addressed = inTo ? 'to' : inCc ? 'cc' : null;
-      if (!addressed && last.to == null) addressed = 'unknown'; // recipients never fetched (budget) — keep, flagged
-      if (!addressed) continue; // a list or a bulk sender: I am not a recipient
-      if (addressed === 'cc' && !includeCc) continue;
-      const mine = list.filter((m) => m.fromMe);
-      const others = new Map();
-      for (const m of list) {
-        if (!m.fromMe && m.fromEmail && !isMe(m.fromEmail)) others.set(m.fromEmail.toLowerCase(), m.fromName || m.fromEmail);
-        for (const r of [...(m.to || []), ...(m.cc || [])]) if (r.email && !isMe(r.email)) others.set(r.email.toLowerCase(), r.name || r.email);
+    if (!subject) throw new Error('getThread: pass id or subject');
+    const normalized = normalizeSubject(subject);
+    const sinceIso = new Date(Date.now() - span * 86400e3).toISOString();
+    const names = selectAccounts(account);
+    const found = [];
+    for (const name of names) {
+      for (const folder of ['inbox', 'sent']) {
+        try {
+          const live = folder !== 'inbox';
+          const items = await withAuthRetry((c) => c.findInbox({ folder, subjectContains: normalized, sinceIso, limit: 100, live }), null, name);
+          found.push(...items.map((m) => ({ ...m, folder })));
+        } catch (e) { onError?.(name, e); }
       }
-      const body = last.bodyText || '';
-      results.push({
-        account: name,
-        threadId: last.conversationId || list[0].messageId || normalizeSubject(last.subject),
-        subject: last.subject || '(no subject)',
-        lastMessageId: last.id,
-        changeKey: last.changeKey || '',
-        from: last.fromName || last.fromEmail,
-        fromEmail: last.fromEmail,
-        received: last.received,
-        addressed,
-        participants: [...others].map(([email, name]) => ({ name, email })).slice(0, 12),
-        messages: list.length,
-        theirsSinceMyLast: list.slice(mine.length ? list.lastIndexOf(mine[mine.length - 1]) + 1 : 0).filter((m) => !m.fromMe).length,
-        myLastReplyAt: mine.length ? mine[mine.length - 1].received : null,
-        isRead: last.isRead,
-        askedSomething: askedSomething(body),
-        snippet: snippet(body)
-      });
     }
+    let items = found.filter((m) => normalizeSubject(m.subject) === normalized);
+    if (seed) {
+      const sameConv = seed.conversationId ? items.filter((m) => m.conversationId === seed.conversationId) : [];
+      if (sameConv.length) items = sameConv;
+      else if (!seed.conversationId) {
+        const threads = groupThreads([seed, ...items]);
+        for (const list of threads.values()) if (list.some((m) => m.id === seed.id)) { items = list.filter((m) => m.id !== seed.id || m.folder); break; }
+      }
+      if (!items.some((m) => m.id === seed.id)) items.push({ ...seed, folder: 'inbox' });
+    }
+    const seen = new Set();
+    items = items.filter((m) => !seen.has(m.id) && seen.add(m.id));
+    items.sort((a, b) => new Date(a.received) - new Date(b.received));
+    return items.slice(-limit);
   }
-  results.sort((a, b) => new Date(b.received) - new Date(a.received));
-  const threads = results.slice(0, Math.max(1, limit));
-  return {
-    threads,
-    scanned: { inbound: scannedInbound, sent: scannedSent, days },
-    cursor: results.length ? results[0].received : since || sinceIso
-  };
-}
 
-/**
- * getThread({ id?, subject?, days = 14, account?, limit = 50 }) → messages of
- * one thread across Inbox and Sent, oldest first. With `id`, the thread is the
- * message's ConversationId (Exchange) or Message-ID chain (IMAP); subject
- * matching is the fallback and the only option without an id.
- */
-export async function getThread({ id, subject, days = 14, account, limit = 50, onError } = {}) {
-  const span = Math.min(90, Math.max(1, days));
-  let seed = null;
-  if (id) {
-    seed = await readMessage(id, { bodyType: 'Text' });
-    subject = seed.subject;
-    account = seed.account || account || id.split(':')[0];
-  }
-  if (!subject) throw new Error('getThread: pass id or subject');
-  const normalized = normalizeSubject(subject);
-  const sinceIso = new Date(Date.now() - span * 86400e3).toISOString();
-  const names = selectAccounts(account);
-  const found = [];
-  for (const name of names) {
-    for (const folder of ['inbox', 'sent']) {
-      try {
-        const live = folder !== 'inbox';
-        const items = await withAuthRetry((c) => c.findInbox({ folder, subjectContains: normalized, sinceIso, limit: 100, live }), null, name);
-        found.push(...items.map((m) => ({ ...m, folder })));
-      } catch (e) { onError?.(name, e); }
-    }
-  }
-  let items = found.filter((m) => normalizeSubject(m.subject) === normalized);
-  if (seed) {
-    const sameConv = seed.conversationId ? items.filter((m) => m.conversationId === seed.conversationId) : [];
-    if (sameConv.length) items = sameConv;
-    else if (!seed.conversationId) {
-      const threads = groupThreads([seed, ...items]);
-      for (const list of threads.values()) if (list.some((m) => m.id === seed.id)) { items = list.filter((m) => m.id !== seed.id || m.folder); break; }
-    }
-    if (!items.some((m) => m.id === seed.id)) items.push({ ...seed, folder: 'inbox' });
-  }
-  const seen = new Set();
-  items = items.filter((m) => !seen.has(m.id) && seen.add(m.id));
-  items.sort((a, b) => new Date(a.received) - new Date(b.received));
-  return items.slice(-limit);
+  return { awaitingReply, getThread };
 }

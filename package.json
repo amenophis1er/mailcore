@@ -1,0 +1,40 @@
+{
+  "name": "mailcore",
+  "version": "0.1.0",
+  "description": "Mail and calendar accounts (Exchange/EWS, IMAP+SMTP, CalDAV, Google) with push, an encrypted cache, drafts and calendars — configuration and secrets handed in by the caller",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "index.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc -p test/types"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3-multiple-ciphers": "^13.0.3",
+    "fast-xml-parser": "^5.11.2",
+    "httpntlm": "^1.8.13",
+    "imapflow": "^2.5.9",
+    "mailparser": "^3.10.0",
+    "node-ical": "^0.27.3",
+    "nodemailer": "^10.1.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3"
+  }
+}

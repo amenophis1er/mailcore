@@ -35,9 +35,8 @@
 // Ids handed to callers are prefixed "<account>:" so any id routes back to
 // its account; AccountClient adds/strips the prefix around the backend.
 
-import { loadConfig, getCredentials, getAccount, accountNames, mailAccountNames, calendarProvider, hasMail } from './config.js';
+import { calendarProvider, hasMail } from './accounts.js';
 import { replaceAboveQuote } from './body.js';
-import * as cache from './cache.js';
 
 export function isAuthError(e) {
   return !!e && (e.code === 'EWS_AUTH' || e.code === 'MAIL_AUTH');
@@ -64,20 +63,19 @@ export function makeBackend(acct, creds) {
  * Google client for calendar-only accounts, or the one an IMAP account
  * carries under `calendar`. null when the account has no calendar.
  */
-export async function makeCalendarBackend(acct, mailBackend, config, forceRefresh = false) {
+export async function makeCalendarBackend(acct, mailBackend, { timeZone = null, getPassword, accessToken, refresh = false } = {}) {
   const kind = calendarProvider(acct);
   if (!kind) return null;
   if (kind === 'ews') return mailBackend;
   const spec = acct.provider === 'imap' ? acct.calendar : acct;
-  const timeZone = config?.timeZone || null;
   if (kind === 'google') {
     const m = await import('./cal-google.js');
-    return new m.GoogleCalendar({ account: acct.name, email: spec.email || acct.email, timeZone });
+    return new m.GoogleCalendar({ account: acct.name, email: spec.email || acct.email, timeZone, accessToken });
   }
   const m = await import('./cal-caldav.js');
-  // credentials: the account's own (calendar-only), or the calendar block's 1Password item / keychain entry "<account>/calendar"
+  // credentials: the account's own (calendar-only), or those of the calendar block, asked for as account "<account>/calendar"
   const credAcct = acct.provider === 'imap' ? { ...spec, name: `${acct.name}/calendar`, provider: 'caldav' } : acct;
-  const creds = await getCredentials(config || loadConfig(), credAcct, forceRefresh);
+  const creds = await getPassword(credAcct, { refresh });
   return new m.CaldavCalendar({ server: spec.server, service: spec.service, username: creds.username || spec.username || spec.email, password: creds.password, email: spec.email || acct.email, hostPattern: spec.hostPattern, timeZone, account: acct.name });
 }
 
@@ -175,171 +173,3 @@ export class AccountClient {
   async getFreeBusy(o) { return (await this.#cal('getFreeBusy'))(o); }
 }
 
-export async function createClient(account, forceRefresh = false) {
-  const config = loadConfig();
-  const acct = getAccount(config, account);
-  const creds = hasMail(acct) || acct.provider === 'caldav' ? await getCredentials(config, acct, forceRefresh) : null;
-  const backend = await makeBackend(acct, creds);
-  // the calendar backend is built on first calendar call (lazily): a CalDAV password problem must not stop mail
-  return new AccountClient(acct.name, backend, () => makeCalendarBackend(acct, backend, config, forceRefresh));
-}
-
-/**
- * Run fn(client) for one account with automatic credential refresh: an auth
- * failure (the password rotated) triggers one re-fetch from 1Password and a
- * single retry. `account` may be a name, or a prefixed message id.
- */
-export async function withAuthRetry(fn, onRefresh, account) {
-  const name = account && splitId(account).account ? splitId(account).account : account;
-  const attempt = async (force) => {
-    const c = await createClient(name, force);
-    try { return await fn(c); } finally { try { await c.close(); } catch {} }
-  };
-  try {
-    return await attempt(false);
-  } catch (e) {
-    if (!isAuthError(e)) throw e;
-    // NTLM 401s are sometimes transient — retry once with the same cached
-    // credentials before concluding the password rotated.
-    try {
-      return await attempt(false);
-    } catch (e2) {
-      if (!isAuthError(e2)) throw e2;
-      if (onRefresh) onRefresh(e2);
-      return await attempt(true);
-    }
-  }
-}
-
-/** Account names to query: the one given, or all of them. */
-export function selectAccounts(account) {
-  const config = loadConfig();
-  if (account) return [getAccount(config, account).name];
-  return mailAccountNames(config);
-}
-
-/**
- * findInbox across accounts (all, or the one named), merged newest-first and
- * trimmed to opts.limit. Any account that fails is reported via onError and
- * skipped so one dead server does not blank the whole listing.
- *
- * Served from the encrypted cache when every requested account is cached,
- * the daemon is alive, and the folder is the inbox; opts.live forces the
- * servers. Cached items carry `cached: true`.
- */
-export async function findAcross(account, opts = {}, onError) {
-  const names = selectAccounts(account);
-  if (cache.cacheUsable(names, opts)) {
-    try {
-      if (opts.fromMe && names.length === 1) {
-        const me = await withAuthRetry((c) => c.selfEmail(), null, names[0]);
-        return cache.findCached(names, { ...opts, fromMe: me });
-      }
-      if (!opts.fromMe) return cache.findCached(names, opts);
-    } catch (e) {
-      if (onError) onError('cache', e);
-    }
-  }
-  const lists = await Promise.all(
-    names.map((n) =>
-      withAuthRetry((c) => c.findInbox(opts), null, n).catch((e) => {
-        if (onError) onError(n, e);
-        else throw e;
-        return [];
-      })
-    )
-  );
-  const items = lists.flat().sort((a, b) => new Date(b.received) - new Date(a.received));
-  return opts && opts.limit ? items.slice(0, opts.limit) : items;
-}
-
-/**
- * One full message: cached body when stored, else live (and the live result
- * is written back to the cache for next time). opts.live forces the server.
- */
-export async function readMessage(id, opts = {}) {
-  const { account } = splitId(id);
-  // a stored body only goes stale when a draft is edited (the write paths drop it), so no daemon-liveness check here
-  if (!opts.live && account && cache.cachedAccounts().includes(account)) {
-    try {
-      const hit = cache.getCached(id, opts);
-      if (hit) return hit;
-    } catch {}
-  }
-  const msg = await withAuthRetry((c) => c.getMessage(id, opts), null, id);
-  if (account && cache.cachedAccounts().includes(account)) {
-    try {
-      const html = msg.bodyType === 'HTML' ? msg.body : null;
-      // keep a text version too so the mail is searchable (FTS) and readable with --plain
-      const text = msg.bodyType === 'Text' ? msg.body : htmlToText(msg.body);
-      cache.upsertBody(account, msg, { text, html });
-    } catch {}
-  }
-  return msg;
-}
-
-/**
- * Save attachments of a message to a directory. `only` filters by attachment
- * id or file name. Returns [{ name, path, size, contentType }]. Existing files
- * are never overwritten (a " (2)" suffix is added).
- */
-export async function saveAttachments(id, dir, { only } = {}) {
-  const fs = await import('node:fs');
-  const path = await import('node:path');
-  const msg = await readMessage(id, { bodyType: 'Text' });
-  let list = (msg.attachments || []).filter((a) => !a.inline || only);
-  if (only) list = list.filter((a) => a.id === only || a.name === only);
-  if (list.length === 0) throw new Error(only ? `no attachment "${only}" on this message` : 'this message has no attachments');
-  fs.mkdirSync(dir, { recursive: true });
-  const saved = [];
-  for (const a of list) {
-    const file = await withAuthRetry((c) => c.getAttachment(a.id, id), null, id);
-    const target = uniquePath(fs, path, dir, safeName(file.name || a.name));
-    fs.writeFileSync(target, file.content, { mode: 0o600 });
-    saved.push({ name: path.basename(target), path: target, size: file.content.length, contentType: file.contentType });
-  }
-  return saved;
-}
-
-function safeName(name) {
-  const n = String(name || 'attachment').replace(/[\/\\:\0]/g, '_').replace(/^\.+/, '_').slice(0, 200);
-  return n || 'attachment';
-}
-
-function uniquePath(fs, path, dir, name) {
-  let target = path.join(dir, name);
-  if (!fs.existsSync(target)) return target;
-  const ext = path.extname(name);
-  const base = name.slice(0, name.length - ext.length);
-  for (let i = 2; ; i++) {
-    target = path.join(dir, `${base} (${i})${ext}`);
-    if (!fs.existsSync(target)) return target;
-  }
-}
-
-function htmlToText(html) {
-  return String(html || '')
-    .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>|<head[\s\S]*?<\/head>/gi, '')
-    .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/tr>|<\/li>|<\/h[1-6]>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-/**
- * Reply to a message: creates the (reply or reply-all) draft, and sends it
- * when `send` is true. Returns { sent, draftId, changeKey }.
- */
-export async function replyTo(id, body, { all = false, send = false, changeKey = '', bodyType = 'Text' } = {}) {
-  return withAuthRetry(async (c) => {
-    const d = all ? await c.draftReplyAll(id, changeKey, body, { bodyType }) : await c.draftReply(id, changeKey, body, { bodyType });
-    if (!send) return { sent: false, ...d };
-    await c.sendItem(d.draftId, d.changeKey);
-    return { sent: true, ...d };
-  }, null, id);
-}
-
-/** Keep the cache honest after writes that change a cached row. */
-export function noteRead(id, isRead = true) { try { cache.setRead(id, isRead); } catch {} }
-export function noteRemoved(id) { try { cache.removeMessage(id); } catch {} }
