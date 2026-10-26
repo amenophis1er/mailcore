@@ -47,3 +47,18 @@ async function main(): Promise<void> {
   console.log(cached.length);
 }
 void main;
+
+import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, type MailTool, type MailToolEffect } from 'mailcore/tools';
+const manifest: MailTool[] = mailTools({ allowSend: false }); // no core needed
+const text: string = MAIL_INSTRUCTIONS;
+void manifest; void text;
+async function tools(core: Mailcore): Promise<void> {
+  const list: MailTool[] = mailTools({ allowSend: false });
+  for (const t of list) {
+    const parsed = t.input.parse({});
+    const effect: MailToolEffect = t.effectFor ? await t.effectFor(core, parsed) : t.effect;
+    if (effect !== 'others') console.log(t.name, await t.run(core, parsed, { signal: AbortSignal.timeout(1000) }));
+  }
+  console.log(mailInstructions({ allowSend: false, name: 'deputy' }));
+}
+void tools;

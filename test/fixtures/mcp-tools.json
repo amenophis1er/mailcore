@@ -1,0 +1,937 @@
+[
+  {
+    "name": "list_unread",
+    "description": "List unread messages (newest first).",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "limit": {
+          "description": "Max results, default 20",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "folder": {
+          "description": "Default inbox",
+          "type": "string",
+          "enum": [
+            "inbox",
+            "junk",
+            "sent",
+            "drafts",
+            "trash",
+            "archive"
+          ]
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        }
+      }
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "search_mail",
+    "description": "Search a mail folder. sender/subject/to are substrings; text searches subject AND body; hasAttachments filters to mail with files. Inbox queries are served from the local encrypted cache when the daemon is running (live: true forces the server). Returns { items, cursor? }: when `limit` was hit, pass `cursor` as `until` (same filters) to page further back.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "sender": {
+          "description": "Substring of sender name or address",
+          "type": "string"
+        },
+        "subject": {
+          "description": "Substring of subject",
+          "type": "string"
+        },
+        "text": {
+          "description": "Search subject AND body (content-index search)",
+          "type": "string"
+        },
+        "to": {
+          "description": "Substring of a To/Cc recipient (name or address)",
+          "type": "string"
+        },
+        "fromMe": {
+          "description": "Only mail I sent (sender = my own address)",
+          "type": "boolean"
+        },
+        "since": {
+          "description": "ISO date/time: only mail received at or after this (replaces days)",
+          "type": "string"
+        },
+        "until": {
+          "description": "ISO date/time: only mail received at or before this — pass a previous result's cursor to page",
+          "type": "string"
+        },
+        "hasAttachments": {
+          "description": "Only mail with attachments",
+          "type": "boolean"
+        },
+        "days": {
+          "description": "Only mail from the last N days",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 90
+        },
+        "unread": {
+          "description": "Only unread mail",
+          "type": "boolean"
+        },
+        "folder": {
+          "description": "Default inbox",
+          "type": "string",
+          "enum": [
+            "inbox",
+            "junk",
+            "sent",
+            "drafts",
+            "trash",
+            "archive"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        },
+        "live": {
+          "description": "Bypass the local cache and query the server",
+          "type": "boolean"
+        }
+      }
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "read_message",
+    "description": "Read one message in full (body, recipients, attachments) by its id. Plain-text body by default; format: \"html\" returns the HTML body (e.g. to edit a draft in place with update_draft format: \"html\").",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Message id from a listing"
+        },
+        "format": {
+          "description": "Body format: text (default) or html",
+          "type": "string",
+          "enum": [
+            "text",
+            "html"
+          ]
+        },
+        "live": {
+          "description": "Bypass the local cache and read from the server",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "save_attachments",
+    "description": "Download a message's file attachments to a local directory (default ~/.mailwatcher/attachments/<message>). Returns the saved paths. Use read_message first to see attachment names/ids.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Message id"
+        },
+        "only": {
+          "description": "Only this attachment (id or file name)",
+          "type": "string"
+        },
+        "dir": {
+          "description": "Target directory",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_thread",
+    "description": "Messages of one thread across Inbox and Sent, oldest first (each carries `folder`). Pass the id of any message in it (thread = Exchange ConversationId, or the Message-ID chain on IMAP); subject matching is the fallback. Looks back `days` (default 14, max 90).",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Id of any message in the thread (preferred)",
+          "type": "string"
+        },
+        "subject": {
+          "description": "Subject of any message in the thread (fallback)",
+          "type": "string"
+        },
+        "days": {
+          "description": "How far back to look (default 14)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 90
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        }
+      }
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "awaiting_reply",
+    "description": "Threads where the last word is theirs and I never answered: last message inbound, I am in To (or Cc), no message from me after it, within the last `days`. Bulk/automated senders, mailing lists and calendar mail are left out. Each thread: subject, lastMessageId (reply with draft_reply), sender, received, addressed (to|cc|unknown), participants, snippet (200 chars, quotes stripped), askedSomething (question/request heuristic, en+fr), myLastReplyAt, theirsSinceMyLast. Returns { threads, scanned, cursor }: pass `cursor` as `since` on the next sweep to see only threads with newer inbound mail. The judgment of what really needs an answer is yours.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "days": {
+          "description": "Look-back window (default 28)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 90
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Max threads (default 50)",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "includeCc": {
+          "description": "Include threads where I am only in Cc (default true)",
+          "type": "boolean"
+        },
+        "since": {
+          "description": "Cursor from a previous sweep: only threads whose last inbound message is newer",
+          "type": "string"
+        }
+      }
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "draft_reply_all",
+    "description": "Create a reply-all DRAFT for a message. The draft is saved to the Drafts folder and is NEVER sent — a human reviews and sends it.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Message id to reply to"
+        },
+        "changeKey": {
+          "description": "changeKey from the listing, if known; looked up when omitted",
+          "type": "string"
+        },
+        "body": {
+          "type": "string",
+          "description": "Body of the reply (plain text unless `format` says otherwise)"
+        },
+        "format": {
+          "description": "How to read `body`: 'text' (default), 'markdown' (converted to HTML — use for tables, lists, bold), or 'html' (sent as is)",
+          "type": "string",
+          "enum": [
+            "text",
+            "markdown",
+            "html"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "body"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "draft_reply",
+    "description": "Create a reply DRAFT to the sender only (not reply-all). Saved to Drafts and NEVER sent — a human reviews and sends it.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Message id"
+        },
+        "changeKey": {
+          "description": "changeKey from the listing, if known; looked up when omitted",
+          "type": "string"
+        },
+        "body": {
+          "type": "string",
+          "description": "Body of the reply (plain text unless `format` says otherwise)"
+        },
+        "format": {
+          "description": "How to read `body`: 'text' (default), 'markdown' (converted to HTML — use for tables, lists, bold), or 'html' (sent as is)",
+          "type": "string",
+          "enum": [
+            "text",
+            "markdown",
+            "html"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "body"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "compose_draft",
+    "description": "Create a brand-new mail as a DRAFT (not a reply): recipients, subject, plain-text body. Saved to Drafts, NEVER sent — a human reviews and sends. Returns the draft id + changeKey.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "to": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Recipient email addresses"
+        },
+        "cc": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "subject": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string",
+          "description": "Body (plain text unless `format` says otherwise)"
+        },
+        "format": {
+          "description": "How to read `body`: 'text' (default), 'markdown' (converted to HTML — use for tables, lists, bold), or 'html' (sent as is)",
+          "type": "string",
+          "enum": [
+            "text",
+            "markdown",
+            "html"
+          ]
+        },
+        "account": {
+          "description": "Account to create the draft in (required when several are configured)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "to",
+        "subject",
+        "body"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "add_attachment",
+    "description": "Attach a local file to an existing DRAFT by its id. Returns the new changeKey. Max 25 MB. With inline=true the file (an image) is embedded for an HTML body: reference it as <img src=\"cid:CONTENT_ID\"> (contentId defaults to the file name).",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Draft item id"
+        },
+        "changeKey": {
+          "description": "Current changeKey, if known",
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "description": "Absolute path of the file to attach"
+        },
+        "inline": {
+          "description": "Embed as an inline image (HTML bodies)",
+          "type": "boolean"
+        },
+        "contentId": {
+          "description": "Content-ID to use in <img src=\"cid:…\">; defaults to the file name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "path"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_draft",
+    "description": "Edit an existing DRAFT (subject, body, recipients). Requires the draft id and its current changeKey (from draft_reply_all/compose results or a drafts-folder listing). Returns the new changeKey for further edits. Never sends.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Draft item id"
+        },
+        "changeKey": {
+          "type": "string",
+          "description": "Current changeKey of the draft"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "body": {
+          "description": "New body (replaces the whole body unless keepQuoted; plain text unless `format` says otherwise)",
+          "type": "string"
+        },
+        "keepQuoted": {
+          "description": "For reply/forward drafts: replace only the text above the quoted original thread and keep the quote as is",
+          "type": "boolean"
+        },
+        "format": {
+          "description": "How to read `body`: 'text' (default), 'markdown' (converted to HTML — use for tables, lists, bold), or 'html' (sent as is)",
+          "type": "string",
+          "enum": [
+            "text",
+            "markdown",
+            "html"
+          ]
+        },
+        "to": {
+          "description": "Replacement To recipients (email addresses)",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cc": {
+          "description": "Replacement Cc recipients",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "changeKey"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_draft",
+    "description": "Delete a draft (moves it to Deleted Items — reversible). Use to replace or clean up drafts you created.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Draft item id"
+        },
+        "changeKey": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "mark_read",
+    "description": "Mark a message as read.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "changeKey": {
+          "type": "string",
+          "description": "changeKey from the listing"
+        }
+      },
+      "required": [
+        "id",
+        "changeKey"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "send_draft",
+    "description": "SEND an existing draft (from compose_draft, draft_reply or draft_reply_all). This actually sends mail to the recipients — only use it when the user explicitly asked to send. Enabled by mcp.allowSend in config.json.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Draft id"
+        },
+        "changeKey": {
+          "description": "changeKey returned when the draft was created/updated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_accounts",
+    "description": "List the configured accounts (name, provider, whether it holds mail, which calendar backend: ews | caldav | google | null, server). Message and event ids are prefixed \"<account>:\".",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {}
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_calendars",
+    "description": "List the calendars of the Exchange account(s): the default one plus any extra calendars you created. Pass mailbox to see whether a colleague's default calendar is shared with you.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        },
+        "mailbox": {
+          "description": "Email of another person (their default calendar)",
+          "type": "string"
+        }
+      }
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "list_events",
+    "description": "Events in a time window (default: now → +7 days), recurring series expanded, soonest first. Own default calendar across accounts unless `calendar` names one of your calendars or a colleague's email (needs their sharing permission). Times are ISO with offset.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "start": {
+          "description": "ISO or natural (\"today\", \"monday\", \"+1d\"); default now",
+          "type": "string"
+        },
+        "end": {
+          "description": "Default start + 7 days",
+          "type": "string"
+        },
+        "calendar": {
+          "description": "Own calendar by name or id (default: the default calendar), or a colleague's email for their shared calendar",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Default 100",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        }
+      }
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "get_event",
+    "description": "One event in full: body, attendees and their responses, organizer, reminder.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Event id from list_events"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "free_busy",
+    "description": "Availability of one or more people (anyone in the organisation): busy/tentative/out-of-office blocks, with subjects where you have detail access, plus a merged grid (one char per interval: 0 free, 1 tentative, 2 busy, 3 OOF, 4 no data).",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "emails": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "start": {
+          "description": "Default now",
+          "type": "string"
+        },
+        "end": {
+          "description": "Default start + 1 day",
+          "type": "string"
+        },
+        "intervalMinutes": {
+          "description": "Grid interval, default 30",
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 1440
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "emails"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "find_free_slots",
+    "description": "Suggest meeting slots when everyone listed is free: scans the next days inside working hours (local time, weekdays) and returns up to `max` candidate start/end pairs.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "emails": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Everyone who must be free (include yourself)"
+        },
+        "durationMinutes": {
+          "description": "Default 30",
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 1440
+        },
+        "start": {
+          "description": "Search from (default now)",
+          "type": "string"
+        },
+        "end": {
+          "description": "Search until (default start + 5 days)",
+          "type": "string"
+        },
+        "hoursFrom": {
+          "description": "Earliest local hour, default 9",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 23
+        },
+        "hoursTo": {
+          "description": "Latest local hour, default 18",
+          "type": "number",
+          "minimum": 1,
+          "maximum": 24
+        },
+        "weekends": {
+          "type": "boolean"
+        },
+        "tentativeOk": {
+          "description": "Treat tentative as free",
+          "type": "boolean"
+        },
+        "max": {
+          "description": "Default 10",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "emails"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "create_event",
+    "description": "Create an appointment on your calendar. With attendees it becomes a meeting and invitations are SENT (needs mcp.allowSend and the user's explicit request). Returns the event id.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "subject": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string",
+          "description": "ISO or natural (\"tomorrow 9am\")"
+        },
+        "end": {
+          "description": "Default start + durationMinutes (30)",
+          "type": "string"
+        },
+        "durationMinutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "allDay": {
+          "type": "boolean"
+        },
+        "location": {
+          "type": "string"
+        },
+        "body": {
+          "description": "Plain-text description",
+          "type": "string"
+        },
+        "attendees": {
+          "description": "Required attendees (emails) — sends invitations",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "optionalAttendees": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reminderMinutes": {
+          "description": "Default: none",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "showAs": {
+          "type": "string",
+          "enum": [
+            "Free",
+            "Tentative",
+            "Busy",
+            "OOF",
+            "WorkingElsewhere"
+          ]
+        },
+        "calendar": {
+          "description": "One of your calendars by name/id (default: the default calendar)",
+          "type": "string"
+        },
+        "account": {
+          "description": "Account name (default: all accounts)",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject",
+        "start"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "update_event",
+    "description": "Change an event (subject, time, location, body, reminder, attendees). For a meeting, attendees are SENT an update (needs mcp.allowSend).",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        },
+        "allDay": {
+          "type": "boolean"
+        },
+        "location": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "reminderMinutes": {
+          "description": "-1 removes the reminder",
+          "type": "integer",
+          "minimum": -1,
+          "maximum": 9007199254740991
+        },
+        "showAs": {
+          "type": "string",
+          "enum": [
+            "Free",
+            "Tentative",
+            "Busy",
+            "OOF",
+            "WorkingElsewhere"
+          ]
+        },
+        "attendees": {
+          "description": "Replacement required-attendee list",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "optionalAttendees": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "delete_event",
+    "description": "Delete an event (to Deleted Items). As organizer of a meeting this SENDS cancellations (needs mcp.allowSend); as an attendee it just removes it from your calendar.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  },
+  {
+    "name": "respond_to_event",
+    "description": "Accept, tentatively accept or decline a meeting invitation. The response is SENT to the organizer (needs mcp.allowSend) unless notify is false, which only records it on your calendar.",
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "response": {
+          "type": "string",
+          "enum": [
+            "accept",
+            "tentative",
+            "decline"
+          ]
+        },
+        "message": {
+          "description": "Note to the organizer",
+          "type": "string"
+        },
+        "notify": {
+          "description": "Default true",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "response"
+      ]
+    },
+    "execution": {
+      "taskSupport": "forbidden"
+    }
+  }
+]

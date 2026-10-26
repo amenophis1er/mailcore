@@ -96,8 +96,28 @@ await w.start();
 The first poll of an account sets a baseline and reports nothing. Seen ids live in the `state` store (default
 `<dataDir>/state.json`), so a restart does not re-announce mail.
 
+## Tools (`mailcore/tools`)
+
+MailWatcher's MCP mail and calendar tools, as plain objects any agent host can serve in-process, under the same
+names, descriptions, schemas and outputs. They are static, so a manifest can declare them before any instance
+exists; the instance comes with each call. zod (^4) is a peer dependency: the schemas are your zod.
+
+```js
+import { mailTools, mailInstructions, MAIL_INSTRUCTIONS } from 'mailcore/tools';
+
+const tools = mailTools({ allowSend: false });    // [{ name, description, input: z.object, effect, effectFor?, run }]
+const out = await tools[0].run(mc, { limit: 5 }, { signal });   // the data an MCP server sends as JSON text
+```
+
+`effect`, strictest first: `others` (sends mail to someone, or changes a meeting that has other attendees:
+send_draft, create/update/delete_event, respond_to_event), `own-calendar` (an appointment with nobody else),
+`draft`, `local` (mark_read, save_attachments), `read`. For create/update/delete_event, `effect` is the worst case
+and `effectFor(core, args)` gives the effect of one call. Without `allowSend`, send_draft is absent and calendar
+calls that would mail someone throw before doing anything. MailWatcher adds `next_event`, `wait_for_mail` and the
+rule tools on top, as they need its daemon and its rules file.
+
 ## Tests
 
-`npm test` runs `node --test` over the parts that need no network (bodies, iCalendar, DAV XML, EWS request
+`npm test` runs `node --test` over the parts that need no network (the tool table against MailWatcher's tools/list, bodies, iCalendar, DAV XML, EWS request
 building and parsing, rules, the event log, thread heuristics, the encrypted cache, the auth-retry policy).
 `npm run typecheck` compiles a strict NodeNext consumer against `index.d.ts`.
