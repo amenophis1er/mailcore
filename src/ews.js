@@ -1,0 +1,528 @@
+// EWS (Exchange Web Services) client over NTLM.
+// Talks SOAP to /EWS/Exchange.asmx — the server advertises NTLM/Negotiate,
+// so every call authenticates with the AD username/password from config.
+
+import httpntlm from 'httpntlm';
+import { XMLParser } from 'fast-xml-parser';
+import { envelope, esc, dig, toArray, textOf, parseMailbox, assertSuccess } from './ews-util.js';
+import { calendarMethods } from './ews-calendar.js';
+
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: '@',
+  removeNSPrefix: true,
+  // keep values as strings: a free/busy grid like "000200" must not become 200
+  parseTagValue: false,
+  // entities are decoded once, by textOf(); decoding here too turned an HTML
+  // body's &lt;https://…&gt; into a raw <https://…> tag
+  processEntities: false
+});
+
+export class EwsClient {
+  constructor({ host, username, password, domain = '', email = '' }) {
+    this.url = host.replace(/\/$/, '') + '/EWS/Exchange.asmx';
+    this.username = username;
+    this.password = password;
+    this.domain = domain;
+    this.self = String(email || '').toLowerCase(); // own SMTP address; resolved lazily when not configured
+  }
+
+  /** Own SMTP address: from config, else ResolveNames on the login name (cached). */
+  async selfEmail() {
+    if (this.self) return this.self;
+    const json = await this.post(envelope(`<m:ResolveNames ReturnFullContactData="false"><m:UnresolvedEntry>${esc(this.username)}</m:UnresolvedEntry></m:ResolveNames>`));
+    const res = toArray(dig(json, 'Envelope.Body.ResolveNamesResponse.ResponseMessages.ResolveNamesResponseMessage.ResolutionSet.Resolution'))[0];
+    this.self = textOf(res?.Mailbox?.EmailAddress).toLowerCase();
+    if (!this.self) throw new Error(`cannot resolve my own address from "${this.username}" — set "email" on the account in config.json`);
+    return this.self;
+  }
+
+  post(xml) {
+    return new Promise((resolve, reject) => {
+      httpntlm.post(
+        {
+          url: this.url,
+          username: this.username,
+          password: this.password,
+          domain: this.domain,
+          workstation: '',
+          body: xml,
+          headers: { 'Content-Type': 'text/xml; charset=utf-8' }
+        },
+        (err, res) => {
+          if (err) return reject(err);
+          if (res.statusCode === 401) {
+            const e = new Error('EWS authentication failed (401) — the cached password is likely stale.');
+            e.code = 'EWS_AUTH';
+            return reject(e);
+          }
+          if (res.statusCode !== 200) {
+            return reject(new Error(`EWS HTTP ${res.statusCode}: ${String(res.body).slice(0, 300)}`));
+          }
+          resolve(parser.parse(res.body));
+        }
+      );
+    });
+  }
+
+  // --- operations -----------------------------------------------------------
+
+  /**
+   * List newest items in a folder. Options: limit, unreadOnly, senderContains,
+   * subjectContains, sinceIso, folder (inbox|junk|sent|drafts|trash|archive),
+   * text (subject OR body, via Exchange's content index), hasAttachments.
+   */
+  async findInbox(opts = {}) {
+    const folderId = FOLDERS[String(opts.folder || 'inbox').toLowerCase()];
+    if (!folderId) {
+      throw new Error(`unknown folder "${opts.folder}" — use: ${Object.keys(FOLDERS).join(', ')}`);
+    }
+
+    // Body search and attachment filtering aren't expressible as EWS
+    // restrictions — they need an AQS QueryString (the content index, same as
+    // OWA's search box). When either is requested, translate ALL filters to
+    // AQS, since QueryString and Restriction cannot be combined.
+    if (opts.text || opts.hasAttachments) {
+      const parts = [];
+      // text may be one term or a list — every term must match (AND),
+      // each in the subject OR the body.
+      const texts = Array.isArray(opts.text) ? opts.text : opts.text ? [opts.text] : [];
+      for (const t of texts) parts.push(`(subject:"${aqs(t)}" OR body:"${aqs(t)}")`);
+      if (opts.subjectContains) parts.push(`subject:"${aqs(opts.subjectContains)}"`);
+      if (opts.senderContains) parts.push(`from:"${aqs(opts.senderContains)}"`);
+      if (opts.toContains) parts.push(`(to:"${aqs(opts.toContains)}" OR cc:"${aqs(opts.toContains)}")`);
+      if (opts.fromMe) parts.push(`from:"${aqs(await this.selfEmail())}"`);
+      if (opts.unreadOnly) parts.push('isread:false');
+      if (opts.hasAttachments) parts.push('hasattachments:true');
+      if (opts.sinceIso) {
+        const d = new Date(opts.sinceIso);
+        parts.push(`received:>=${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`);
+      }
+      if (opts.untilIso) {
+        const d = new Date(opts.untilIso);
+        parts.push(`received:<=${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`);
+      }
+      return this.#find(folderId, opts.limit, '', `<m:QueryString>${esc(parts.join(' AND '))}</m:QueryString>`, opts.offset);
+    }
+    const limit = Math.min(opts.limit || 25, 100);
+    const conditions = [];
+    if (opts.subjectContains) {
+      conditions.push(
+        `<t:Contains ContainmentMode="Substring" ContainmentComparison="IgnoreCase">` +
+          `<t:FieldURI FieldURI="item:Subject"/><t:Constant Value="${esc(opts.subjectContains)}"/></t:Contains>`
+      );
+    }
+    if (opts.senderContains || opts.fromMe) {
+      conditions.push(
+        `<t:Contains ContainmentMode="Substring" ContainmentComparison="IgnoreCase">` +
+          `<t:FieldURI FieldURI="message:Sender"/><t:Constant Value="${esc(opts.fromMe ? await this.selfEmail() : opts.senderContains)}"/></t:Contains>`
+      );
+    }
+    if (opts.toContains) {
+      const c = (f) => `<t:Contains ContainmentMode="Substring" ContainmentComparison="IgnoreCase"><t:FieldURI FieldURI="${f}"/><t:Constant Value="${esc(opts.toContains)}"/></t:Contains>`;
+      conditions.push(`<t:Or>${c('message:ToRecipients')}${c('message:CcRecipients')}</t:Or>`);
+    }
+    if (opts.unreadOnly) {
+      conditions.push(
+        `<t:IsEqualTo><t:FieldURI FieldURI="message:IsRead"/>` +
+          `<t:FieldURIOrConstant><t:Constant Value="false"/></t:FieldURIOrConstant></t:IsEqualTo>`
+      );
+    }
+    if (opts.sinceIso) {
+      conditions.push(
+        `<t:IsGreaterThanOrEqualTo><t:FieldURI FieldURI="item:DateTimeReceived"/>` +
+          `<t:FieldURIOrConstant><t:Constant Value="${esc(opts.sinceIso)}"/></t:FieldURIOrConstant></t:IsGreaterThanOrEqualTo>`
+      );
+    }
+    if (opts.untilIso) {
+      conditions.push(
+        `<t:IsLessThanOrEqualTo><t:FieldURI FieldURI="item:DateTimeReceived"/>` +
+          `<t:FieldURIOrConstant><t:Constant Value="${esc(new Date(opts.untilIso).toISOString())}"/></t:FieldURIOrConstant></t:IsLessThanOrEqualTo>`
+      );
+    }
+    let restriction = '';
+    if (conditions.length === 1) restriction = `<m:Restriction>${conditions[0]}</m:Restriction>`;
+    else if (conditions.length > 1) restriction = `<m:Restriction><t:And>${conditions.join('')}</t:And></m:Restriction>`;
+
+    return this.#find(folderId, limit, restriction, '', opts.offset);
+  }
+
+  async #find(folderId, limit, restriction, queryString, offset = 0) {
+    const max = Math.min(limit || 25, 100);
+    // SortOrder is not allowed together with QueryString; AQS results come
+    // back newest-first from the content index anyway.
+    const sort = queryString
+      ? ''
+      : `<m:SortOrder>
+          <t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder>
+        </m:SortOrder>`;
+    const body = `
+      <m:FindItem Traversal="Shallow">
+        <m:ItemShape>
+          <t:BaseShape>IdOnly</t:BaseShape>
+          <t:AdditionalProperties>
+            <t:FieldURI FieldURI="item:Subject"/>
+            <t:FieldURI FieldURI="message:From"/>
+            <t:FieldURI FieldURI="message:IsRead"/>
+            <t:FieldURI FieldURI="item:DateTimeReceived"/>
+            <t:FieldURI FieldURI="item:HasAttachments"/>
+            <t:FieldURI FieldURI="item:DisplayTo"/>
+            <t:FieldURI FieldURI="item:ConversationId"/>
+            <t:FieldURI FieldURI="message:InternetMessageId"/>
+            <t:FieldURI FieldURI="item:InReplyTo"/>
+          </t:AdditionalProperties>
+        </m:ItemShape>
+        <m:IndexedPageItemView MaxEntriesReturned="${max}" Offset="${Math.max(0, Number(offset) || 0)}" BasePoint="Beginning"/>
+        ${restriction}
+        ${sort}
+        <m:ParentFolderIds><t:DistinguishedFolderId Id="${folderId}"/></m:ParentFolderIds>
+        ${queryString}
+      </m:FindItem>`;
+
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.FindItemResponse.ResponseMessages.FindItemResponseMessage');
+    assertSuccess(rm, 'FindItem');
+    const items = toArray(dig(rm, 'RootFolder.Items.Message'));
+    return items.map(parseListItem);
+  }
+
+  /** Fetch one message with its body (Text by default, or HTML) and recipients. */
+  async getMessage(id, { bodyType = 'Text' } = {}) {
+    const bt = bodyType === 'HTML' ? 'HTML' : 'Text';
+    const body = `
+      <m:GetItem>
+        <m:ItemShape>
+          <t:BaseShape>IdOnly</t:BaseShape>
+          <t:BodyType>${bt}</t:BodyType>
+          <t:AdditionalProperties>
+            <t:FieldURI FieldURI="item:Subject"/>
+            <t:FieldURI FieldURI="message:From"/>
+            <t:FieldURI FieldURI="message:ToRecipients"/>
+            <t:FieldURI FieldURI="message:CcRecipients"/>
+            <t:FieldURI FieldURI="message:IsRead"/>
+            <t:FieldURI FieldURI="item:DateTimeReceived"/>
+            <t:FieldURI FieldURI="item:HasAttachments"/>
+            <t:FieldURI FieldURI="item:Attachments"/>
+            <t:FieldURI FieldURI="item:Body"/>
+            <t:FieldURI FieldURI="item:ConversationId"/>
+            <t:FieldURI FieldURI="message:InternetMessageId"/>
+            <t:FieldURI FieldURI="item:InReplyTo"/>
+            <t:FieldURI FieldURI="message:References"/>
+            <t:FieldURI FieldURI="item:InternetMessageHeaders"/>
+          </t:AdditionalProperties>
+        </m:ItemShape>
+        <m:ItemIds><t:ItemId Id="${esc(id)}"/></m:ItemIds>
+      </m:GetItem>`;
+
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage');
+    assertSuccess(rm, 'GetItem');
+    const msg = dig(rm, 'Items.Message');
+    if (!msg) throw new Error('GetItem: message not found');
+    const base = parseListItem(msg);
+    const attachments = ['FileAttachment', 'ItemAttachment']
+      .flatMap((kind) => toArray(dig(msg, 'Attachments.' + kind)))
+      .map((a) => ({
+        id: a.AttachmentId?.['@Id'] || '',
+        name: textOf(a.Name),
+        size: Number(a.Size) || 0,
+        contentType: textOf(a.ContentType),
+        inline: String(a.IsInline) === 'true'
+      }));
+    const headers = {};
+    for (const h of toArray(dig(msg, 'InternetMessageHeaders.InternetMessageHeader'))) {
+      const k = String(h?.['@HeaderName'] || '').toLowerCase();
+      if (k) headers[k] = textOf(h);
+    }
+    return {
+      ...base,
+      to: toArray(dig(msg, 'ToRecipients.Mailbox')).map(parseMailbox),
+      cc: toArray(dig(msg, 'CcRecipients.Mailbox')).map(parseMailbox),
+      references: textOf(msg.References),
+      isBulk: isBulkHeaders(headers),
+      attachments,
+      bodyType: bt,
+      body: textOf(dig(msg, 'Body')).replace(/\r\n?/g, '\n')
+    };
+  }
+
+  /**
+   * Create a reply-all DRAFT (saved to Drafts, never sent) for a message.
+   * The user reviews and sends it from any mail client.
+   */
+  async draftReplyAll(id, changeKey, newBodyText, { bodyType = 'Text' } = {}) {
+    const ck = changeKey ? ` ChangeKey="${esc(changeKey)}"` : '';
+    const body = `
+      <m:CreateItem MessageDisposition="SaveOnly">
+        <m:Items>
+          <t:ReplyAllToItem>
+            <t:ReferenceItemId Id="${esc(id)}"${ck}/>
+            <t:NewBodyContent BodyType="${bodyType === 'HTML' ? 'HTML' : 'Text'}">${esc(newBodyText)}</t:NewBodyContent>
+          </t:ReplyAllToItem>
+        </m:Items>
+      </m:CreateItem>`;
+
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.CreateItemResponse.ResponseMessages.CreateItemResponseMessage');
+    assertSuccess(rm, 'CreateItem(draft reply-all)');
+    const created = dig(rm, 'Items.Message.ItemId');
+    return { draftId: created?.['@Id'] || null, changeKey: created?.['@ChangeKey'] || null };
+  }
+
+  /** Reply-to-sender DRAFT (same semantics as draftReplyAll). */
+  async draftReply(id, changeKey, newBodyText, { bodyType = 'Text' } = {}) {
+    const ck = changeKey ? ` ChangeKey="${esc(changeKey)}"` : '';
+    const body = `
+      <m:CreateItem MessageDisposition="SaveOnly">
+        <m:Items>
+          <t:ReplyToItem>
+            <t:ReferenceItemId Id="${esc(id)}"${ck}/>
+            <t:NewBodyContent BodyType="${bodyType === 'HTML' ? 'HTML' : 'Text'}">${esc(newBodyText)}</t:NewBodyContent>
+          </t:ReplyToItem>
+        </m:Items>
+      </m:CreateItem>`;
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.CreateItemResponse.ResponseMessages.CreateItemResponseMessage');
+    assertSuccess(rm, 'CreateItem(draft reply)');
+    const created = dig(rm, 'Items.Message.ItemId');
+    return { draftId: created?.['@Id'] || null, changeKey: created?.['@ChangeKey'] || null };
+  }
+
+  /**
+   * Edit an existing draft: any of subject, body (Text or HTML), to, cc.
+   * Requires the current changeKey; returns the new one for further edits.
+   */
+  async updateDraft({ id, changeKey, subject, body, bodyType = 'Text', to, cc }) {
+    const mailboxes = (list) =>
+      list.map((a) => `<t:Mailbox><t:EmailAddress>${esc(a)}</t:EmailAddress></t:Mailbox>`).join('');
+    const sets = [];
+    if (subject !== undefined) {
+      sets.push(`<t:SetItemField><t:FieldURI FieldURI="item:Subject"/><t:Message><t:Subject>${esc(subject)}</t:Subject></t:Message></t:SetItemField>`);
+    }
+    if (body !== undefined) {
+      sets.push(`<t:SetItemField><t:FieldURI FieldURI="item:Body"/><t:Message><t:Body BodyType="${bodyType === 'HTML' ? 'HTML' : 'Text'}">${esc(body)}</t:Body></t:Message></t:SetItemField>`);
+    }
+    if (to !== undefined) {
+      sets.push(`<t:SetItemField><t:FieldURI FieldURI="message:ToRecipients"/><t:Message><t:ToRecipients>${mailboxes(to)}</t:ToRecipients></t:Message></t:SetItemField>`);
+    }
+    if (cc !== undefined) {
+      sets.push(`<t:SetItemField><t:FieldURI FieldURI="message:CcRecipients"/><t:Message><t:CcRecipients>${mailboxes(cc)}</t:CcRecipients></t:Message></t:SetItemField>`);
+    }
+    if (sets.length === 0) throw new Error('updateDraft: nothing to change');
+
+    const xml = `
+      <m:UpdateItem ConflictResolution="AlwaysOverwrite" MessageDisposition="SaveOnly">
+        <m:ItemChanges>
+          <t:ItemChange>
+            <t:ItemId Id="${esc(id)}" ChangeKey="${esc(changeKey)}"/>
+            <t:Updates>${sets.join('')}</t:Updates>
+          </t:ItemChange>
+        </m:ItemChanges>
+      </m:UpdateItem>`;
+
+    const json = await this.post(envelope(xml));
+    const rm = dig(json, 'Envelope.Body.UpdateItemResponse.ResponseMessages.UpdateItemResponseMessage');
+    assertSuccess(rm, 'UpdateItem(draft)');
+    const updated = dig(rm, 'Items.Message.ItemId');
+    return { draftId: updated?.['@Id'] || id, changeKey: updated?.['@ChangeKey'] || null };
+  }
+
+  /**
+   * Attach a file to an existing item (draft). Attaching changes the item's
+   * changeKey — the new one is returned for subsequent operations.
+   * inline + contentId: an inline image for an HTML body (<img src="cid:ID">).
+   */
+  async addAttachment(parentId, parentChangeKey, { name, contentBase64, contentType, inline = false, contentId }) {
+    const ck = parentChangeKey ? ` ChangeKey="${esc(parentChangeKey)}"` : '';
+    const ct = contentType ? `<t:ContentType>${esc(contentType)}</t:ContentType>` : '';
+    const cid = inline ? `<t:ContentId>${esc(contentId || name)}</t:ContentId>` : '';
+    const xml = `
+      <m:CreateAttachment>
+        <m:ParentItemId Id="${esc(parentId)}"${ck}/>
+        <m:Attachments>
+          <t:FileAttachment>
+            <t:Name>${esc(name)}</t:Name>
+            ${ct}
+            ${cid}
+            <t:Content>${contentBase64}</t:Content>
+            ${inline ? '<t:IsInline>true</t:IsInline>' : ''}
+          </t:FileAttachment>
+        </m:Attachments>
+      </m:CreateAttachment>`;
+    const json = await this.post(envelope(xml));
+    const rm = dig(json, 'Envelope.Body.CreateAttachmentResponse.ResponseMessages.CreateAttachmentResponseMessage');
+    assertSuccess(rm, 'CreateAttachment');
+    const att = dig(rm, 'Attachments.FileAttachment.AttachmentId');
+    return { attachmentId: att?.['@Id'] || null, changeKey: att?.['@RootItemChangeKey'] || null };
+  }
+
+  /** Send an existing draft (used by the CLI's --send after attaching). */
+  async sendItem(id, changeKey) {
+    const ck = changeKey ? ` ChangeKey="${esc(changeKey)}"` : '';
+    const xml = `
+      <m:SendItem SaveItemToFolder="true">
+        <m:ItemIds><t:ItemId Id="${esc(id)}"${ck}/></m:ItemIds>
+        <m:SavedItemFolderId><t:DistinguishedFolderId Id="sentitems"/></m:SavedItemFolderId>
+      </m:SendItem>`;
+    const json = await this.post(envelope(xml));
+    const rm = dig(json, 'Envelope.Body.SendItemResponse.ResponseMessages.SendItemResponseMessage');
+    assertSuccess(rm, 'SendItem');
+    return true;
+  }
+
+  /** Move an item to Deleted Items (reversible, unlike a hard delete). */
+  async deleteItem(id, changeKey) {
+    const ck = changeKey ? ` ChangeKey="${esc(changeKey)}"` : '';
+    const xml = `
+      <m:DeleteItem DeleteType="MoveToDeletedItems">
+        <m:ItemIds><t:ItemId Id="${esc(id)}"${ck}/></m:ItemIds>
+      </m:DeleteItem>`;
+    const json = await this.post(envelope(xml));
+    const rm = dig(json, 'Envelope.Body.DeleteItemResponse.ResponseMessages.DeleteItemResponseMessage');
+    assertSuccess(rm, 'DeleteItem');
+    return true;
+  }
+
+  /**
+   * Compose a new message. send=false saves a draft in Drafts;
+   * send=true sends it and keeps a copy in Sent Items.
+   */
+  async createMessage({ to = [], cc = [], subject = '', body = '', bodyType = 'Text', send = false }) {
+    const mailboxes = (list) =>
+      list.map((a) => `<t:Mailbox><t:EmailAddress>${esc(a)}</t:EmailAddress></t:Mailbox>`).join('');
+    const disposition = send ? 'SendAndSaveCopy' : 'SaveOnly';
+    const savedFolder = send ? 'sentitems' : 'drafts';
+    const xml = `
+      <m:CreateItem MessageDisposition="${disposition}">
+        <m:SavedItemFolderId><t:DistinguishedFolderId Id="${savedFolder}"/></m:SavedItemFolderId>
+        <m:Items>
+          <t:Message>
+            <t:Subject>${esc(subject)}</t:Subject>
+            <t:Body BodyType="${bodyType === 'HTML' ? 'HTML' : 'Text'}">${esc(body)}</t:Body>
+            <t:ToRecipients>${mailboxes(to)}</t:ToRecipients>
+            ${cc.length ? `<t:CcRecipients>${mailboxes(cc)}</t:CcRecipients>` : ''}
+          </t:Message>
+        </m:Items>
+      </m:CreateItem>`;
+
+    const json = await this.post(envelope(xml));
+    const rm = dig(json, 'Envelope.Body.CreateItemResponse.ResponseMessages.CreateItemResponseMessage');
+    assertSuccess(rm, send ? 'CreateItem(send)' : 'CreateItem(draft)');
+    const created = dig(rm, 'Items.Message.ItemId');
+    return { sent: send, draftId: created?.['@Id'] || null, changeKey: created?.['@ChangeKey'] || null };
+  }
+
+  /** Bulk/list flag for many ids at once (headers only, one GetItem). Returns Map id → boolean. */
+  async bulkFlags(ids) {
+    const out = new Map();
+    for (let i = 0; i < ids.length; i += 50) {
+      const batch = ids.slice(i, i + 50);
+      const xml = `
+        <m:GetItem>
+          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="item:InternetMessageHeaders"/></t:AdditionalProperties></m:ItemShape>
+          <m:ItemIds>${batch.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join('')}</m:ItemIds>
+        </m:GetItem>`;
+      const json = await this.post(envelope(xml));
+      const rms = toArray(dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage'));
+      rms.forEach((rm, k) => {
+        if (rm?.['@ResponseClass'] !== 'Success') return;
+        const it = dig(rm, 'Items.Message') || dig(rm, 'Items.MeetingRequest') || dig(rm, 'Items.Item');
+        const headers = {};
+        for (const h of toArray(dig(it, 'InternetMessageHeaders.InternetMessageHeader'))) {
+          const key = String(h?.['@HeaderName'] || '').toLowerCase();
+          if (key) headers[key] = textOf(h);
+        }
+        out.set(it?.ItemId?.['@Id'] || batch[k], isBulkHeaders(headers));
+      });
+    }
+    return out;
+  }
+
+  /** Download one file attachment (id from getMessage().attachments). */
+  async getAttachment(attachmentId) {
+    const body = `
+      <m:GetAttachment>
+        <m:AttachmentIds><t:AttachmentId Id="${esc(attachmentId)}"/></m:AttachmentIds>
+      </m:GetAttachment>`;
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.GetAttachmentResponse.ResponseMessages.GetAttachmentResponseMessage');
+    assertSuccess(rm, 'GetAttachment');
+    const file = dig(rm, 'Attachments.FileAttachment');
+    if (!file) throw new Error('GetAttachment: not a file attachment (attached mails cannot be downloaded)');
+    return {
+      name: textOf(file.Name) || 'attachment',
+      contentType: textOf(file.ContentType) || 'application/octet-stream',
+      content: Buffer.from(String(textOf(file.Content) || ''), 'base64')
+    };
+  }
+
+  /** Mark a message read (requires the changeKey from a listing). */
+  async markRead(id, changeKey, isRead = true) {
+    const body = `
+      <m:UpdateItem ConflictResolution="AutoResolve" MessageDisposition="SaveOnly">
+        <m:ItemChanges>
+          <t:ItemChange>
+            <t:ItemId Id="${esc(id)}" ChangeKey="${esc(changeKey)}"/>
+            <t:Updates>
+              <t:SetItemField>
+                <t:FieldURI FieldURI="message:IsRead"/>
+                <t:Message><t:IsRead>${isRead}</t:IsRead></t:Message>
+              </t:SetItemField>
+            </t:Updates>
+          </t:ItemChange>
+        </m:ItemChanges>
+      </m:UpdateItem>`;
+
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.UpdateItemResponse.ResponseMessages.UpdateItemResponseMessage');
+    assertSuccess(rm, 'UpdateItem(markRead)');
+    return true;
+  }
+}
+
+// --- helpers -----------------------------------------------------------------
+
+export const FOLDERS = {
+  inbox: 'inbox',
+  junk: 'junkemail',
+  sent: 'sentitems',
+  drafts: 'drafts',
+  trash: 'deleteditems',
+  archive: 'archive'
+};
+
+function parseListItem(m) {
+  const from = dig(m, 'From.Mailbox');
+  return {
+    id: m.ItemId?.['@Id'] || '',
+    changeKey: m.ItemId?.['@ChangeKey'] || '',
+    subject: textOf(m.Subject),
+    fromName: textOf(from?.Name),
+    fromEmail: textOf(from?.EmailAddress),
+    displayTo: textOf(m.DisplayTo),
+    isRead: String(m.IsRead) !== 'false',
+    hasAttachments: String(m.HasAttachments) === 'true',
+    received: textOf(m.DateTimeReceived),
+    conversationId: m.ConversationId?.['@Id'] || '',
+    messageId: textOf(m.InternetMessageId),
+    inReplyTo: textOf(m.InReplyTo)
+  };
+}
+
+/** Mailing-list / automated mail, judged from the usual headers. */
+export function isBulkHeaders(h) {
+  const get = (k) => String(h[k] || '').toLowerCase();
+  if (h['list-id'] || h['list-unsubscribe'] || h['list-post']) return true;
+  if (/bulk|list|junk/.test(get('precedence'))) return true;
+  const auto = get('auto-submitted');
+  if (auto && auto !== 'no') return true;
+  return false;
+}
+
+function aqs(s) {
+  // value inside an AQS quoted string — strip quotes to avoid breaking out
+  return String(s).replace(/"/g, ' ');
+}
+
+// Calendar operations live in ews-calendar.js and share this client's post().
+Object.assign(EwsClient.prototype, calendarMethods);
