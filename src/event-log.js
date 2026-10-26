@@ -48,6 +48,7 @@ export class EventLog extends EventEmitter {
     this.seq = 0;
     this.queue = [];
     this.waiters = new Set();
+    this.closed = false;
     if (store) {
       try {
         const saved = store.load();
@@ -73,11 +74,7 @@ export class EventLog extends EventEmitter {
       if (this.queue.length > this.max) this.queue = this.queue.slice(-this.max);
       this.#persist();
       for (const w of Array.from(this.waiters)) {
-        if (matchesFilter(event, w.filter)) {
-          clearTimeout(w.timer);
-          this.waiters.delete(w);
-          w.resolve([event]);
-        }
+        if (matchesFilter(event, w.filter)) w.resolve([event]);
       }
     }
     this.emit('event', event);
@@ -98,48 +95,53 @@ export class EventLog extends EventEmitter {
    * Long-poll: { events, cursor, gap? } at once when events past `after`
    * match, else when the first matching one lands, else after `timeout`
    * seconds with events: []. after 'now' (or null) = from the current cursor.
-   * `signal` (AbortSignal) ends the wait early with events: [].
+   * `signal` (AbortSignal) ends the wait early with events: [] — at once
+   * when it is already aborted — and so does close().
    */
   wait({ after = 'now', timeout = 90, filter = {}, limit = 50, signal } = {}) {
     const from = after == null || after === 'now' ? this.seq : Math.max(0, Number(after) || 0);
     const gap = after != null && after !== 'now' ? gapInfo(from, this.queue, this.seq) : {};
     const max = Math.min(100, Math.max(1, Number(limit) || 50));
     const ready = this.since(from, filter);
-    if (ready.length || !(timeout > 0)) {
-      return Promise.resolve({ events: ready.slice(0, max), cursor: ready.length ? ready[Math.min(max, ready.length) - 1].seq : this.seq, ...gap });
-    }
+    const result = (events) => ({ events, cursor: events.length ? events[events.length - 1].seq : this.seq, ...gap });
+    if (ready.length) return Promise.resolve(result(ready.slice(0, max)));
+    if (!(timeout > 0) || this.closed || signal?.aborted) return Promise.resolve(result([]));
     return new Promise((resolve) => {
-      const w = {
-        filter,
-        resolve: (events) => resolve({ events, cursor: events.length ? events[events.length - 1].seq : this.seq, ...gap }),
-        timer: null
+      const w = { filter, timer: null, resolve: null };
+      const onAbort = () => w.resolve([]);
+      // one settle path: timeout, abort, a matching event and close() all clean up the same three things
+      w.resolve = (events) => {
+        if (!this.waiters.delete(w)) return;
+        clearTimeout(w.timer);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(result(events));
       };
-      const done = () => { clearTimeout(w.timer); if (this.waiters.delete(w)) w.resolve([]); };
-      w.timer = setTimeout(done, timeout * 1000);
-      if (signal) {
-        if (signal.aborted) return done();
-        signal.addEventListener('abort', done, { once: true });
-      }
       this.waiters.add(w);
+      w.timer = setTimeout(onAbort, timeout * 1000);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
   /**
-   * Async iterator over matching events after `after`, forever (or until
-   * `signal` aborts). Each yielded event carries its `seq`: keep it as the cursor.
+   * Async iterator over matching events after `after`, until `signal` aborts
+   * or the log is closed. Each event carries its `seq`: keep it as the cursor.
+   * When `after` predates what the bounded queue still holds, a
+   * { type: 'gap', gap: true, oldest, lost, cursor } notice comes first:
+   * resync rather than trust the stream.
    */
   async *events({ after = 'now', filter = {}, signal } = {}) {
-    let cursor = after == null || after === 'now' ? this.seq : Number(after) || 0;
-    while (!signal?.aborted) {
+    let cursor = after == null || after === 'now' ? 'now' : Number(after) || 0;
+    while (!signal?.aborted && !this.closed) {
       const r = await this.wait({ after: cursor, timeout: 3600, filter, signal });
+      if (r.gap) yield { type: 'gap', gap: true, oldest: r.oldest ?? null, lost: r.lost ?? 0, cursor: typeof cursor === 'number' ? cursor : this.seq };
       for (const e of r.events) yield e;
       cursor = r.cursor;
     }
   }
 
-  /** Release every waiter (events: []). */
+  /** Release every waiter (events: []) and end every events() iterator. */
   close() {
-    for (const w of this.waiters) { clearTimeout(w.timer); w.resolve([]); }
-    this.waiters.clear();
+    this.closed = true;
+    for (const w of Array.from(this.waiters)) w.resolve([]);
   }
 }

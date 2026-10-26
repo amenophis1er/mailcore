@@ -89,3 +89,40 @@ test('events() iterates matches in order', async () => {
   await done;
   assert.deepEqual(seen, [1, 2]);
 });
+
+test('wait with an already-aborted signal resolves at once', async () => {
+  const log = new EventLog();
+  const ac = new AbortController();
+  ac.abort();
+  const r = await Promise.race([log.wait({ timeout: 60, signal: ac.signal }), new Promise((res) => setTimeout(() => res('hung'), 100))]);
+  assert.deepEqual(r, { events: [], cursor: 0 });
+  assert.equal(log.waiters.size, 0);
+});
+
+test('waits on a reused signal leave no abort listeners behind', async () => {
+  const { getEventListeners } = await import('node:events');
+  const log = new EventLog();
+  const ac = new AbortController();
+  const a = log.wait({ timeout: 60, signal: ac.signal });
+  log.append('newmail', { account: 'a', rule: 'r' }); // settles by a match
+  await a;
+  await log.wait({ timeout: 0.01, signal: ac.signal }); // settles by timeout
+  const c = log.wait({ timeout: 60, signal: ac.signal });
+  log.close(); // settles by close
+  await c;
+  assert.equal(getEventListeners(ac.signal, 'abort').length, 0);
+  assert.equal(log.waiters.size, 0);
+});
+
+test('events() reports a gap first, and ends when the log closes', async () => {
+  const log = new EventLog({ max: 2 });
+  for (let i = 0; i < 4; i++) log.append('newmail', { account: 'a', rule: 'r' });
+  const seen = [];
+  const done = (async () => { for await (const e of log.events({ after: 0 })) seen.push(e.gap ? `gap:${e.lost}` : e.seq); })();
+  await new Promise((r) => setTimeout(r, 5));
+  log.close();
+  await done; // would hang without the closed flag
+  assert.deepEqual(seen, ['gap:2', 3, 4]);
+  assert.equal(log.closed, true);
+  assert.deepEqual(await log.wait({ timeout: 60 }), { events: [], cursor: 4 }, 'a closed log answers at once');
+});

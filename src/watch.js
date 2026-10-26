@@ -39,15 +39,24 @@ export class MailWatch extends EventEmitter {
     this.log = log || core.log;
     this.calendarSnapshot = calendarSnapshot;
     this.timers = [];
+    this.timeouts = new Set();
     this.streams = [];
     this.calendars = new Map();
+    this.ticks = new Map();
     this.started = false;
+    // stop() bumps the generation; anything begun under an older one checks
+    // it after each await and installs nothing (intervals, streams, watchers)
+    this.gen = 0;
   }
+
+  #alive(gen) { return this.started && this.gen === gen; }
+  #state() { return this.core.state.load() ?? {}; }
 
   /** Start every account; resolves once each account's first poll ran. */
   async start() {
     if (this.started) return this;
     this.started = true;
+    const gen = ++this.gen;
     const core = this.core;
     const names = this.names || core.accountNames();
     if (names.length === 0) throw new Error('no accounts to watch');
@@ -58,32 +67,48 @@ export class MailWatch extends EventEmitter {
         core.cache.openCache({ create: true });
         const removed = core.cache.prune();
         this.log(`cache: ${cached.join(', ')} → ${core.cache.path}${removed ? ` (pruned ${removed} old rows)` : ''}`);
-        this.#every(() => { try { core.cache.prune(); } catch (e) { this.log('cache prune failed: ' + e.message); } }, 6 * 3600e3);
+        this.#every(gen, () => { try { core.cache.prune(); } catch (e) { this.log('cache prune failed: ' + e.message); } }, 6 * 3600e3);
       } catch (e) {
         this.log('cache disabled: ' + e.message);
         this.useCache = false;
       }
     }
-    await Promise.all(names.map((n) => this.#watchAccount(core.account(n))));
+    await Promise.all(names.map((n) => this.#watchAccount(core.account(n), gen)));
     return this;
   }
 
   stop() {
+    this.gen++;
+    this.started = false;
     for (const t of this.timers) clearInterval(t);
     this.timers = [];
+    for (const t of this.timeouts) clearTimeout(t);
+    this.timeouts.clear();
+    this.ticks.clear();
     for (const s of this.streams) { try { s.stop?.(); } catch {} }
     this.streams = [];
     for (const c of this.calendars.values()) c.stop();
     this.calendars.clear();
-    this.started = false;
   }
 
   /** Poll one account now (also what a push triggers). */
-  check(account) { return this.ticks?.get(account)?.(); }
+  check(account) { return this.ticks.get(account)?.(); }
 
-  #every(fn, ms) { const t = setInterval(fn, ms); this.timers.push(t); return t; }
+  #every(gen, fn, ms) {
+    if (!this.#alive(gen)) return null;
+    const t = setInterval(fn, ms);
+    this.timers.push(t);
+    return t;
+  }
 
-  async #watchAccount(acct) {
+  #later(gen, fn, ms) {
+    if (!this.#alive(gen)) return null;
+    const t = setTimeout(() => { this.timeouts.delete(t); if (this.#alive(gen)) fn(); }, ms);
+    this.timeouts.add(t);
+    return t;
+  }
+
+  async #watchAccount(acct, gen) {
     const core = this.core;
     const name = acct.name;
     const mail = hasMail(acct);
@@ -91,34 +116,37 @@ export class MailWatch extends EventEmitter {
     let ticking = false;
     let again = false; // a push arrived mid-poll: run once more right after
     const tick = async () => {
-      if (!mail) return;
+      if (!mail || !this.#alive(gen)) return;
       if (ticking) { again = true; return; }
       ticking = true;
       try {
-        await core.withClient(name, (client) => this.#poll(client, name), {
+        await core.withClient(name, (client) => this.#poll(client, name, gen), {
           onRefresh: () => this.log(`[${name}] password rejected — asking for fresh credentials…`)
         });
         failures = 0;
       } catch (e) {
+        if (!this.#alive(gen)) return;
         failures++;
         this.log(`[${name}] poll failed (${failures}): ${e.message}`);
         this.emit('failure', { account: name, error: e, failures });
       } finally {
         ticking = false;
-        if (again) { again = false; setTimeout(tick, 250); }
+        if (again) { again = false; this.#later(gen, tick, 250); }
       }
     };
-    (this.ticks ||= new Map()).set(name, tick);
+    this.ticks.set(name, tick);
     if (mail) {
       await tick();
-      this.#every(tick, Math.max(15, this.pollSeconds || core.pollSeconds) * 1000);
+      this.#every(gen, tick, Math.max(15, this.pollSeconds || core.pollSeconds) * 1000);
     }
+    if (!this.#alive(gen)) return;
 
     // Calendar: snapshot + reminders, refreshed on push (Exchange) or by polling
     let calendar = null;
     if (this.calendar && calendarProvider(acct) && acct.calendar && acct.calendar.watch !== false) {
       try {
         const { watchCalendar } = await import('./calendar-watch.js');
+        if (!this.#alive(gen)) return;
         calendar = watchCalendar(core, { account: name, log: this.log, snapshot: this.calendarSnapshot?.(name), start: false });
         calendar.on('changes', (changes) => this.emit('calendar', { account: name, changes }));
         calendar.on('reminder', (r) => this.emit('reminder', r));
@@ -134,31 +162,35 @@ export class MailWatch extends EventEmitter {
     if (!mail || !this.push || acct.streaming === false) return;
     try {
       const stream = await core.stream(name, {
-        onNewMail: () => setTimeout(tick, 500), // small delay lets the item settle
+        onNewMail: () => this.#later(gen, tick, 500), // small delay lets the item settle
         onCalendarChange: calendar ? () => calendar.refresh() : undefined,
         onState: (s) => {
+          if (!this.#alive(gen)) return;
           try {
-            const state = core.state.load();
+            const state = this.#state();
             core.state.save({ ...state, streams: { ...(state.streams || {}), [name]: { state: s, at: Date.now() } } });
           } catch {}
           this.emit('stream', { account: name, state: s });
         },
         log: (m) => this.log(`[${name}] [stream] ` + m)
       });
+      if (!this.#alive(gen)) return; // stopped while connecting: never start it
       this.streams.push(stream);
       stream.start();
     } catch (e) {
+      if (!this.#alive(gen)) return;
       this.log(`[${name}] push stream not started: ${e.message} — polling only`);
     }
   }
 
-  async #poll(client, account) {
+  async #poll(client, account, gen) {
     const core = this.core;
     const acct = core.accounts[account];
     const caching = this.useCache && acct?.cache?.enabled !== false && core.cache.openCache() !== null;
     // first poll with a cache: backfill a deeper slice of headers
-    const backfill = caching && !(core.state.load().baselinedAccounts || {})[account];
+    const backfill = caching && !(this.#state().baselinedAccounts || {})[account];
     const items = await client.findInbox({ limit: backfill ? 100 : 25 });
+    if (!this.#alive(gen)) return;
     if (caching) {
       try {
         const newIds = core.cache.upsertItems(account, items);
@@ -167,7 +199,8 @@ export class MailWatch extends EventEmitter {
         this.log(`[${account}] cache write failed: ${e.message}`);
       }
     }
-    const state = core.state.load();
+    if (!this.#alive(gen)) return;
+    const state = this.#state();
     const seen = new Set(state.seenIds || []);
     // ids are "<account>:<raw>"; an older seen-set may hold raw ids for the
     // account named "default" — honour those too so nothing re-alerts.

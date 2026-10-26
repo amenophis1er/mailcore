@@ -47,7 +47,7 @@ export class Mailcore {
       dir: dataDir,
       key: cacheKey,
       accounts: () => this.accounts,
-      state: () => this.state.load(),
+      state: () => this.state.load() ?? {},
       pollSeconds: () => this.pollSeconds,
       fresh: cacheFresh
     });

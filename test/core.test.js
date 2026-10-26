@@ -131,3 +131,15 @@ test('the encrypted cache serves listings and bodies while a watcher is alive', 
   const wrong = createMailcore({ accounts: { work: ACCOUNTS.work }, credentials: noCreds, dataDir: dir, cacheKey: 'x'.repeat(64), state });
   assert.throws(() => wrong.cache.openCache(), (e) => e.code === 'CACHE_KEY');
 });
+
+test('AccountClient.close() waits for the backends to close', async () => {
+  const order = [];
+  const slow = (name) => ({ close: () => new Promise((r) => setTimeout(() => { order.push(name); r(); }, 10)) });
+  const c = new AccountClient('home', slow('mail'), slow('calendar'));
+  const p = c.close();
+  assert.ok(p instanceof Promise);
+  await p;
+  assert.deepEqual(order.sort(), ['calendar', 'mail']);
+  const failing = new AccountClient('x', { close: async () => { throw new Error('logout failed'); } });
+  await failing.close(); // never rejects
+});

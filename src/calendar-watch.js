@@ -25,21 +25,29 @@ const KEY_FIELDS = ['subject', 'start', 'end', 'location', 'isCancelled', 'organ
 export function watchCalendar(core, { account, snapshot, settings, log = () => {}, start = true } = {}) {
   const fresh = () => ({ baselined: false, events: {}, fired: {} });
   const store = snapshot || (core.dataDir ? jsonFileStore(path.join(core.dataDir, `calendar-${account}.json`), fresh) : memoryStore(fresh));
-  let snap = { ...fresh(), ...(store.load() || {}) };
+  let snap = { ...fresh(), ...(store.load() ?? {}) };
   const save = () => { try { store.save(snap); } catch {} };
   const cfgOf = settings || (() => core.accounts[account]?.calendar || {});
   const out = new EventEmitter();
+  // stop() bumps the generation: work started before it (a refresh in flight,
+  // a queued retry or start) sees the change after its await and does nothing
+  let gen = 0;
+  let running = false;
+  const timeouts = new Set();
+  const later = (fn, ms) => { const t = setTimeout(() => { timeouts.delete(t); fn(); }, ms); timeouts.add(t); return t; };
 
   let refreshing = false;
   let again = false;
   const refresh = async () => {
     if (refreshing) { again = true; return; }
+    const mine = gen;
     refreshing = true;
     try {
       const cfg = cfgOf();
       const from = new Date(Date.now() - 3600e3);
       const to = new Date(Date.now() + (cfg.lookaheadDays || 7) * 86400e3);
       const list = await core.withClient(account, (c) => c.findEvents({ start: from, end: to, limit: 500 }));
+      if (mine !== gen) return; // stopped meanwhile
       const next = {};
       for (const e of list) next[e.id] = pick(e);
       const changes = snap.baselined ? diff(snap.events, next) : [];
@@ -58,11 +66,12 @@ export function watchCalendar(core, { account, snapshot, settings, log = () => {
         out.emit('changes', changes);
       } else if (list.length) log(`[${account}] calendar: ${list.length} upcoming event(s), no change`);
     } catch (e) {
+      if (mine !== gen) return;
       log(`[${account}] calendar refresh failed: ${e.message}`);
       out.emit('failure', e);
     } finally {
       refreshing = false;
-      if (again) { again = false; setTimeout(refresh, 1000); }
+      if (again) { again = false; if (mine === gen) later(refresh, 1000); }
     }
   };
 
@@ -93,18 +102,29 @@ export function watchCalendar(core, { account, snapshot, settings, log = () => {
 
   let pollTimer = null;
   let remindTimer = null;
+  let queued = null;
   out.start = () => {
-    if (pollTimer) return out;
+    if (queued) { clearImmediate(queued); queued = null; }
+    if (running) return out;
+    running = true;
     refresh();
     pollTimer = setInterval(refresh, Math.max(1, Number(cfgOf().pollMinutes) || 5) * 60e3);
     remindTimer = setInterval(tickReminders, 60e3);
     return out;
   };
-  out.refresh = () => setTimeout(refresh, 1500); // let the server settle after a push
+  out.refresh = () => { if (running) later(refresh, 1500); }; // let the server settle after a push
   out.refreshNow = refresh;
   out.checkReminders = tickReminders;
-  out.stop = () => { clearInterval(pollTimer); clearInterval(remindTimer); pollTimer = remindTimer = null; };
-  if (start) setImmediate(out.start); // listeners attach first
+  out.stop = () => {
+    gen++;
+    running = false;
+    if (queued) { clearImmediate(queued); queued = null; }
+    clearInterval(pollTimer); clearInterval(remindTimer); pollTimer = remindTimer = null;
+    for (const t of timeouts) clearTimeout(t);
+    timeouts.clear();
+    again = false;
+  };
+  if (start) queued = setImmediate(() => { queued = null; out.start(); }); // listeners attach first
   return out;
 }
 

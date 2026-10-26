@@ -97,6 +97,7 @@ export interface CredentialsProvider {
 /** A string, or a function asked for the key; with create: true it may make and store one. */
 export type CacheKey = string | ((opts: { create: boolean }) => string | null | undefined);
 
+/** load() may return null/undefined (nothing stored yet): mailcore treats it as {}. */
 export interface StateStore<T = Record<string, unknown>> {
   load(): T | null | undefined;
   save(value: T): void;
@@ -372,7 +373,8 @@ export class AccountClient {
   deleteEvent(id: string, changeKey?: string, opts?: { notify?: boolean }): Promise<unknown>;
   respondToEvent(id: string, changeKey: string | undefined, response: string, opts?: { message?: string; notify?: boolean }): Promise<unknown>;
   getFreeBusy(opts: { emails: string[]; start: Date; end: Date; intervalMinutes?: number }): Promise<FreeBusyRow[]>;
-  close(): void;
+  /** Release both backends (IMAP logs out); never rejects. */
+  close(): Promise<void>;
 }
 
 export interface PushStream { start(): void; stop(): void }
@@ -393,7 +395,8 @@ export interface MailCache {
   openCache(opts?: { create?: boolean }): unknown | null;
   closeCache(): void;
   cacheUsable(accounts: string[], opts?: FindOptions): boolean;
-  findCached(accounts: string[], opts?: FindOptions & { fromMe?: string }): ListItem[];
+  /** fromMe here is the address itself (the caller resolves it). */
+  findCached(accounts: string[], opts?: Omit<FindOptions, 'fromMe'> & { fromMe?: string }): ListItem[];
   getCached(id: string, opts?: { bodyType?: BodyType }): Message | null;
   cachedSince(account: string, sinceIso: string, opts?: { limit?: number }): Array<ListItem & { to: Mailbox[] | null; cc: Mailbox[] | null; isBulk: boolean | null; bodyText: string | null; hasBody: boolean }>;
   upsertItems(account: string, items: Partial<ListItem>[]): string[];
@@ -481,17 +484,21 @@ export function watchCalendar(core: Mailcore, opts: CalendarWatchOptions & { acc
 
 // --- event log ----------------------------------------------------------------
 
-export interface LogEvent { ts: string; type: string; seq?: number; account?: string; rule?: string | null; [extra: string]: unknown }
+export interface LogEvent { ts: string; type: string; seq?: number; gap?: never; account?: string; rule?: string | null; [extra: string]: unknown }
 export interface EventFilter { match?: 'rules' | 'all'; account?: string | null; rule?: string | null; types?: string[] | null }
+/** Yielded by EventLog.events() when the cursor predates the oldest event kept: resync. */
+export interface GapNotice { type: 'gap'; gap: true; oldest: number | null; lost: number; cursor: number }
 export interface WaitResult { events: LogEvent[]; cursor: number; gap?: true; oldest?: number | null; lost?: number }
 
 export class EventLog extends EventEmitter<{ event: [LogEvent] }> {
   constructor(opts?: { max?: number; store?: StateStore<{ seq: number; events: LogEvent[] }>; now?: () => Date });
   readonly cursor: number;
+  /** Set by close(): waits resolve empty at once and events() iterators end. */
+  readonly closed: boolean;
   append(type: string, data?: Record<string, unknown>): LogEvent;
   since(after: number, filter?: EventFilter): LogEvent[];
   wait(opts?: { after?: number | 'now' | null; timeout?: number; filter?: EventFilter; limit?: number; signal?: AbortSignal }): Promise<WaitResult>;
-  events(opts?: { after?: number | 'now' | null; filter?: EventFilter; signal?: AbortSignal }): AsyncGenerator<LogEvent>;
+  events(opts?: { after?: number | 'now' | null; filter?: EventFilter; signal?: AbortSignal }): AsyncGenerator<LogEvent | GapNotice>;
   close(): void;
 }
 

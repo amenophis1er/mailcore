@@ -150,7 +150,12 @@ export class AccountClient {
   deleteItem(id, ck) { return this.backend.deleteItem(this.#in(id), this.#ck(ck)); }
   markRead(id, ck, r) { return this.backend.markRead(this.#in(id), this.#ck(ck), r); }
   getAttachment(attId, messageId) { return this.backend.getAttachment(attId, messageId ? this.#in(messageId) : undefined); }
-  close() { try { this.backend?.close?.(); } catch {} if (this._calendar && this._calendar !== this.backend) try { this._calendar.close?.(); } catch {} }
+  /** Release both backends (IMAP logs out); never rejects. */
+  async close() {
+    const closing = [this.backend?.close?.bind(this.backend)];
+    if (this._calendar && this._calendar !== this.backend) closing.push(this._calendar.close?.bind(this._calendar));
+    await Promise.all(closing.filter(Boolean).map(async (fn) => { try { await fn(); } catch {} }));
+  }
 
   // --- calendar (ews-calendar.js, cal-caldav.js or cal-google.js) ----------
   async #cal(method) {

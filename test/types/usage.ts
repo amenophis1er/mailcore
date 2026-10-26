@@ -36,6 +36,14 @@ async function main(): Promise<void> {
   const log = new EventLog();
   log.append('newmail', { account: 'work', rule: 'boss' });
   const r = await log.wait({ after: 0, timeout: 10, filter: { match: 'all' } });
-  for await (const e of log.events({ after: r.cursor })) console.log(e.seq);
+  for await (const e of log.events({ after: r.cursor })) {
+    if (e.gap) console.log('resync, lost', e.lost);
+    else console.log(e.seq);
+  }
+  const cached = mc.cache.findCached(['work'], { fromMe: 'me@example.org', unreadOnly: true });
+  const c = await mc.client('work');
+  const closed: Promise<void> = c.close();
+  await closed;
+  console.log(cached.length);
 }
 void main;
