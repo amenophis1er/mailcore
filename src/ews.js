@@ -363,6 +363,8 @@ export class EwsClient {
 
   /** Send an existing draft (used by the CLI's --send after attaching). */
   async sendItem(id, changeKey) {
+    // Exchange needs the draft's current ChangeKey to send it; a caller that has only the id gets it looked up here
+    if (!changeKey) changeKey = (await this.getMessage(id)).changeKey;
     const ck = changeKey ? ` ChangeKey="${esc(changeKey)}"` : '';
     const xml = `
       <m:SendItem SaveItemToFolder="true">
@@ -371,7 +373,9 @@ export class EwsClient {
       </m:SendItem>`;
     const json = await this.post(envelope(xml));
     const rm = dig(json, 'Envelope.Body.SendItemResponse.ResponseMessages.SendItemResponseMessage');
-    assertSuccess(rm, 'SendItem');
+    // a failed send may still have gone out (Exchange has sent one and answered with an error): never retry blind
+    try { assertSuccess(rm, 'SendItem'); }
+    catch (err) { throw new Error(`${err.message}. It may still have been sent: look in Sent before trying again.`); }
     return true;
   }
 
