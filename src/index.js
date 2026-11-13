@@ -23,4 +23,4 @@ export { prepareBody, replaceAboveQuote, splitQuoted, splitBreaks, markdownToHtm
 export { GOOGLE_SCOPES } from './google-auth.js';
 export { jsonFileStore, memoryStore } from './store.js';
 export { AUTH_HEADER_NAMES, OVERSIZED, authHeadersFrom, headerPairs } from './auth-headers.js';
-export { isAutoReply } from './auto-reply.js';
+export { isAutoReply, AUTO_REPLY_HEADERS } from './auto-reply.js';

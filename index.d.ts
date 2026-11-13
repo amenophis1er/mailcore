@@ -793,6 +793,8 @@ export function jsonFileStore<T = Record<string, unknown>>(file: string, fallbac
 export const OVERSIZED: string;
 /** Whether a message is an automatic answer (out-of-office, a rule's reply), by its subject or the raw Auto-Submitted / X-Autoreply headers. */
 export function isAutoReply(subject: string, headers?: string): boolean;
+/** The headers isAutoReply reads (lower case). */
+export const AUTO_REPLY_HEADERS: string[];
 /** The header names authHeadersOf asks for (lower case). */
 export const AUTH_HEADER_NAMES: string[];
 /** [name, value] pairs, topmost first → the authentication headers among them. */

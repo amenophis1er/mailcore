@@ -124,7 +124,7 @@ test('EWS userPhoto: NoError is success even without ResponseClass; an error cod
 
 test('EWS sentTo: To only, SMTP only, automatic answers left out, with when each was sent', async () => {
   const c = new EwsClient({ host: 'https://mail.example.org/', username: 'me', password: 'x', email: 'me@x.org' });
-  c.findInbox = async (o) => { assert.equal(o.folder, 'sent'); return [{ id: 'S1' }, { id: 'S2' }, { id: 'S3' }, { id: 'S4' }]; };
+  c.findInbox = async (o) => { assert.equal(o.folder, 'sent'); return ['S1', 'S2', 'S3', 'S4', 'S5', 'S6'].map((id) => ({ id })); };
   let asked = '';
   c.post = async (xml) => { asked = xml; return parseEws(env(`<m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"><m:ResponseMessages>
     <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S1"/><t:ItemClass>IPM.Note</t:ItemClass><t:Subject>Lunch</t:Subject><t:DateTimeSent>2026-10-01T10:00:00Z</t:DateTimeSent>
@@ -138,10 +138,20 @@ test('EWS sentTo: To only, SMTP only, automatic answers left out, with when each
     </t:Message></m:Items></m:GetItemResponseMessage>
     <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S4"/><t:ItemClass>IPM.Note</t:ItemClass><t:Subject>Re: Q4</t:Subject><t:DateTimeSent>2026-10-04T10:00:00Z</t:DateTimeSent>
       <t:ToRecipients><t:Mailbox><t:EmailAddress>bob@bank.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
+      <t:ExtendedProperty><t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="auto-submitted" PropertyType="String"/><t:Value>no</t:Value></t:ExtendedProperty>
+    </t:Message></m:Items></m:GetItemResponseMessage>
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S5"/><t:ItemClass>IPM.Note</t:ItemClass><t:Subject>Re: Your offer</t:Subject><t:DateTimeSent>2026-10-05T10:00:00Z</t:DateTimeSent>
+      <t:ToRecipients><t:Mailbox><t:EmailAddress>stranger@evil.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
+      <t:ExtendedProperty><t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="auto-submitted" PropertyType="String"/><t:Value>auto-replied</t:Value></t:ExtendedProperty>
+    </t:Message></m:Items></m:GetItemResponseMessage>
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S6"/><t:ItemClass>IPM.Note</t:ItemClass><t:Subject>Re: Hello</t:Subject><t:DateTimeSent>2026-10-06T10:00:00Z</t:DateTimeSent>
+      <t:ToRecipients><t:Mailbox><t:EmailAddress>stranger2@evil.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
+      <t:ExtendedProperty><t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="x-auto-response-suppress" PropertyType="String"/><t:Value>All</t:Value></t:ExtendedProperty>
     </t:Message></m:Items></m:GetItemResponseMessage>
   </m:ResponseMessages></m:GetItemResponse>`)); };
   const out = await c.sentTo();
   assert.doesNotMatch(asked, /CcRecipients|BccRecipients/);
+  assert.match(asked, /DistinguishedPropertySetId="InternetHeaders" PropertyName="auto-submitted"/);
   assert.deepEqual(out, [{ to: ['ann@partner.example'], sent: '2026-10-01T10:00:00.000Z' }, { to: ['bob@bank.example'], sent: '2026-10-04T10:00:00.000Z' }]);
 });
 
@@ -154,6 +164,9 @@ test('isAutoReply: by subject or by its headers', async () => {
   assert.equal(isAutoReply('Re: lunch', 'Auto-Submitted: no\r\n'), false);
   assert.equal(isAutoReply('Re: lunch', 'X-Autoreply: yes\r\n'), true);
   assert.equal(isAutoReply('Re: automation project'), false);
+  assert.equal(isAutoReply('Re: lunch', 'Precedence: auto_reply\r\n'), true);
+  assert.equal(isAutoReply('Re: lunch', 'Precedence: bulk\r\n'), false);
+  assert.equal(isAutoReply('Re: lunch', 'X-Auto-Response-Suppress: All\r\n'), true);
 });
 
 test('an Authentication-Results too long to keep is kept as one that parses as nothing, in its place', async () => {

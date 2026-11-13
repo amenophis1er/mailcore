@@ -7,7 +7,7 @@ import { XMLParser } from 'fast-xml-parser';
 import { envelope, esc, dig, toArray, textOf, parseMailbox, assertSuccess } from './ews-util.js';
 import { calendarMethods } from './ews-calendar.js';
 import { authHeadersFrom } from './auth-headers.js';
-import { isAutoReply } from './auto-reply.js';
+import { isAutoReply, AUTO_REPLY_HEADERS } from './auto-reply.js';
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -680,13 +680,15 @@ export class EwsClient {
       const batch = ids.slice(i, i + 50);
       const json = await this.post(envelope(`
         <m:GetItem>
-          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="message:ToRecipients"/><t:FieldURI FieldURI="item:ItemClass"/><t:FieldURI FieldURI="item:Subject"/><t:FieldURI FieldURI="item:DateTimeSent"/></t:AdditionalProperties></m:ItemShape>
+          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="message:ToRecipients"/><t:FieldURI FieldURI="item:ItemClass"/><t:FieldURI FieldURI="item:Subject"/><t:FieldURI FieldURI="item:DateTimeSent"/>${AUTO_REPLY_HEADERS.map((h) => `<t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="${h}" PropertyType="String"/>`).join('')}</t:AdditionalProperties></m:ItemShape>
           <m:ItemIds>${batch.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join('')}</m:ItemIds>
         </m:GetItem>`));
       for (const rm of toArray(dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage'))) {
         if (rm?.['@ResponseClass'] !== 'Success') continue;
         const it = dig(rm, 'Items.Message');
-        if (!it || /^IPM\.Note\.Rules\./i.test(textOf(it.ItemClass)) || isAutoReply(textOf(it.Subject))) continue;
+        // the headers asked for, as the message has them (each an extended property of the InternetHeaders set)
+        const headers = toArray(it?.ExtendedProperty).map((p) => `${String(p?.ExtendedFieldURI?.['@PropertyName'] || '')}: ${textOf(p?.Value)}`).join('\n');
+        if (!it || /^IPM\.Note\.Rules\./i.test(textOf(it.ItemClass)) || isAutoReply(textOf(it.Subject), headers)) continue;
         const to = toArray(dig(it, 'ToRecipients.Mailbox'))
           .filter((mb) => !mb?.RoutingType || textOf(mb.RoutingType) === 'SMTP')
           .map((mb) => textOf(mb?.EmailAddress).toLowerCase()).filter((e) => e.includes('@'));

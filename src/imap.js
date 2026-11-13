@@ -15,7 +15,7 @@ import MailComposer from 'nodemailer/lib/mail-composer';
 import { displayNameOf } from './accounts.js';
 import { idParts } from './client.js';
 import { AUTH_HEADER_NAMES, authHeadersFrom, authHeadersOfParsed, headerPairs } from './auth-headers.js';
-import { isAutoReply } from './auto-reply.js';
+import { isAutoReply, AUTO_REPLY_HEADERS } from './auto-reply.js';
 
 export { idParts }; // defined beside splitId, so it can be had without loading the IMAP backend
 
@@ -581,7 +581,7 @@ export class ImapClient {
       const n = Number(mailbox.exists) || 0;
       if (!n) return [];
       const out = [];
-      for await (const m of c.fetch(`${Math.max(1, n - Math.min(200, limit) + 1)}:*`, { envelope: true, internalDate: true, headers: ['auto-submitted', 'x-autoreply', 'x-autorespond'] })) {
+      for await (const m of c.fetch(`${Math.max(1, n - Math.min(200, limit) + 1)}:*`, { envelope: true, internalDate: true, headers: AUTO_REPLY_HEADERS })) {
         const env = m.envelope || {};
         if (isAutoReply(env.subject, m.headers ? m.headers.toString('utf8') : '')) continue;
         const to = [...new Set((env.to || []).map((a) => String(a.address || '').toLowerCase()).filter((e) => e.includes('@')))];
