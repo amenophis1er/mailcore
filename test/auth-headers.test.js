@@ -106,3 +106,47 @@ test('EWS userPhoto: the picture, none, and a server without the operation', asy
   await ok.userPhoto('a<b>@x.org');
   assert.match(ok.sent[1], /a&lt;b&gt;@x\.org/);
 });
+
+test('X-Gmail-Fetch-Info is kept: mail Gmail fetched from elsewhere', () => {
+  const h = authHeadersFrom([['X-Gmail-Fetch-Info', 'me@other.example 1 pop.other.example 995 me'], ['Authentication-Results', 'mx.google.com; dmarc=pass header.from=bank.example']]);
+  assert.equal(h.gmailFetchInfo, 'me@other.example 1 pop.other.example 995 me');
+  assert.equal(authHeadersFrom([]).gmailFetchInfo, '');
+});
+
+test('EWS userPhoto: NoError is success even without ResponseClass; an error code is not, whatever the class says', async () => {
+  const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]).toString('base64');
+  const bare = stubbed(env(`<GetUserPhotoResponse xmlns="http://schemas.microsoft.com/exchange/services/2006/messages"><ResponseCode>NoError</ResponseCode><PictureData>${jpeg}</PictureData></GetUserPhotoResponse>`));
+  assert.equal((await bare.userPhoto('ann@x.org')).contentType, 'image/jpeg');
+  const odd = stubbed(env(`<GetUserPhotoResponse ResponseClass="Warning" xmlns="http://schemas.microsoft.com/exchange/services/2006/messages"><ResponseCode>NoError</ResponseCode><PictureData>${jpeg}</PictureData></GetUserPhotoResponse>`));
+  assert.equal((await odd.userPhoto('ann@x.org')).contentType, 'image/jpeg');
+  const none = stubbed(env(`<GetUserPhotoResponse ResponseClass="Success" xmlns="http://schemas.microsoft.com/exchange/services/2006/messages"><ResponseCode>ErrorItemNotFound</ResponseCode></GetUserPhotoResponse>`));
+  assert.equal(await none.userPhoto('ann@x.org'), null);
+});
+
+test('EWS sentRecipients: To, Cc and Bcc of the newest sent mail, SMTP only, each once', async () => {
+  const c = new EwsClient({ host: 'https://mail.example.org/', username: 'me', password: 'x', email: 'me@x.org' });
+  c.findInbox = async (o) => { assert.equal(o.folder, 'sent'); return [{ id: 'S1' }, { id: 'S2' }]; };
+  c.post = async () => parseEws(env(`<m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"><m:ResponseMessages>
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S1"/>
+      <t:ToRecipients><t:Mailbox><t:Name>Ann</t:Name><t:EmailAddress>Ann@Partner.example</t:EmailAddress><t:RoutingType>SMTP</t:RoutingType></t:Mailbox></t:ToRecipients>
+      <t:CcRecipients><t:Mailbox><t:EmailAddress>/o=ExchangeLabs/cn=x</t:EmailAddress><t:RoutingType>EX</t:RoutingType></t:Mailbox></t:CcRecipients>
+    </t:Message></m:Items></m:GetItemResponseMessage>
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S2"/>
+      <t:ToRecipients><t:Mailbox><t:EmailAddress>ann@partner.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
+      <t:BccRecipients><t:Mailbox><t:EmailAddress>bob@bank.example</t:EmailAddress></t:Mailbox></t:BccRecipients>
+    </t:Message></m:Items></m:GetItemResponseMessage>
+  </m:ResponseMessages></m:GetItemResponse>`));
+  assert.deepEqual((await c.sentRecipients()).sort(), ['ann@partner.example', 'bob@bank.example']);
+});
+
+test('AccountClient.authHeadersOf leaves out ids of another account; IMAP leaves out ids that do not parse', async () => {
+  const { AccountClient } = await import('../src/client.js');
+  const seen = [];
+  const ac = new AccountClient('g', { authHeadersOf: async (ids) => { seen.push(...ids); return new Map(); } });
+  await ac.authHeadersOf(['g:INBOX/1/2', 'other:INBOX/1/3']);
+  assert.deepEqual(seen, ['INBOX/1/2']);
+  const { ImapClient } = await import('../src/imap.js');
+  const imap = Object.create(ImapClient.prototype);
+  // nothing that parses: answered without a connection
+  assert.equal((await imap.authHeadersOf(['nonsense', 'also/bad'])).size, 0);
+});

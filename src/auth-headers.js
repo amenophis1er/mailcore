@@ -1,13 +1,15 @@
 // The headers a reader needs to judge who really sent a message, as they
 // stand in it: every Authentication-Results header, topmost (the last
-// receiving server's) first, the BIMI-Selector, and Exchange Online's word
+// receiving server's) first, the BIMI-Selector, Exchange Online's word
 // on how the message came in (X-MS-Exchange-Organization-AuthAs, a header
-// Exchange removes from what arrives from outside before setting its own).
+// Exchange removes from what arrives from outside before setting its own),
+// and Gmail's mark on mail it fetched from another mailbox (X-Gmail-Fetch-Info:
+// that mail did not come through Gmail's own servers).
 // Raw values only: what to trust of them is the caller's (the authserv-id
 // of its own receiving server, and so on).
 
 /** The header names asked for (lower case). */
-export const AUTH_HEADER_NAMES = ['authentication-results', 'bimi-selector', 'x-ms-exchange-organization-authas'];
+export const AUTH_HEADER_NAMES = ['authentication-results', 'bimi-selector', 'x-ms-exchange-organization-authas', 'x-gmail-fetch-info'];
 
 const MAX_RESULTS = 10;
 const MAX_VALUE = 4096;
@@ -17,16 +19,17 @@ const flat = (v) => String(v ?? '').replace(/\r?\n[ \t]+/g, ' ').replace(/[\x00-
 
 /**
  * `pairs`: [name, value] in the order the message holds them, topmost first.
- * → { results: string[], bimiSelector: string, msAuthAs: string } (the first
- * BIMI-Selector and AuthAs when there are several; '' when none).
+ * → { results: string[], bimiSelector: string, msAuthAs: string, gmailFetchInfo: string }
+ * (the first of each single one when there are several; '' when none).
  */
 export function authHeadersFrom(pairs) {
-  const out = { results: [], bimiSelector: '', msAuthAs: '' };
+  const out = { results: [], bimiSelector: '', msAuthAs: '', gmailFetchInfo: '' };
   for (const [rawName, value] of pairs || []) {
     const name = String(rawName || '').trim().toLowerCase();
     if (name === 'authentication-results') { if (out.results.length < MAX_RESULTS) out.results.push(flat(value)); }
     else if (name === 'bimi-selector') { if (!out.bimiSelector) out.bimiSelector = flat(value); }
     else if (name === 'x-ms-exchange-organization-authas') { if (!out.msAuthAs) out.msAuthAs = flat(value); }
+    else if (name === 'x-gmail-fetch-info') { if (!out.gmailFetchInfo) out.gmailFetchInfo = flat(value) || '(empty)'; }
   }
   return out;
 }

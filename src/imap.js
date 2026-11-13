@@ -553,7 +553,9 @@ export class ImapClient {
     const out = new Map();
     const byPath = new Map();
     for (const id of ids) {
-      const { path, uidValidity, uid } = parseId(id);
+      let parts;
+      try { parts = parseId(id); } catch { continue; } // not an id of this server: left out, the others answered
+      const { path, uidValidity, uid } = parts;
       if (!byPath.has(path)) byPath.set(path, { uv: uidValidity, uids: [] });
       byPath.get(path).uids.push(uid);
     }
@@ -566,6 +568,12 @@ export class ImapClient {
       });
     }
     return out;
+  }
+
+  /** The addresses my latest sent mail went to (To and Cc of the newest `limit`, at most 100, of Sent), lower case, each once. */
+  async sentRecipients({ limit = 100 } = {}) {
+    const items = await this.findInbox({ folder: 'sent', limit: Math.min(100, limit) });
+    return [...new Set(items.flatMap((i) => (i.toPeople || []).map((p) => p.email)).filter((e) => e.includes('@')))];
   }
 
   async #append(path, raw, flags) {

@@ -648,8 +648,10 @@ export class EwsClient {
     }
     const r = dig(json, 'Envelope.Body.GetUserPhotoResponse');
     if (!r) throw Object.assign(new Error('GetUserPhoto: malformed EWS response'), { unsupported: true });
-    if (r['@ResponseClass'] !== 'Success') {
-      const code = textOf(r.ResponseCode);
+    // NoError is success whatever ResponseClass says (some servers leave it out); without a code, ResponseClass decides
+    const code = textOf(r.ResponseCode);
+    const ok = code ? code === 'NoError' : !r['@ResponseClass'] || r['@ResponseClass'] === 'Success';
+    if (!ok) {
       if (/NotFound|ErrorNonExistentMailbox|ErrorInvalidSmtpAddress/i.test(code)) return null;
       throw Object.assign(new Error(`GetUserPhoto: ${code || 'error'}`), { unsupported: !/ErrorServerBusy|Timeout/i.test(code) });
     }
@@ -658,6 +660,40 @@ export class EwsClient {
     const data = Buffer.from(b64, 'base64');
     const contentType = data[0] === 0xff && data[1] === 0xd8 ? 'image/jpeg' : data.subarray(0, 4).toString('latin1') === '\x89PNG' ? 'image/png' : data.subarray(0, 3).toString('latin1') === 'GIF' ? 'image/gif' : '';
     return contentType ? { contentType, data } : null;
+  }
+
+  /**
+   * The addresses my latest sent mail went to (To, Cc and Bcc of the newest
+   * `limit` messages of Sent; one FindItem, one GetItem per 50), lower case,
+   * each once.
+   */
+  async sentRecipients({ limit = 200 } = {}) {
+    const ids = [];
+    for (let offset = 0; ids.length < limit; offset += 100) {
+      const page = await this.findInbox({ folder: 'sent', limit: Math.min(100, limit - ids.length), offset });
+      ids.push(...page.map((i) => i.id));
+      if (page.length < 100) break;
+    }
+    const out = new Set();
+    for (let i = 0; i < ids.length; i += 50) {
+      const batch = ids.slice(i, i + 50);
+      const json = await this.post(envelope(`
+        <m:GetItem>
+          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="message:ToRecipients"/><t:FieldURI FieldURI="message:CcRecipients"/><t:FieldURI FieldURI="message:BccRecipients"/></t:AdditionalProperties></m:ItemShape>
+          <m:ItemIds>${batch.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join('')}</m:ItemIds>
+        </m:GetItem>`));
+      for (const rm of toArray(dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage'))) {
+        if (rm?.['@ResponseClass'] !== 'Success') continue;
+        const it = dig(rm, 'Items.Message') || dig(rm, 'Items.MeetingRequest') || dig(rm, 'Items.Item');
+        for (const k of ['ToRecipients', 'CcRecipients', 'BccRecipients']) {
+          for (const mb of toArray(dig(it, `${k}.Mailbox`))) {
+            const e = textOf(mb?.EmailAddress).toLowerCase();
+            if (e.includes('@') && (!mb?.RoutingType || textOf(mb.RoutingType) === 'SMTP')) out.add(e);
+          }
+        }
+      }
+    }
+    return [...out];
   }
 
   /** The attachments of many messages at once (one GetItem per 50): Map id → [{ id, name, size, contentType, contentId, inline }]. */
