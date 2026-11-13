@@ -15,6 +15,7 @@ import MailComposer from 'nodemailer/lib/mail-composer';
 import { displayNameOf } from './accounts.js';
 import { idParts } from './client.js';
 import { AUTH_HEADER_NAMES, authHeadersFrom, authHeadersOfParsed, headerPairs } from './auth-headers.js';
+import { isAutoReply } from './auto-reply.js';
 
 export { idParts }; // defined beside splitId, so it can be had without loading the IMAP backend
 
@@ -570,10 +571,25 @@ export class ImapClient {
     return out;
   }
 
-  /** The addresses my latest sent mail went to (To and Cc of the newest `limit`, at most 100, of Sent), lower case, each once. */
-  async sentRecipients({ limit = 100 } = {}) {
-    const items = await this.findInbox({ folder: 'sent', limit: Math.min(100, limit) });
-    return [...new Set(items.flatMap((i) => (i.toPeople || []).map((p) => p.email)).filter((e) => e.includes('@')))];
+  /**
+   * Whom my newest sent mail went to: [{ to: [addresses, lower case], sent: ISO }] for the newest `limit` (at
+   * most 200) of Sent, To only, automatic answers left out (by Auto-Submitted, X-Autoreply, or their subject).
+   */
+  async sentTo({ limit = 200 } = {}) {
+    const path = await this.#folder('sent');
+    return this.#inMailbox(path, async (c, mailbox) => {
+      const n = Number(mailbox.exists) || 0;
+      if (!n) return [];
+      const out = [];
+      for await (const m of c.fetch(`${Math.max(1, n - Math.min(200, limit) + 1)}:*`, { envelope: true, internalDate: true, headers: ['auto-submitted', 'x-autoreply', 'x-autorespond'] })) {
+        const env = m.envelope || {};
+        if (isAutoReply(env.subject, m.headers ? m.headers.toString('utf8') : '')) continue;
+        const to = [...new Set((env.to || []).map((a) => String(a.address || '').toLowerCase()).filter((e) => e.includes('@')))];
+        const at = env.date || m.internalDate;
+        if (to.length) out.push({ to, sent: at && !isNaN(new Date(at)) ? new Date(at).toISOString() : new Date(0).toISOString() });
+      }
+      return out;
+    });
   }
 
   async #append(path, raw, flags) {

@@ -42,11 +42,10 @@ test('a message read by mailparser gives the same, in the same order', async () 
   assert.match(h.results[1], /^forged\.example;/);
 });
 
-test('at most ten results, each cut to 4 KB, controls out', () => {
-  const pairs = Array.from({ length: 15 }, (_, i) => ['Authentication-Results', `h${i}.example; dmarc=pass\u0000${'x'.repeat(5000)}`]);
+test('at most ten results, controls out', () => {
+  const pairs = Array.from({ length: 15 }, (_, i) => ['Authentication-Results', `h${i}.example; dmarc=pass\u0000 header.from=x.example`]);
   const h = authHeadersFrom(pairs);
   assert.equal(h.results.length, 10);
-  assert.equal(h.results[0].length, 4096);
   assert.doesNotMatch(h.results[0], /\u0000/);
 });
 
@@ -123,20 +122,49 @@ test('EWS userPhoto: NoError is success even without ResponseClass; an error cod
   assert.equal(await none.userPhoto('ann@x.org'), null);
 });
 
-test('EWS sentRecipients: To, Cc and Bcc of the newest sent mail, SMTP only, each once', async () => {
+test('EWS sentTo: To only, SMTP only, automatic answers left out, with when each was sent', async () => {
   const c = new EwsClient({ host: 'https://mail.example.org/', username: 'me', password: 'x', email: 'me@x.org' });
-  c.findInbox = async (o) => { assert.equal(o.folder, 'sent'); return [{ id: 'S1' }, { id: 'S2' }]; };
-  c.post = async () => parseEws(env(`<m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"><m:ResponseMessages>
-    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S1"/>
-      <t:ToRecipients><t:Mailbox><t:Name>Ann</t:Name><t:EmailAddress>Ann@Partner.example</t:EmailAddress><t:RoutingType>SMTP</t:RoutingType></t:Mailbox></t:ToRecipients>
-      <t:CcRecipients><t:Mailbox><t:EmailAddress>/o=ExchangeLabs/cn=x</t:EmailAddress><t:RoutingType>EX</t:RoutingType></t:Mailbox></t:CcRecipients>
+  c.findInbox = async (o) => { assert.equal(o.folder, 'sent'); return [{ id: 'S1' }, { id: 'S2' }, { id: 'S3' }, { id: 'S4' }]; };
+  let asked = '';
+  c.post = async (xml) => { asked = xml; return parseEws(env(`<m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"><m:ResponseMessages>
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S1"/><t:ItemClass>IPM.Note</t:ItemClass><t:Subject>Lunch</t:Subject><t:DateTimeSent>2026-10-01T10:00:00Z</t:DateTimeSent>
+      <t:ToRecipients><t:Mailbox><t:Name>Ann</t:Name><t:EmailAddress>Ann@Partner.example</t:EmailAddress><t:RoutingType>SMTP</t:RoutingType></t:Mailbox><t:Mailbox><t:EmailAddress>/o=ExchangeLabs/cn=x</t:EmailAddress><t:RoutingType>EX</t:RoutingType></t:Mailbox></t:ToRecipients>
     </t:Message></m:Items></m:GetItemResponseMessage>
-    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S2"/>
-      <t:ToRecipients><t:Mailbox><t:EmailAddress>ann@partner.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
-      <t:BccRecipients><t:Mailbox><t:EmailAddress>bob@bank.example</t:EmailAddress></t:Mailbox></t:BccRecipients>
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S2"/><t:ItemClass>IPM.Note.Rules.OofTemplate.Microsoft</t:ItemClass><t:Subject>Automatic reply: Offer</t:Subject><t:DateTimeSent>2026-10-02T10:00:00Z</t:DateTimeSent>
+      <t:ToRecipients><t:Mailbox><t:EmailAddress>spammer@evil.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
     </t:Message></m:Items></m:GetItemResponseMessage>
-  </m:ResponseMessages></m:GetItemResponse>`));
-  assert.deepEqual((await c.sentRecipients()).sort(), ['ann@partner.example', 'bob@bank.example']);
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S3"/><t:ItemClass>IPM.Note</t:ItemClass><t:Subject>Out of Office: back Monday</t:Subject><t:DateTimeSent>2026-10-03T10:00:00Z</t:DateTimeSent>
+      <t:ToRecipients><t:Mailbox><t:EmailAddress>other@evil.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
+    </t:Message></m:Items></m:GetItemResponseMessage>
+    <m:GetItemResponseMessage ResponseClass="Success"><m:Items><t:Message><t:ItemId Id="S4"/><t:ItemClass>IPM.Note</t:ItemClass><t:Subject>Re: Q4</t:Subject><t:DateTimeSent>2026-10-04T10:00:00Z</t:DateTimeSent>
+      <t:ToRecipients><t:Mailbox><t:EmailAddress>bob@bank.example</t:EmailAddress></t:Mailbox></t:ToRecipients>
+    </t:Message></m:Items></m:GetItemResponseMessage>
+  </m:ResponseMessages></m:GetItemResponse>`)); };
+  const out = await c.sentTo();
+  assert.doesNotMatch(asked, /CcRecipients|BccRecipients/);
+  assert.deepEqual(out, [{ to: ['ann@partner.example'], sent: '2026-10-01T10:00:00.000Z' }, { to: ['bob@bank.example'], sent: '2026-10-04T10:00:00.000Z' }]);
+});
+
+test('isAutoReply: by subject or by its headers', async () => {
+  const { isAutoReply } = await import('../src/auto-reply.js');
+  assert.equal(isAutoReply('Automatic reply: Offer'), true);
+  assert.equal(isAutoReply('Réponse automatique : absent'), true);
+  assert.equal(isAutoReply('Out of Office'), true);
+  assert.equal(isAutoReply('Re: lunch', 'Auto-Submitted: auto-replied\r\n'), true);
+  assert.equal(isAutoReply('Re: lunch', 'Auto-Submitted: no\r\n'), false);
+  assert.equal(isAutoReply('Re: lunch', 'X-Autoreply: yes\r\n'), true);
+  assert.equal(isAutoReply('Re: automation project'), false);
+});
+
+test('an Authentication-Results too long to keep is kept as one that parses as nothing, in its place', async () => {
+  const { OVERSIZED } = await import('../src/auth-headers.js');
+  // a long first result, and a second dmarc past the cut that says fail
+  const long = `mx.google.com; dmarc=pass header.from=bank.example; x-note=${'a'.repeat(5000)}; dmarc=fail header.from=bank.example`;
+  const h = authHeadersFrom([['Authentication-Results', long], ['Authentication-Results', 'mx.google.com; dmarc=pass header.from=bank.example']]);
+  assert.equal(h.results.length, 2);
+  assert.equal(h.results[0], OVERSIZED);
+  assert.ok(!h.results[0].includes('dmarc'));
+  assert.equal(authHeadersFrom([['Authentication-Results', 'x'.repeat(4096)]]).results[0].length, 4096); // at the limit: kept whole
 });
 
 test('AccountClient.authHeadersOf leaves out ids of another account; IMAP leaves out ids that do not parse', async () => {

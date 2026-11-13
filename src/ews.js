@@ -7,6 +7,7 @@ import { XMLParser } from 'fast-xml-parser';
 import { envelope, esc, dig, toArray, textOf, parseMailbox, assertSuccess } from './ews-util.js';
 import { calendarMethods } from './ews-calendar.js';
 import { authHeadersFrom } from './auth-headers.js';
+import { isAutoReply } from './auto-reply.js';
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -663,37 +664,37 @@ export class EwsClient {
   }
 
   /**
-   * The addresses my latest sent mail went to (To, Cc and Bcc of the newest
-   * `limit` messages of Sent; one FindItem, one GetItem per 50), lower case,
-   * each once.
+   * Whom my newest sent mail went to: [{ to: [addresses, lower case], sent: ISO }]
+   * for the newest `limit` messages of Sent (To only; automatic answers,
+   * out-of-office and the replies of rules, left out). One FindItem, one GetItem per 50.
    */
-  async sentRecipients({ limit = 200 } = {}) {
+  async sentTo({ limit = 200 } = {}) {
     const ids = [];
     for (let offset = 0; ids.length < limit; offset += 100) {
       const page = await this.findInbox({ folder: 'sent', limit: Math.min(100, limit - ids.length), offset });
       ids.push(...page.map((i) => i.id));
       if (page.length < 100) break;
     }
-    const out = new Set();
+    const out = [];
     for (let i = 0; i < ids.length; i += 50) {
       const batch = ids.slice(i, i + 50);
       const json = await this.post(envelope(`
         <m:GetItem>
-          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="message:ToRecipients"/><t:FieldURI FieldURI="message:CcRecipients"/><t:FieldURI FieldURI="message:BccRecipients"/></t:AdditionalProperties></m:ItemShape>
+          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="message:ToRecipients"/><t:FieldURI FieldURI="item:ItemClass"/><t:FieldURI FieldURI="item:Subject"/><t:FieldURI FieldURI="item:DateTimeSent"/></t:AdditionalProperties></m:ItemShape>
           <m:ItemIds>${batch.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join('')}</m:ItemIds>
         </m:GetItem>`));
       for (const rm of toArray(dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage'))) {
         if (rm?.['@ResponseClass'] !== 'Success') continue;
-        const it = dig(rm, 'Items.Message') || dig(rm, 'Items.MeetingRequest') || dig(rm, 'Items.Item');
-        for (const k of ['ToRecipients', 'CcRecipients', 'BccRecipients']) {
-          for (const mb of toArray(dig(it, `${k}.Mailbox`))) {
-            const e = textOf(mb?.EmailAddress).toLowerCase();
-            if (e.includes('@') && (!mb?.RoutingType || textOf(mb.RoutingType) === 'SMTP')) out.add(e);
-          }
-        }
+        const it = dig(rm, 'Items.Message');
+        if (!it || /^IPM\.Note\.Rules\./i.test(textOf(it.ItemClass)) || isAutoReply(textOf(it.Subject))) continue;
+        const to = toArray(dig(it, 'ToRecipients.Mailbox'))
+          .filter((mb) => !mb?.RoutingType || textOf(mb.RoutingType) === 'SMTP')
+          .map((mb) => textOf(mb?.EmailAddress).toLowerCase()).filter((e) => e.includes('@'));
+        const sent = new Date(textOf(it.DateTimeSent));
+        if (to.length) out.push({ to: [...new Set(to)], sent: isNaN(sent) ? new Date(0).toISOString() : sent.toISOString() });
       }
     }
-    return [...out];
+    return out;
   }
 
   /** The attachments of many messages at once (one GetItem per 50): Map id → [{ id, name, size, contentType, contentId, inline }]. */

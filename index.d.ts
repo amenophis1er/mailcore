@@ -457,8 +457,8 @@ export class AccountClient {
   bulkFlags(ids: string[]): Promise<Map<string, boolean>>;
   /** Headers only, many messages at once; empty where the backend cannot say. */
   authHeadersOf(ids: string[]): Promise<Map<string, AuthHeaders & { fromEmail: string }>>;
-  /** The addresses the newest sent mail went to (lower case, each once); none where the backend cannot say. */
-  sentRecipients(o?: { limit?: number }): Promise<string[]>;
+  /** Whom the newest sent mail went to: To only (lower case), automatic answers left out; none where the backend cannot say. */
+  sentTo(o?: { limit?: number }): Promise<{ to: string[]; sent: string }[]>;
   /** The organisation's photo of an address (Exchange 2013+, GetUserPhoto); null when none or no directory. Throws with `unsupported: true` where the server lacks the operation. */
   userPhoto(email: string, o?: { size?: 'HR48x48' | 'HR64x64' | 'HR96x96' | 'HR120x120' | 'HR240x240' | 'HR360x360' | 'HR432x432' | 'HR504x504' | 'HR648x648' }): Promise<UserPhoto | null>;
   draftReply(id: string, changeKey: string | null | undefined, body: string, opts?: { bodyType?: BodyType }): Promise<DraftResult>;
@@ -789,6 +789,10 @@ export function plainText(text: string): string;
 export const GOOGLE_SCOPES: string[];
 export function jsonFileStore<T = Record<string, unknown>>(file: string, fallback?: () => T): StateStore<T>;
 
+/** What an Authentication-Results too long to keep is kept as: a value that parses as nothing. */
+export const OVERSIZED: string;
+/** Whether a message is an automatic answer (out-of-office, a rule's reply), by its subject or the raw Auto-Submitted / X-Autoreply headers. */
+export function isAutoReply(subject: string, headers?: string): boolean;
 /** The header names authHeadersOf asks for (lower case). */
 export const AUTH_HEADER_NAMES: string[];
 /** [name, value] pairs, topmost first → the authentication headers among them. */

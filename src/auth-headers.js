@@ -14,8 +14,18 @@ export const AUTH_HEADER_NAMES = ['authentication-results', 'bimi-selector', 'x-
 const MAX_RESULTS = 10;
 const MAX_VALUE = 4096;
 
-/** A header value on one line: folded lines joined, controls out, cut to MAX_VALUE. */
-const flat = (v) => String(v ?? '').replace(/\r?\n[ \t]+/g, ' ').replace(/[\x00-\x08\x0a-\x1f\x7f]+/g, ' ').trim().slice(0, MAX_VALUE);
+/** A header value on one line: folded lines joined, controls out. */
+const unfolded = (v) => String(v ?? '').replace(/\r?\n[ \t]+/g, ' ').replace(/[\x00-\x08\x0a-\x1f\x7f]+/g, ' ').trim();
+/** The same, cut to MAX_VALUE (for what is only shown or matched whole). */
+const flat = (v) => unfolded(v).slice(0, MAX_VALUE);
+/**
+ * What an Authentication-Results too long to keep is kept as, in its place: a
+ * value that parses as nothing (a comment left open), so it is never trusted.
+ * A prefix of it is never kept (it could end before a second result that
+ * contradicts the first), nor is it dropped (the next header would become the
+ * topmost).
+ */
+export const OVERSIZED = '(oversized Authentication-Results';
 
 /**
  * `pairs`: [name, value] in the order the message holds them, topmost first.
@@ -26,7 +36,9 @@ export function authHeadersFrom(pairs) {
   const out = { results: [], bimiSelector: '', msAuthAs: '', gmailFetchInfo: '' };
   for (const [rawName, value] of pairs || []) {
     const name = String(rawName || '').trim().toLowerCase();
-    if (name === 'authentication-results') { if (out.results.length < MAX_RESULTS) out.results.push(flat(value)); }
+    if (name === 'authentication-results') {
+      if (out.results.length < MAX_RESULTS) { const v = unfolded(value); out.results.push(v.length > MAX_VALUE ? OVERSIZED : v); }
+    }
     else if (name === 'bimi-selector') { if (!out.bimiSelector) out.bimiSelector = flat(value); }
     else if (name === 'x-ms-exchange-organization-authas') { if (!out.msAuthAs) out.msAuthAs = flat(value); }
     else if (name === 'x-gmail-fetch-info') { if (!out.gmailFetchInfo) out.gmailFetchInfo = flat(value) || '(empty)'; }

@@ -22,7 +22,7 @@
 //   getAttachment(attachmentId, messageId) → { name, contentType, content (Buffer) }
 //   authHeadersOf?(ids)                 → Map id → { results, bimiSelector, msAuthAs, fromEmail } (auth-headers.js)
 //   userPhoto?(email, { size })         → { contentType, data } | null   (EWS: GetUserPhoto)
-//   sentRecipients?({ limit })          → string[]  addresses the newest sent mail went to
+//   sentTo?({ limit })                  → [{ to: string[], sent }]  whom the newest sent mail went to (To; no auto-replies)
 //   close?()                            → release connections (optional)
 //
 // Calendar (EWS backends only — AccountClient raises NO_CALENDAR otherwise):
@@ -165,8 +165,8 @@ export class AccountClient {
     const m = await this.backend.authHeadersOf(mine.map((id) => this.#in(id)));
     return new Map([...m].map(([id, v]) => [`${this.account}:${id}`, v]));
   }
-  /** The addresses my latest sent mail went to, lower case, each once; none where the backend cannot say. */
-  async sentRecipients(o) { return typeof this.backend.sentRecipients === 'function' ? this.backend.sentRecipients(o) : []; }
+  /** Whom my newest sent mail went to: [{ to, sent }] (To only, automatic answers left out); none where the backend cannot say. */
+  async sentTo(o) { return typeof this.backend.sentTo === 'function' ? this.backend.sentTo(o) : []; }
   /** The photo the organisation keeps of an address (Exchange): { contentType, data } or null; null where the backend has no directory. */
   async userPhoto(email, o) { return typeof this.backend.userPhoto === 'function' ? this.backend.userPhoto(email, o) : null; }
   async bulkFlags(ids) {
