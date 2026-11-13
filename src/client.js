@@ -4,7 +4,7 @@
 // same duck-typed MailClient interface; callers never see the provider.
 //
 //   findInbox(opts)                     → ListItem[]   newest first
-//       opts: limit, unreadOnly, senderContains, subjectContains, text,
+//       opts: limit, unreadOnly, flaggedOnly, senderContains, subjectContains, text,
 //             hasAttachments, sinceIso, folder (inbox|junk|sent|drafts|trash|archive)
 //   getMessage(id, { bodyType })        → ListItem & { to, cc, attachments, bodyType, body }
 //   draftReply(id, changeKey, body, { bodyType })     → { draftId, changeKey }   reply to sender
@@ -16,7 +16,9 @@
 //   bodyType is 'Text' (default) or 'HTML' — see body.js (prepareBody) for Markdown.
 //   sendItem(id, changeKey)             → true
 //   deleteItem(id, changeKey)           → true   (move to trash)
+//   moveItems(ids, folder)              → Map old id → new id
 //   markRead(id, changeKey, isRead)     → true
+//   setFlag(id, changeKey, flagged)     → true
 //   getAttachment(attachmentId, messageId) → { name, contentType, content (Buffer) }
 //   close?()                            → release connections (optional)
 //
@@ -38,6 +40,7 @@
 import { loadConfig, getCredentials, getAccount, accountNames, mailAccountNames, calendarProvider, hasMail } from './config.js';
 import { replaceAboveQuote } from './body.js';
 import * as cache from './cache.js';
+import { htmlToText } from './text.js';
 
 export function isAuthError(e) {
   return !!e && (e.code === 'EWS_AUTH' || e.code === 'MAIL_AUTH');
@@ -121,10 +124,31 @@ export class AccountClient {
   }
   async findInbox(opts) { return (await this.backend.findInbox(opts)).map((i) => this.#item(i)); }
   async getMessage(id, o) { return this.#item(await this.backend.getMessage(this.#in(id), o)); }
+  /** Whole messages that arrived since a mark only the backend understands (IMAP: a UID); null where the backend cannot say. */
+  /** What changed in a folder since a mark (IMAP; see ImapClient.changesIn): ids prefixed; null where the backend cannot say. */
+  async changesIn(folder, o) {
+    if (typeof this.backend.changesIn !== 'function') return null;
+    const r = await this.backend.changesIn(folder, o);
+    return r.flags ? { ...r, flags: r.flags.map((f) => ({ ...f, id: this.#out(f.id) })) } : r;
+  }
+  async listByUids(folder, uids) { return (await this.backend.listByUids(folder, uids)).map((i) => this.#item(i)); }
+  async newSince(mark, o) { const got = typeof this.backend.newSince === 'function' ? await this.backend.newSince(mark, o) : null; return got && got.map((i) => this.#item(i)); }
   /** My own address: from the mail backend, else from the calendar backend (calendar-only accounts). */
   async selfEmail() {
     if (this.hasMail) return this.backend.selfEmail();
     return (await this.#cal('selfEmail'))();
+  }
+  /** The attachments of many messages: Map id → attachments. One request where the backend can, else a read per message. */
+  async attachmentsOf(ids) {
+    if (typeof this.backend.attachmentsOf === 'function') {
+      const m = await this.backend.attachmentsOf(ids.map((id) => this.#in(id)));
+      return new Map([...m].map(([id, v]) => [`${this.account}:${id}`, v]));
+    }
+    const out = new Map();
+    for (const id of ids) {
+      try { out.set(id, (await this.backend.getMessage(this.#in(id), { bodyType: 'Text' })).attachments || []); } catch { /* that message is skipped */ }
+    }
+    return out;
   }
   async bulkFlags(ids) {
     const m = await this.backend.bulkFlags(ids.map((id) => this.#in(id)));
@@ -137,7 +161,13 @@ export class AccountClient {
   }
   async draftReply(id, ck, b, o) { return this.#result(await this.backend.draftReply(this.#in(id), await this.#replyCk(id, ck), b, o)); }
   async draftReplyAll(id, ck, b, o) { return this.#result(await this.backend.draftReplyAll(this.#in(id), await this.#replyCk(id, ck), b, o)); }
+  async draftForward(id, ck, b, o) { return this.#result(await this.backend.draftForward(this.#in(id), await this.#replyCk(id, ck), b, o)); }
+  async removeAttachment(id, ck, attId) { return this.#result(await this.backend.removeAttachment(this.#in(id), this.#ck(ck), attId)); }
   async createMessage(o) { return this.#result(await this.backend.createMessage(o)); }
+  /** People of the account's directory and contacts matching `query` ([{ name, email }]); none where the backend has no directory. */
+  async resolveNames(query) { return typeof this.backend.resolveNames === 'function' ? this.backend.resolveNames(query) : []; }
+  /** The mailbox's own contacts (Exchange); none where the backend keeps none. */
+  async contacts(o) { return typeof this.backend.contacts === 'function' ? this.backend.contacts(o) : []; }
   async updateDraft({ keepQuoted = false, ...o }) {
     if (keepQuoted && o.body !== undefined) {
       // replace only what is written above the quoted thread of a reply/forward draft
@@ -150,7 +180,14 @@ export class AccountClient {
   async addAttachment(id, ck, a) { return this.#result(await this.backend.addAttachment(this.#in(id), this.#ck(ck), a)); }
   sendItem(id, ck) { return this.backend.sendItem(this.#in(id), this.#ck(ck)); }
   deleteItem(id, ck) { return this.backend.deleteItem(this.#in(id), this.#ck(ck)); }
+  /** Move messages to a folder: Map old id → new id (the moved message's), or → null for one that is no longer there. */
+  async moveItems(ids, folder) {
+    const m = await this.backend.moveItems(ids.map((id) => this.#in(id)), folder);
+    return new Map([...m].map(([from, to]) => [`${this.account}:${from}`, to == null ? null : `${this.account}:${to}`]));
+  }
   markRead(id, ck, r) { return this.backend.markRead(this.#in(id), this.#ck(ck), r); }
+  setFlag(id, ck, f) { return this.backend.setFlag(this.#in(id), this.#ck(ck), f); }
+  async webLink(id) { return typeof this.backend.webLink === 'function' ? this.backend.webLink(this.#in(id)) : null; }
   getAttachment(attId, messageId) { return this.backend.getAttachment(attId, messageId ? this.#in(messageId) : undefined); }
   close() { try { this.backend?.close?.(); } catch {} if (this._calendar && this._calendar !== this.backend) try { this._calendar.close?.(); } catch {} }
 
@@ -269,7 +306,8 @@ export async function readMessage(id, opts = {}) {
   const msg = await withAuthRetry((c) => c.getMessage(id, opts), null, id);
   if (account && cache.cachedAccounts().includes(account)) {
     try {
-      const html = msg.bodyType === 'HTML' ? msg.body : null;
+      // asked for HTML and given text: this mail has no HTML ('' says so). Asked for text: whether it has any is not known (null)
+      const html = msg.bodyType === 'HTML' ? msg.body : opts.bodyType === 'HTML' ? '' : null;
       // keep a text version too so the mail is searchable (FTS) and readable with --plain
       const text = msg.bodyType === 'Text' ? msg.body : htmlToText(msg.body);
       cache.upsertBody(account, msg, { text, html });
@@ -317,16 +355,6 @@ function uniquePath(fs, path, dir, name) {
   }
 }
 
-function htmlToText(html) {
-  return String(html || '')
-    .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>|<head[\s\S]*?<\/head>/gi, '')
-    .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/tr>|<\/li>|<\/h[1-6]>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
 /**
  * Reply to a message: creates the (reply or reply-all) draft, and sends it
  * when `send` is true. Returns { sent, draftId, changeKey }.
@@ -342,4 +370,5 @@ export async function replyTo(id, body, { all = false, send = false, changeKey =
 
 /** Keep the cache honest after writes that change a cached row. */
 export function noteRead(id, isRead = true) { try { cache.setRead(id, isRead); } catch {} }
+export function noteFlagged(id, isFlagged = true) { try { cache.setFlagged(id, isFlagged); } catch {} }
 export function noteRemoved(id) { try { cache.removeMessage(id); } catch {} }

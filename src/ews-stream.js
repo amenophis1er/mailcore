@@ -15,7 +15,7 @@ const CONNECTION_TIMEOUT_MIN = 15; // server closes + we reopen this often
 const SOCKET_IDLE_MS = 120000; // Exchange keep-alives arrive ~45s apart
 
 export class EwsStream {
-  constructor({ host, username, domain, password, onNewMail, onCalendarChange, refreshCreds, onState, log }) {
+  constructor({ host, username, domain, password, onNewMail, onCalendarChange, onDraftsChange, refreshCreds, authGate, onState, log }) {
     this.url = new URL(host.replace(/\/$/, '') + '/EWS/Exchange.asmx');
     this.creds = { username, domain: domain || '', password };
     this.onNewMail = onNewMail;
@@ -23,7 +23,12 @@ export class EwsStream {
     // created / modified / deleted items (invitations, moves, cancellations)
     this.onCalendarChange = onCalendarChange || null;
     this.calendarSubscriptionId = null;
+    // when set, another subscription watches the Drafts folder, so a draft
+    // written in one client shows up in the others without a refresh
+    this.onDraftsChange = onDraftsChange || null;
+    this.draftsSubscriptionId = null;
     this.refreshCreds = refreshCreds;
+    this.authGate = authGate || null; // pauses reconnects while sign-in is rejected
     this.onState = onState || (() => {});
     this.log = log || (() => {});
     this.stopped = false;
@@ -45,6 +50,18 @@ export class EwsStream {
   async loop() {
     while (!this.stopped) {
       let connectedAt = 0;
+      if (this.authGate?.blocked()) {
+        this.onState('reconnecting');
+        this.paused = true;
+        await sleep(15000);
+        continue;
+      }
+      if (this.paused && this.refreshCreds) {
+        // the pause ended: sign in with what is stored now, not what was rejected
+        this.paused = false;
+        this.authFails = 0;
+        try { this.creds = await this.refreshCreds(); } catch (e2) { this.log('credential refresh failed: ' + e2.message); }
+      }
       try {
         if (!this.subscriptionId) {
           this.subscriptionId = await this.subscribe();
@@ -59,7 +76,17 @@ export class EwsStream {
             this.onCalendarChange = null;
           }
         }
+        if (this.onDraftsChange && !this.draftsSubscriptionId) {
+          try {
+            this.draftsSubscriptionId = await this.subscribe('drafts', ['CreatedEvent', 'ModifiedEvent', 'DeletedEvent', 'MovedEvent']);
+            this.log('subscribed to Drafts change events');
+          } catch (e) {
+            this.log('Drafts subscription failed (' + e.message + ') — drafts are not pushed');
+            this.onDraftsChange = null;
+          }
+        }
         this.onState('connected');
+        this.authFails = 0;
         connectedAt = Date.now();
         await this.streamOnce();
         this.failures = 0; // normal server-side close; reconnect immediately
@@ -69,10 +96,13 @@ export class EwsStream {
         if (e.code === 'EWS_AUTH' && this.refreshCreds) {
           this.log('auth failed — refreshing credentials');
           try { this.creds = await this.refreshCreds(); } catch (e2) { this.log('credential refresh failed: ' + e2.message); }
+          this.authFails = (this.authFails || 0) + 1;
+          if (this.authGate && this.authFails >= 2) this.authGate.failed(e); // rejected again after a refresh
         }
         if (/SubscriptionNotFound|InvalidSubscription|ExpiredSubscription|SubscriptionUnsubscribed/i.test(e.message)) {
           this.subscriptionId = null;
           this.calendarSubscriptionId = null;
+          this.draftsSubscriptionId = null;
         }
         // A connection that lived a while and then got reset (RST from the
         // server or a middlebox) is routine, not a failure — reconnect fast.
@@ -112,7 +142,7 @@ export class EwsStream {
   streamOnce() {
     const body = envelope(`
       <m:GetStreamingEvents>
-        <m:SubscriptionIds>${[this.subscriptionId, this.calendarSubscriptionId].filter(Boolean).map((id) => `<t:SubscriptionId>${id}</t:SubscriptionId>`).join('')}</m:SubscriptionIds>
+        <m:SubscriptionIds>${[this.subscriptionId, this.calendarSubscriptionId, this.draftsSubscriptionId].filter(Boolean).map((id) => `<t:SubscriptionId>${id}</t:SubscriptionId>`).join('')}</m:SubscriptionIds>
         <m:ConnectionTimeout>${CONNECTION_TIMEOUT_MIN}</m:ConnectionTimeout>
       </m:GetStreamingEvents>`);
 
@@ -146,10 +176,13 @@ export class EwsStream {
     // its SubscriptionId — route calendar changes apart from new mail
     let mail = false;
     let calendar = false;
+    let drafts = false;
     for (const block of env.split(/<(?:\w+:)?Notification>/).slice(1)) {
       const sub = block.match(/<(?:\w+:)?SubscriptionId>([^<]+)<\//)?.[1];
       if (sub && sub === this.calendarSubscriptionId) {
         if (/(Created|Modified|Deleted)Event/.test(block)) calendar = true;
+      } else if (sub && sub === this.draftsSubscriptionId) {
+        if (/(Created|Modified|Deleted|Moved)Event/.test(block)) drafts = true;
       } else if (block.includes('NewMailEvent')) mail = true;
     }
     if (mail) {
@@ -159,6 +192,9 @@ export class EwsStream {
     if (calendar && this.onCalendarChange) {
       this.log('calendar change received');
       try { this.onCalendarChange(); } catch {}
+    }
+    if (drafts && this.onDraftsChange) {
+      try { this.onDraftsChange(); } catch {}
     }
     // keep-alives (ConnectionStatus OK) need no action; Closed ends the
     // response body, which resolves streamOnce via the request 'end'.

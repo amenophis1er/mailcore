@@ -12,7 +12,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { withAuthRetry } from './client.js';
+import { withAuthRetry, isAuthError } from './client.js';
 import { HOME_DIR, loadConfig, loadRulesDoc } from './config.js';
 import { inQuietHours } from './rules.js';
 import { playSound, notifyMac } from './notify.js';
@@ -20,7 +20,7 @@ import { playSound, notifyMac } from './notify.js';
 const KEY_FIELDS = ['subject', 'start', 'end', 'location', 'isCancelled', 'organizerEmail'];
 const MAX_NOTIFY_PER_REFRESH = 3;
 
-export function startCalendarWatch({ account, bus, log }) {
+export function startCalendarWatch({ account, bus, log, authGate }) {
   const snapPath = path.join(HOME_DIR, `calendar-${account}.json`);
   let snap = { baselined: false, events: {}, fired: {} };
   try { snap = { ...snap, ...JSON.parse(fs.readFileSync(snapPath, 'utf8')) }; } catch {}
@@ -31,6 +31,7 @@ export function startCalendarWatch({ account, bus, log }) {
   let refreshing = false;
   let again = false;
   const refresh = async () => {
+    if (authGate?.blocked()) return;
     if (refreshing) { again = true; return; }
     refreshing = true;
     try {
@@ -38,6 +39,7 @@ export function startCalendarWatch({ account, bus, log }) {
       const start = new Date(Date.now() - 3600e3);
       const end = new Date(Date.now() + (cfg.lookaheadDays || 7) * 86400e3);
       const list = await withAuthRetry((c) => c.findEvents({ start, end, limit: 500 }), null, account);
+      authGate?.ok();
       const next = {};
       for (const e of list) next[e.id] = pick(e);
       const changes = snap.baselined ? diff(snap.events, next) : [];
@@ -50,6 +52,7 @@ export function startCalendarWatch({ account, bus, log }) {
       else if (!changes.length && list.length) log(`[${account}] calendar: ${list.length} upcoming event(s), no change`);
     } catch (e) {
       log(`[${account}] calendar refresh failed: ${e.message}`);
+      if (isAuthError(e)) authGate?.failed(e);
     } finally {
       refreshing = false;
       if (again) { again = false; setTimeout(refresh, 1000); }

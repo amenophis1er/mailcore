@@ -12,6 +12,7 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
+import { displayNameOf } from './identity.js';
 
 const FOLDER_SPECIAL = { inbox: '\\Inbox', junk: '\\Junk', sent: '\\Sent', drafts: '\\Drafts', trash: '\\Trash', archive: '\\Archive' };
 const FOLDER_NAMES = {
@@ -84,9 +85,30 @@ export class ImapClient {
     if (c) { try { await c.logout(); } catch { try { c.close(); } catch {} } }
   }
 
+  /**
+   * For a connection that is kept and looked through again and again (the daemon's checks): each look opens
+   * the mailbox anew. A session that keeps a mailbox selected learns of new mail when the server gets round to
+   * telling it (Gmail: ten seconds and more after it arrived); a mailbox just opened is the mailbox as it is.
+   * It is opened read-only, so that leaving it removes nothing (CLOSE expunges only what was opened to write).
+   */
+  asWatcher() {
+    this.watcher = true;
+    return this;
+  }
+
+  /** A watcher's next look opens the mailbox anew, however lately it was opened (the daemon says so before each check). */
+  lookAgain() {
+    this.openedAt = 0;
+  }
+
   async #inMailbox(path, fn) {
     const c = await this.#conn();
-    const lock = await c.getMailboxLock(path);
+    if (this.watcher) {
+      // (not between the steps of one look: the listing, then the bodies of what it found)
+      if (c.mailbox && c.mailbox.readOnly && Date.now() - (this.openedAt || 0) > 1500) await c.mailboxClose();
+      if (!c.mailbox) this.openedAt = Date.now();
+    }
+    const lock = await c.getMailboxLock(path, this.watcher ? { readOnly: true } : undefined);
     try {
       return await fn(c, c.mailbox);
     } finally {
@@ -124,6 +146,7 @@ export class ImapClient {
       const uv = String(mailbox.uidValidity);
       const query = {};
       if (opts.unreadOnly) query.seen = false;
+      if (opts.flaggedOnly) query.flagged = true; // Gmail's star
       if (opts.senderContains) query.from = opts.senderContains;
       if (opts.subjectContains) query.subject = opts.subjectContains;
       if (opts.sinceIso) query.since = new Date(opts.sinceIso);
@@ -147,15 +170,24 @@ export class ImapClient {
         range = `${Math.max(1, hi - want + 1)}:${hi}`;
         byUid = false;
       } else {
-        const uids = (await c.search(query, { uid: true })) || [];
+        let uids = found(await c.search(query, { uid: true }));
         if (uids.length === 0) return [];
         uids.sort((a, b) => a - b);
+        if (opts.untilIso) {
+          // BEFORE is by whole days: the mail of the cursor's own day that came after it (the page before showed it) is left out here
+          const until = new Date(opts.untilIso).getTime();
+          const recent = uids.slice(-Math.max(want + offset, 1) - 500); // the newest ones are where the day's surplus is
+          const late = new Set();
+          for await (const m of c.fetch(recent.join(','), { uid: true, internalDate: true }, { uid: true })) if (m.internalDate && m.internalDate.getTime() > until) late.add(m.uid);
+          if (late.size) uids = uids.filter((u) => !late.has(u));
+          if (uids.length === 0) return [];
+        }
         const page = uids.slice(0, uids.length - offset).slice(-want);
         if (page.length === 0) return [];
         range = page.join(',');
       }
       const items = [];
-      for await (const m of c.fetch(range, { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true }, { uid: byUid })) {
+      for await (const m of c.fetch(range, { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true, threadId: true }, { uid: byUid })) {
         items.push(listItem(path, uv, m));
       }
       items.sort((a, b) => new Date(b.received) - new Date(a.received));
@@ -167,25 +199,102 @@ export class ImapClient {
   async getMessage(id, { bodyType = 'Text' } = {}) {
     const { path, uid } = parseId(id);
     const { item, parsed } = await this.#fetchParsed(path, uid);
-    const html = parsed.html || null;
-    const text = parsed.text || (html ? stripHtml(html) : '');
-    const useHtml = bodyType === 'HTML' && html;
-    return {
-      ...item,
-      to: addrs(parsed.to),
-      cc: addrs(parsed.cc),
-      references: Array.isArray(parsed.references) ? parsed.references.join(' ') : parsed.references || '',
-      isBulk: isBulkHeaders(parsed.headers),
-      attachments: (parsed.attachments || []).map((a, i) => ({
-        id: attachmentId(a, i),
-        name: a.filename || '(unnamed)',
-        size: a.size || 0,
-        contentType: a.contentType || '',
-        inline: a.contentDisposition === 'inline' || !!a.cid
-      })),
-      bodyType: useHtml ? 'HTML' : 'Text',
-      body: String(useHtml ? html : text).replace(/\r\n?/g, '\n')
-    };
+    return shaped(item, parsed, bodyType);
+  }
+
+  /**
+   * Where a folder stands, and what changed in it since it stood at `mark` (what an earlier call gave back),
+   * among the messages numbered `from` and up: the ones a cache holds, never the whole of a large mailbox.
+   *
+   *   { mark, reset: true }   no earlier mark, or the mailbox was rebuilt since: there is no difference to give
+   *   { mark, same: true }    nothing changed
+   *   { mark, flags, uids }   flags: [{ id, uid, isRead, isFlagged }] of the messages whose flags changed;
+   *                           uids: the numbers of the messages there now (a Set), when their number changed,
+   *                           else null. What is in a cache and not among them has left the folder.
+   *
+   * `flags`: 'changed' asks the server for what changed since the mark's counter (CONDSTORE; nothing is asked
+   * where the server keeps no counter); 'all' reads the flags of every message from `from` up, counter or not;
+   * false leaves flags alone.
+   */
+  async changesIn(folder, { mark = null, from = 1, flags = 'changed' } = {}) {
+    const path = await this.#folder(folder);
+    // (a watcher's look is as fresh as its check made it: the daemon asks this right after looking for new mail)
+    return this.#inMailbox(path, async (c, mailbox) => {
+      const now = {
+        path,
+        validity: String(mailbox.uidValidity),
+        next: Number(mailbox.uidNext),
+        exists: Number(mailbox.exists),
+        modseq: mailbox.highestModseq != null ? String(mailbox.highestModseq) : null
+      };
+      // a server that does not say where the folder's numbers stand cannot be asked what changed since
+      if (!Number.isFinite(now.next) || !Number.isFinite(now.exists)) return null;
+      if (!mark || mark.path !== path || mark.validity !== now.validity) return { mark: now, reset: true };
+      const moved = now.exists !== mark.exists || now.next !== mark.next;
+      const counted = /^\d+$/.test(now.modseq ?? '') && /^\d+$/.test(mark.modseq ?? '');
+      // every flag when all are asked for, counter or not: the counter of a server that keeps it badly is no excuse
+      const flagsMoved = flags === 'all' || (counted && now.modseq !== mark.modseq);
+      if (!moved && !(flags && flagsMoved)) return { mark: now, same: true, flags: [], uids: null };
+      const first = Math.max(1, Number(from) || 1);
+      const range = `${first}:*`;
+      const changed = [];
+      if (flags && flagsMoved) {
+        const since = counted && flags !== 'all' ? { changedSince: BigInt(mark.modseq) } : {};
+        for await (const m of c.fetch(range, { uid: true, flags: true }, { uid: true, ...since })) {
+          // ("n:*" answers with the last message even when it is older than n)
+          if (m.uid >= first) changed.push({ id: makeId(path, now.validity, m.uid), uid: m.uid, isRead: m.flags.has('\\Seen'), isFlagged: m.flags.has('\\Flagged') });
+        }
+      }
+      // no server says what left a folder (short of QRESYNC, which Gmail has not): when the number of messages
+      // moved, the numbers that are there are asked for, and the difference is taken by whoever kept the others
+      const uids = moved ? new Set(found(await c.search({ uid: range }, { uid: true })).filter((u) => u >= first)) : null;
+      return { mark: now, flags: changed, uids };
+    });
+  }
+
+  /** The list items (headers, flags, thread) of messages of a folder, by number. */
+  async listByUids(folder, uids) {
+    const path = await this.#folder(folder);
+    if (!uids.length) return [];
+    return this.#inMailbox(path, async (c, mailbox) => {
+      const uv = String(mailbox.uidValidity);
+      const out = [];
+      for await (const m of c.fetch(uids.join(','), { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true, threadId: true }, { uid: true })) out.push(listItem(path, uv, m));
+      return out.sort((x, y) => new Date(y.received) - new Date(x.received));
+    });
+  }
+
+  /**
+   * The inbox's messages from a UID on: what arrived since the mailbox was last looked at, without listing it
+   * again. With `bodies` each comes whole (its text in `body`, its HTML in `html`), downloaded once instead of
+   * once per form of its body. Null when there are more than a handful: that is not "a mail came in" but a
+   * mailbox being filled (a batch moved back in), which the ordinary listing handles, with its own limits.
+   */
+  async newSince(uid, { bodies = true } = {}) {
+    const from = Number(uid);
+    const path = await this.#folder('inbox');
+    this.lookAgain(); // by definition the first step of a look: what is new shows only in a mailbox just opened
+    return this.#inMailbox(path, async (c, mailbox) => {
+      const uv = String(mailbox.uidValidity);
+      const found = [];
+      for await (const m of c.fetch(`${from}:*`, { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true, threadId: true }, { uid: true })) {
+        if (m.uid >= from) found.push(m); // "n:*" always answers with the last message, an older one too
+      }
+      if (found.length > 10) return null;
+      const items = new Map(found.map((m) => [m.uid, listItem(path, uv, m)]));
+      const out = [...items.values()];
+      if (bodies && found.length) {
+        out.length = 0;
+        for await (const m of c.fetch(found.map((x) => x.uid).join(','), { uid: true, source: true }, { uid: true })) {
+          if (!items.has(m.uid) || !m.source) continue;
+          const parsed = await simpleParser(m.source);
+          out.push({ ...shaped(items.get(m.uid), parsed, 'Text'), html: parsed.html ? String(parsed.html).replace(/\r\n?/g, '\n') : null });
+          items.delete(m.uid);
+        }
+        out.push(...items.values()); // one whose body did not come (gone meanwhile): its header is still news
+      }
+      return out.sort((x, y) => new Date(y.received) - new Date(x.received));
+    });
   }
 
   async draftReply(id, changeKey, newBodyText, { bodyType = 'Text' } = {}) {
@@ -213,7 +322,7 @@ export class ImapClient {
       : undefined;
     const refs = [].concat(parsed.references || [], parsed.messageId || []).filter(Boolean);
     const draftId = await this.#appendDraft({
-      from: this.self,
+      from: this.#from,
       to,
       cc: uniq(cc.filter(notSelf).filter((e) => !to.includes(e))),
       subject,
@@ -225,21 +334,44 @@ export class ImapClient {
     return { draftId, changeKey: draftId };
   }
 
-  async createMessage({ to = [], cc = [], subject = '', body = '', bodyType = 'Text', send = false }) {
+  /** Forward DRAFT: the original below the new body, its attachments carried over. */
+  async draftForward(id, _changeKey, newBodyText, { bodyType = 'Text', to = [], cc = [], bcc = [] } = {}) {
+    const { path, uid } = parseId(id);
+    const { parsed } = await this.#fetchParsed(path, uid);
+    const from = addrs(parsed.from)[0] || {};
+    const who = from.name ? `${from.name} <${from.email}>` : from.email || '';
+    const when = parsed.date ? parsed.date.toUTCString() : '';
+    const toLine = addrs(parsed.to).map((a) => a.email).join(', ');
+    const subject = /^fwd?:/i.test(parsed.subject || '') ? parsed.subject : `Fwd: ${parsed.subject || ''}`;
+    const header = [`From: ${who}`, `Date: ${when}`, `Subject: ${parsed.subject || ''}`, `To: ${toLine}`];
+    const origText = String(parsed.text || stripHtml(parsed.html || ''));
     const html = bodyType === 'HTML';
-    const mail = { from: this.self, to, cc, subject, text: html ? stripHtml(body) : body, html: html ? body : undefined };
+    const text = `${html ? stripHtml(newBodyText) : newBodyText}\n\n---------- Forwarded message ----------\n${header.join('\n')}\n\n${origText}\n`;
+    const htmlBody = html
+      ? `${newBodyText}<br><br><div>---------- Forwarded message ----------<br>${header.map(escapeHtml).join('<br>')}</div><br>${parsed.html || `<pre style="white-space:pre-wrap">${escapeHtml(origText)}</pre>`}`
+      : undefined;
+    const draftId = await this.#appendDraft({
+      from: this.#from, to, cc, bcc, subject, text, html: htmlBody,
+      attachments: (parsed.attachments || []).map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType, cid: a.cid }))
+    });
+    return { draftId, changeKey: draftId };
+  }
+
+  async createMessage({ to = [], cc = [], bcc = [], subject = '', body = '', bodyType = 'Text', send = false }) {
+    const html = bodyType === 'HTML';
+    const mail = { from: this.#from, to, cc, bcc, subject, text: html ? stripHtml(body) : body, html: html ? body : undefined };
     if (!send) {
       const draftId = await this.#appendDraft(mail);
       return { sent: false, draftId, changeKey: draftId };
     }
     const raw = await compose(mail);
-    await this.#smtpSend(raw, { from: this.self, to: [...to, ...cc] });
+    await this.#smtpSend(raw, { from: this.self, to: [...to, ...cc, ...bcc] });
     const sentId = await this.#append(await this.#folder('sent'), raw, ['\\Seen']);
     return { sent: true, draftId: sentId, changeKey: sentId };
   }
 
-  async updateDraft({ id, changeKey, subject, body, bodyType = 'Text', to, cc }) {
-    if (subject === undefined && body === undefined && to === undefined && cc === undefined) {
+  async updateDraft({ id, changeKey, subject, body, bodyType = 'Text', to, cc, bcc }) {
+    if (subject === undefined && body === undefined && to === undefined && cc === undefined && bcc === undefined) {
       throw new Error('updateDraft: nothing to change');
     }
     const draftId = await this.#rewriteDraft(changeKey || id, (mail) => {
@@ -250,6 +382,7 @@ export class ImapClient {
       }
       if (to !== undefined) mail.to = to;
       if (cc !== undefined) mail.cc = cc;
+      if (bcc !== undefined) mail.bcc = bcc;
     });
     return { draftId, changeKey: draftId };
   }
@@ -264,13 +397,23 @@ export class ImapClient {
     return { attachmentId: name, changeKey: draftId };
   }
 
+  /** Remove one attachment (id from getMessage().attachments, or its file name) from a draft. */
+  async removeAttachment(id, changeKey, attId) {
+    const { path, uid } = parseId(changeKey || id);
+    const { parsed } = await this.#fetchParsed(path, uid);
+    const at = (parsed.attachments || []).findIndex((x, i) => attachmentId(x, i) === attId || x.filename === attId);
+    if (at < 0) throw new Error(`attachment "${attId}" not found on this draft`);
+    const draftId = await this.#rewriteDraft(changeKey || id, (mail) => { mail.attachments.splice(at, 1); });
+    return { draftId, changeKey: draftId };
+  }
+
   async sendItem(id, changeKey) {
     const { path, uid } = parseId(changeKey || id);
     const { parsed, source } = await this.#fetchParsed(path, uid, true);
     const to = [...addrs(parsed.to), ...addrs(parsed.cc), ...addrs(parsed.bcc)].map((a) => a.email).filter(Boolean);
     if (to.length === 0) throw new Error('sendItem: the draft has no recipients');
     const from = addrs(parsed.from)[0]?.email || this.self;
-    await this.#smtpSend(source, { from, to });
+    await this.#smtpSend(withoutBcc(source), { from, to }); // Bcc is in the envelope, never in what the others receive
     await this.#append(await this.#folder('sent'), source, ['\\Seen']);
     await this.#delete(path, uid);
     return true;
@@ -284,7 +427,7 @@ export class ImapClient {
     const list = parsed.attachments || [];
     const a = list.find((x, i) => attachmentId(x, i) === attId) || list.find((x) => x.filename === attId);
     if (!a) throw new Error(`attachment "${attId}" not found on this message`);
-    return { name: a.filename || 'attachment', contentType: a.contentType || 'application/octet-stream', content: a.content };
+    return { name: a.filename || 'attachment', contentType: a.contentType || 'application/octet-stream', contentId: a.cid || undefined, content: a.content };
   }
 
   async deleteItem(id, changeKey) {
@@ -297,11 +440,42 @@ export class ImapClient {
     return true;
   }
 
-  async markRead(id, changeKey, isRead = true) {
-    const { path, uid } = parseId(changeKey || id);
-    await this.#inMailbox(path, async (c) => {
-      if (isRead) await c.messageFlagsAdd(uid, ['\\Seen'], { uid: true });
-      else await c.messageFlagsRemove(uid, ['\\Seen'], { uid: true });
+  /** Move messages to a folder. Returns Map old id → new id (where the server says it: UIDPLUS). (EWS also answers null for a message that is gone; here such a move simply does nothing.) */
+  async moveItems(ids, folder) {
+    const dest = await this.#folder(folder);
+    const out = new Map();
+    const byPath = new Map();
+    for (const id of ids) { const p = parseId(id); byPath.set(p.path, [...(byPath.get(p.path) || []), { id, uid: p.uid }]); }
+    for (const [path, list] of byPath) {
+      if (path === dest) { for (const x of list) out.set(x.id, x.id); continue; }
+      await this.#inMailbox(path, async (c) => {
+        const r = await c.messageMove(list.map((x) => x.uid).join(','), dest, { uid: true });
+        for (const x of list) {
+          const uid = r?.uidMap?.get(x.uid);
+          out.set(x.id, uid && r.uidValidity ? `${encodeURIComponent(dest)}/${r.uidValidity}/${uid}` : x.id);
+        }
+      });
+    }
+    return out;
+  }
+
+  markRead(id, changeKey, isRead = true) { return this.#store(changeKey || id, '\\Seen', isRead); }
+
+  /** \\Flagged: a star in Gmail, a flag elsewhere. */
+  setFlag(id, changeKey, flagged = true) { return this.#store(changeKey || id, '\\Flagged', flagged); }
+
+  /**
+   * Set or clear one IMAP flag on the message an id names. The id holds the
+   * mailbox's UIDVALIDITY: in a mailbox rebuilt since, the same UID is
+   * another message. And a STORE on a UID that is gone succeeds without
+   * doing anything, so the message is looked for first.
+   */
+  async #store(id, flag, on) {
+    const { path, uidValidity, uid } = parseId(id);
+    await this.#inMailbox(path, async (c, mailbox) => {
+      if (String(mailbox.uidValidity) !== uidValidity || !(await c.fetchOne(uid, { uid: true }, { uid: true }))) throw new Error('message not found: it is no longer in that folder');
+      const done = on ? await c.messageFlagsAdd(uid, [flag], { uid: true }) : await c.messageFlagsRemove(uid, [flag], { uid: true });
+      if (!done) throw new Error(`the mail server did not ${on ? 'set' : 'clear'} ${flag} on that message`);
     });
     return true;
   }
@@ -310,7 +484,7 @@ export class ImapClient {
 
   async #fetchParsed(path, uid, withSource = false) {
     return this.#inMailbox(path, async (c, mailbox) => {
-      const meta = await c.fetchOne(uid, { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true }, { uid: true });
+      const meta = await c.fetchOne(uid, { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true, threadId: true }, { uid: true });
       if (!meta) throw new Error('message not found (it may have been moved or deleted)');
       const { content } = await c.download(uid, undefined, { uid: true });
       const source = await readAll(content);
@@ -350,17 +524,31 @@ export class ImapClient {
     return makeId(path, String(r.uidValidity), r.uid);
   }
 
+  /** The From of mail written here: the address, with the name the account writes as when one is set (displayName). */
+  get #from() {
+    const name = displayNameOf(this.acct);
+    return name ? { name, address: this.self } : this.self;
+  }
+
+  /** The From a draft keeps when it is written again: its own when it is from another address (an alias), else the account's as it is now. */
+  #fromOf(parsed) {
+    const was = addrs(parsed.from)[0];
+    if (!was?.email || was.email.toLowerCase() === this.self) return this.#from;
+    return was.name ? { name: was.name, address: was.email } : was.email;
+  }
+
   async #appendDraft(mail) {
-    return this.#append(await this.#folder('drafts'), await compose(mail), ['\\Draft', '\\Seen']);
+    return this.#append(await this.#folder('drafts'), await compose(mail, { keepBcc: true }), ['\\Draft', '\\Seen']); // a draft remembers its Bcc
   }
 
   async #rewriteDraft(id, mutate) {
     const { path, uid } = parseId(id);
     const { parsed } = await this.#fetchParsed(path, uid);
     const mail = {
-      from: addrs(parsed.from)[0]?.email || this.self,
+      from: this.#fromOf(parsed),
       to: addrs(parsed.to).map((a) => a.email),
       cc: addrs(parsed.cc).map((a) => a.email),
+      bcc: addrs(parsed.bcc).map((a) => a.email),
       subject: parsed.subject || '',
       text: parsed.text || undefined,
       html: parsed.html || undefined,
@@ -385,6 +573,8 @@ export class ImapClient {
       host: s.host,
       port: Number(s.port || 587),
       secure: !!s.secure,
+      // not encrypted from the start: encrypted by STARTTLS, or nothing is sent (set for accounts added from the panel)
+      requireTLS: !s.secure && !!s.requireTLS,
       auth: { user: this.creds.username || this.acct.email, pass: this.creds.password },
       tls: s.rejectUnauthorized === false ? { rejectUnauthorized: false } : undefined
     });
@@ -402,6 +592,48 @@ export class ImapClient {
 
 function makeId(path, uidValidity, uid) {
   return `${encodeURIComponent(path)}/${uidValidity}/${uid}`;
+}
+
+/** A parsed message as the clients hand it out: the list item, the people, the attachments and one form of the body. */
+function shaped(item, parsed, bodyType = 'Text') {
+  const html = parsed.html || null;
+  const text = parsed.text || (html ? stripHtml(html) : '');
+  const useHtml = bodyType === 'HTML' && html;
+  return {
+    ...item,
+    to: addrs(parsed.to),
+    cc: addrs(parsed.cc),
+    bcc: addrs(parsed.bcc),
+    references: Array.isArray(parsed.references) ? parsed.references.join(' ') : parsed.references || '',
+    isBulk: isBulkHeaders(parsed.headers),
+    attachments: (parsed.attachments || []).map((a, i) => ({
+      id: attachmentId(a, i),
+      name: a.filename || '(unnamed)',
+      size: a.size || 0,
+      contentType: a.contentType || '',
+      contentId: a.cid || undefined,
+      inline: a.contentDisposition === 'inline' || !!a.cid
+    })),
+    bodyType: useHtml ? 'HTML' : 'Text',
+    body: String(useHtml ? html : text).replace(/\r\n?/g, '\n')
+  };
+}
+
+/**
+ * What a search found. A search the server refuses (NO, BAD: busy, throttled) comes back from imapflow as
+ * `false`, not as an error: that is a failure, never "nothing there". Whoever compares a cache with the answer
+ * would otherwise take a refusal for an empty folder, and drop everything it holds.
+ */
+function found(answer) {
+  if (!Array.isArray(answer)) throw new Error('the mail server refused the search');
+  return answer;
+}
+
+/** The folder, mailbox generation and message number an IMAP id holds, or null for anything else. */
+export function idParts(id) {
+  const m = String(id ?? '').match(/^(.+)\/(\d+)\/(\d+)$/);
+  if (!m) return null;
+  try { return { path: decodeURIComponent(m[1]), validity: m[2], uid: Number(m[3]) }; } catch { return null; }
 }
 
 function parseId(id) {
@@ -430,10 +662,14 @@ function listItem(path, uv, m) {
     fromName: from.name || '',
     fromEmail: from.address || '',
     displayTo: (env.to || []).map((a) => a.name || a.address).filter(Boolean).join('; '),
+    // who it went to (To and Cc), each name with its address: who a message of mine went to, without reading it
+    toPeople: [...(env.to || []), ...(env.cc || [])].filter((a) => a.address).map((a) => ({ name: a.name || '', email: String(a.address).toLowerCase() })),
     isRead: flags.has('\\Seen'),
+    isFlagged: flags.has('\\Flagged'),
     hasAttachments: hasAttachment(m.bodyStructure),
     received: (m.internalDate || env.date || new Date(0)).toISOString(),
-    conversationId: '',
+    // Gmail's X-GM-THRID (or THREADID where the server has OBJECTID): the server's own threading
+    conversationId: m.threadId ? String(m.threadId) : '',
     messageId: env.messageId || '',
     inReplyTo: env.inReplyTo || ''
   };
@@ -482,8 +718,21 @@ function stripHtml(html) {
     .trim();
 }
 
-function compose(mail) {
-  return new MailComposer({ ...mail, attachments: mail.attachments || [] }).compile().build();
+function compose(mail, { keepBcc = false } = {}) {
+  const compiled = new MailComposer({ ...mail, attachments: mail.attachments || [] }).compile();
+  compiled.keepBcc = keepBcc;
+  return compiled.build();
+}
+
+/** A raw message without its Bcc header (folded lines included); the body is untouched. */
+export function withoutBcc(raw) {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+  const crlf = buf.indexOf('\r\n\r\n');
+  const lf = buf.indexOf('\n\n');
+  const end = crlf >= 0 && (lf < 0 || crlf < lf) ? crlf : lf;
+  if (end < 0) return buf;
+  const head = buf.subarray(0, end).toString('latin1').replace(/^bcc:[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*(?:\r?\n|$)/gim, '').replace(/\r?\n$/, '');
+  return Buffer.concat([Buffer.from(head, 'latin1'), buf.subarray(end)]);
 }
 
 function readAll(stream) {
