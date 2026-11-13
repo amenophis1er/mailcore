@@ -72,3 +72,18 @@ test('escaping and decoding happen exactly once', () => {
   assert.equal(textOf(undefined), '');
   assert.match(envelope('<x/>'), /<soap:Body><x\/><\/soap:Body>/);
 });
+
+test('an Exchange sign-in that is sent elsewhere is not followed', async () => {
+  const { default: httpntlm } = await import('../src/ntlm-guard.js');
+  const options = { url: 'https://mail.example.invalid/EWS/Exchange.asmx', username: 'a', password: 'secret', body: '' };
+  // the first request of a handshake goes out (here: to nowhere); httpntlm follows a redirect by calling itself again with the same options
+  await new Promise((resolve) => httpntlm.post(options, () => resolve()));
+  for (const elsewhere of ['http://mail.example.invalid/EWS/Exchange.asmx', 'https://evil.example.invalid/EWS/Exchange.asmx']) {
+    options.url = elsewhere;
+    const err = await new Promise((resolve) => httpntlm.post(options, (e) => resolve(e)));
+    assert.equal(err?.code, 'EWS_REDIRECT', elsewhere);
+  }
+  options.url = 'https://mail.example.invalid/owa/EWS/Exchange.asmx'; // the same server: followed
+  const same = await new Promise((resolve) => httpntlm.post(options, (e) => resolve(e)));
+  assert.notEqual(same?.code, 'EWS_REDIRECT');
+}, { timeout: 30_000 });

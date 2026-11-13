@@ -72,14 +72,14 @@ export function makeBackend(acct, creds) {
  * Google client for calendar-only accounts, or the one an IMAP account
  * carries under `calendar`. null when the account has no calendar.
  */
-export async function makeCalendarBackend(acct, mailBackend, { timeZone = null, getPassword, accessToken, refresh = false } = {}) {
+export async function makeCalendarBackend(acct, mailBackend, { timeZone = null, getPassword, accessToken, signInHint, refresh = false } = {}) {
   const kind = calendarProvider(acct);
   if (!kind) return null;
   if (kind === 'ews') return mailBackend;
   const spec = acct.provider === 'imap' ? acct.calendar : acct;
   if (kind === 'google') {
     const m = await import('./cal-google.js');
-    return new m.GoogleCalendar({ account: acct.name, email: spec.email || acct.email, timeZone, accessToken });
+    return new m.GoogleCalendar({ account: acct.name, email: spec.email || acct.email, timeZone, accessToken, ...(signInHint ? { signInHint } : {}) });
   }
   const m = await import('./cal-caldav.js');
   // credentials: the account's own (calendar-only), or those of the calendar block, asked for as account "<account>/calendar"
@@ -193,11 +193,17 @@ export class AccountClient {
   setFlag(id, ck, f) { return this.backend.setFlag(this.#in(id), this.#ck(ck), f); }
   async webLink(id) { return typeof this.backend.webLink === 'function' ? this.backend.webLink(this.#in(id)) : null; }
   getAttachment(attId, messageId) { return this.backend.getAttachment(attId, messageId ? this.#in(messageId) : undefined); }
-  /** Release both backends (IMAP logs out); never rejects. */
-  async close() {
+  /**
+   * Release both backends (IMAP signs out). The sign-out is started, not
+   * waited for: an operation does not pay a LOGOUT round trip on its way out
+   * (ImapClient.close caps its own wait). wait: true resolves once both are
+   * closed. Never rejects.
+   */
+  async close({ wait = false } = {}) {
     const closing = [this.backend?.close?.bind(this.backend)];
     if (this._calendar && this._calendar !== this.backend) closing.push(this._calendar.close?.bind(this._calendar));
-    await Promise.all(closing.filter(Boolean).map(async (fn) => { try { await fn(); } catch {} }));
+    const done = Promise.all(closing.filter(Boolean).map(async (fn) => { try { await fn(); } catch {} }));
+    if (wait) await done;
   }
 
   // --- calendar (ews-calendar.js, cal-caldav.js or cal-google.js) ----------

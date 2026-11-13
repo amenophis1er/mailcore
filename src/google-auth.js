@@ -26,15 +26,23 @@ function authError(message) {
   return e;
 }
 
+/** What a Google auth error tells the user to do, by default. */
+export const DEFAULT_SIGN_IN_HINT = () => 'sign in to Google again';
+
 /**
- * googleAuth({ store, clientId, clientSecret }) → { accessToken, login, signedIn }.
+ * googleAuth({ store, clientId, clientSecret, client, signInHint }) → { accessToken, login, signedIn, signInHint }.
+ * `client`: a function returning { clientId, clientSecret }, asked each time
+ * one is needed (instead of clientId/clientSecret, fixed). `signInHint(account)`:
+ * what an auth error tells the user to do ("sign in to Google again").
  * `store` and the client are only needed once a Google account is used.
  */
-export function googleAuth({ store, clientId, clientSecret } = {}) {
+export function googleAuth({ store, clientId, clientSecret, client: clientOf, signInHint = DEFAULT_SIGN_IN_HINT } = {}) {
   const client = () => {
-    if (!clientId) throw new Error('Google calendar: no OAuth client configured (pass google: { clientId, clientSecret } to createMailcore)');
-    return { clientId, clientSecret };
+    const c = typeof clientOf === 'function' ? clientOf() || {} : { clientId, clientSecret };
+    if (!c.clientId) throw new Error('Google calendar: no OAuth client configured (pass google: { clientId, clientSecret } to createMailcore)');
+    return { clientId: c.clientId, clientSecret: c.clientSecret };
   };
+  const hint = (account) => { try { return String(signInHint(account) || DEFAULT_SIGN_IN_HINT(account)); } catch { return DEFAULT_SIGN_IN_HINT(account); } };
   const tokenStore = () => {
     if (!store || typeof store.get !== 'function' || typeof store.set !== 'function') throw new Error('Google calendar: no token store (pass credentials.google: { get, set } to createMailcore)');
     return store;
@@ -90,21 +98,21 @@ export function googleAuth({ store, clientId, clientSecret } = {}) {
   /** A valid access token for the account, refreshed when within a minute of expiry. */
   async function accessToken(account, { force = false } = {}) {
     const t = await load(account);
-    if (!t?.refresh_token) throw authError(`account "${account}" is not signed in to Google`);
+    if (!t?.refresh_token) throw authError(`account "${account}" is not signed in to Google — ${hint(account)}`);
     if (!force && t.access_token && t.expires_at - Date.now() > 60e3) return t.access_token;
     const { clientId, clientSecret } = client();
     let fresh;
     try {
       fresh = await tokenRequest({ client_id: clientId, client_secret: clientSecret, refresh_token: t.refresh_token, grant_type: 'refresh_token' });
     } catch (err) {
-      if (/invalid_grant/.test(err.message)) throw authError(`Google no longer accepts the sign-in for "${account}" — sign in to Google again`);
+      if (/invalid_grant/.test(err.message)) throw authError(`Google no longer accepts the sign-in for "${account}" — ${hint(account)}`);
       throw err;
     }
     await tokenStore().set(account, { ...t, access_token: fresh.access_token, expires_at: Date.now() + (fresh.expires_in || 3600) * 1000 });
     return fresh.access_token;
   }
 
-  return { accessToken, login, signedIn };
+  return { accessToken, login, signedIn, signInHint: hint };
 }
 
 async function tokenRequest(params) {

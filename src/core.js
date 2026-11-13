@@ -29,7 +29,7 @@ export class Mailcore {
    * @param {object} [o.state]      { load(), save(obj) } for watcher state; default <dataDir>/state.json
    * @param {string|Function} [o.timeZone]  IANA zone for all-day events and free slots
    * @param {number|Function} [o.pollSeconds]
-   * @param {object} [o.google]     { clientId, clientSecret } — the OAuth client for Google calendars
+   * @param {object|Function} [o.google]  { clientId, clientSecret, signInHint? } (or a function returning it, asked each time) — the OAuth client for Google calendars; signInHint(account): what a Google auth error tells the user to do
    * @param {Function} [o.cacheFresh]  (accounts) => boolean, replaces the "watcher polled recently" test
    * @param {Function} [o.log]
    */
@@ -45,7 +45,8 @@ export class Mailcore {
     this.dataDir = dataDir;
     this.log = typeof log === 'function' ? log : () => {};
     this.state = state || (dataDir ? jsonFileStore(path.join(dataDir, 'state.json'), emptyState) : memoryStore(emptyState));
-    this.google = googleAuth({ store: credentials.google, clientId: google.clientId, clientSecret: google.clientSecret });
+    const g = () => val(google) || {};
+    this.google = googleAuth({ store: credentials.google, client: g, signInHint: (account) => (typeof g().signInHint === 'function' ? g().signInHint(account) : null) });
     this.cache = createCache({
       dir: dataDir,
       key: cacheKey,
@@ -120,6 +121,7 @@ export class Mailcore {
       timeZone: this.timeZone,
       getPassword: (a, o) => this.#password(a, o.refresh),
       accessToken: this.google.accessToken,
+      signInHint: this.google.signInHint,
       refresh
     }));
   }

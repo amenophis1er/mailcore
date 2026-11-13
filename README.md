@@ -81,6 +81,11 @@ helpers (`parseWhen`, `parseDuration`, `dayStart`), body helpers (`prepareBody`,
   mailcore retries once with the same credentials (NTLM 401s are sometimes transient), then once with
   `refresh: true`. For the CalDAV calendar of an IMAP account, `account.name` is `"<account>/calendar"`.
 - `credentials.google` stores Google tokens (`{ refresh_token, access_token, expires_at, … }`, or a JSON string).
+- `google` is the OAuth client, `{ clientId, clientSecret, signInHint? }`, or a function returning it (asked each
+  time one is needed, so a changed setting is seen). `signInHint(account)` is what a Google auth error tells the
+  user to do (default "sign in to Google again").
+- A client's `close()` starts the sign-out without waiting for it (an IMAP LOGOUT is waited for at most 5 s even
+  then); `close({ wait: true })` resolves once it is done.
 - `cacheKey` is the SQLCipher key: a string, or `({ create }) => key | null`. Readers ask with `create: false` and
   never make a cache; the watcher asks with `create: true` the first time. mailcore never stores the key.
 - The cache serves inbox listings only while a watcher has polled within 3× `pollSeconds` (the watcher writes

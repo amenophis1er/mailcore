@@ -58,6 +58,7 @@ export class ImapClient {
     this.acct = acct;
     this.creds = creds;
     this.self = (acct.email || (String(creds.username).includes('@') ? creds.username : '')).toLowerCase();
+    this.logoutMs = 5000; // how long close() waits for the server's answer to LOGOUT
   }
 
   async selfEmail() {
@@ -82,10 +83,17 @@ export class ImapClient {
     return c;
   }
 
+  /**
+   * Sign out (LOGOUT), or just hang up: a server that has not answered the
+   * goodbye within `logoutMs` (a dead connection never will) is not waited for.
+   */
   async close() {
     const c = this.client;
     this.client = null;
-    if (c) { try { await c.logout(); } catch { try { c.close(); } catch {} } }
+    if (!c) return;
+    let timer;
+    const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('no answer to LOGOUT')), this.logoutMs); });
+    try { await Promise.race([c.logout(), late]); } catch { try { c.close(); } catch {} } finally { clearTimeout(timer); }
   }
 
   /**

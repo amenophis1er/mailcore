@@ -124,7 +124,11 @@ export interface MailcoreOptions {
   /** The watcher's poll interval; also how stale the cache may be (3×). Default 30. */
   pollSeconds?: Lazy<number>;
   /** The OAuth client used for Google calendars. */
-  google?: { clientId?: string; clientSecret?: string };
+  /**
+   * The OAuth client used for Google calendars (or a function returning it, asked each time one is needed).
+   * signInHint(account): what a Google auth error tells the user to do (default "sign in to Google again").
+   */
+  google?: Lazy<{ clientId?: string; clientSecret?: string; signInHint?: (account: string) => string }>;
   /** Replaces the default "a watcher polled within 3× pollSeconds" test for serving from the cache. */
   cacheFresh?: (accounts: string[]) => boolean;
   log?: (message: string) => void;
@@ -463,8 +467,8 @@ export class AccountClient {
   deleteEvent(id: string, changeKey?: string, opts?: { notify?: boolean }): Promise<unknown>;
   respondToEvent(id: string, changeKey: string | undefined, response: string, opts?: { message?: string; notify?: boolean }): Promise<unknown>;
   getFreeBusy(opts: { emails: string[]; start: Date; end: Date; intervalMinutes?: number }): Promise<FreeBusyRow[]>;
-  /** Release both backends (IMAP logs out); never rejects. */
-  close(): Promise<void>;
+  /** Release both backends (IMAP logs out). The sign-out is started, not waited for, unless wait: true; never rejects. */
+  close(opts?: { wait?: boolean }): Promise<void>;
 }
 
 export interface PushStream { start(): void; stop(): void }
@@ -641,6 +645,8 @@ export class Mailcore {
     /** Interactive OAuth sign-in on a loopback port; stores the tokens through credentials.google. */
     login(account: string, opts?: { openUrl?: (url: string) => void; log?: (message: string) => void; timeoutMs?: number }): Promise<GoogleTokens>;
     signedIn(account: string): Promise<boolean>;
+    /** What a Google auth error of this account tells the user to do. */
+    signInHint(account: string): string;
   };
 
   accountNames(): string[];

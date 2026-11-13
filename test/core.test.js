@@ -132,16 +132,29 @@ test('the encrypted cache serves listings and bodies while a watcher is alive', 
   assert.throws(() => wrong.cache.openCache(), (e) => e.code === 'CACHE_KEY');
 });
 
-test('AccountClient.close() waits for the backends to close', async () => {
+test('AccountClient.close() starts the sign-out without waiting for it; wait: true waits; never rejects', async () => {
   const order = [];
-  const slow = (name) => ({ close: () => new Promise((r) => setTimeout(() => { order.push(name); r(); }, 10)) });
+  const started = [];
+  const slow = (name) => ({ close: () => { started.push(name); return new Promise((r) => setTimeout(() => { order.push(name); r(); }, 30)); } });
   const c = new AccountClient('home', slow('mail'), slow('calendar'));
   const p = c.close();
   assert.ok(p instanceof Promise);
   await p;
-  assert.deepEqual(order.sort(), ['calendar', 'mail']);
-  const failing = new AccountClient('x', { close: async () => { throw new Error('logout failed'); } });
-  await failing.close(); // never rejects
+  assert.deepEqual(started.sort(), ['calendar', 'mail'], 'both closes were started');
+  assert.deepEqual(order, [], 'and not waited for: no LOGOUT round trip on the way out');
+  const w = new AccountClient('home', slow('mail2'), slow('cal2'));
+  await w.close({ wait: true });
+  assert.deepEqual(order.filter((n) => n.endsWith('2')).sort(), ['cal2', 'mail2']);
+  let unhandled = 0;
+  const onUnhandled = () => unhandled++;
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const failing = new AccountClient('x', { close: async () => { throw new Error('logout failed'); } });
+    await failing.close(); // never rejects
+    await failing.close({ wait: true });
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(unhandled, 0);
+  } finally { process.off('unhandledRejection', onUnhandled); }
 });
 
 test('displayNameOf and idParts', () => {

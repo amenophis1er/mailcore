@@ -21,10 +21,11 @@ const enc = encodeURIComponent;
 const RESPONSE = { accepted: 'Accept', tentative: 'Tentative', declined: 'Decline', needsAction: 'NoResponseReceived' };
 
 export class GoogleCalendar {
-  constructor({ account, email = '', timeZone, accessToken }) {
+  constructor({ account, email = '', timeZone, accessToken, signInHint = () => 'sign in to Google again' }) {
     this.account = account;
     if (typeof accessToken !== 'function') throw new Error(`account "${account}": Google calendar needs an access token source (credentials.google)`);
     this.accessToken = accessToken;
+    this.signInHint = signInHint;
     this.self = String(email || '').toLowerCase();
     this.tz = localZone(timeZone);
     this.changeKeyIsId = true;
@@ -46,7 +47,7 @@ export class GoogleCalendar {
     const text = await res.text();
     let data = null;
     try { data = text.trim() ? JSON.parse(text) : null; } catch {}
-    if (res.status === 401) { const e = new Error(`Google no longer accepts the sign-in for "${this.account}" — sign in to Google again`); e.code = 'MAIL_AUTH'; throw e; }
+    if (res.status === 401) { const e = new Error(`Google no longer accepts the sign-in for "${this.account}" — ${this.signInHint(this.account)}`); e.code = 'MAIL_AUTH'; throw e; }
     return { status: res.status, etag: res.headers.get('etag') || data?.etag || null, data };
   }
 

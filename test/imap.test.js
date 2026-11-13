@@ -38,6 +38,23 @@ test('moveItems: a folder whose move fails does not lose what another folder mov
   await assert.rejects(c.moveItems(['Spam/5/3'], 'archive'), (e) => e === fail); // nothing moved: the error is the answer
 });
 
+test('close: a server that never answers LOGOUT is hung up on, not waited for', async () => {
+  const c = new ImapClient(ACCT, { username: 'me', password: 'x' });
+  c.logoutMs = 20;
+  let hungUp = false;
+  c.client = { logout: () => new Promise(() => {}), close() { hungUp = true; } };
+  const started = Date.now();
+  await c.close();
+  assert.ok(Date.now() - started < 1000, 'close() came back');
+  assert.ok(hungUp, 'the connection was closed');
+  assert.equal(c.client, null);
+  // one that answers is signed out properly, and not closed under it
+  let closed = false;
+  c.client = { logout: async () => {}, close() { closed = true; } };
+  await c.close();
+  assert.equal(closed, false);
+});
+
 test('the IDLE loop waits while the auth gate is blocked, then signs in with fresh credentials and says how it went', async () => {
   let blocked = true;
   const heard = [];
