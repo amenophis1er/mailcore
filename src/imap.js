@@ -14,6 +14,7 @@ import nodemailer from 'nodemailer';
 import MailComposer from 'nodemailer/lib/mail-composer';
 import { displayNameOf } from './accounts.js';
 import { idParts } from './client.js';
+import { AUTH_HEADER_NAMES, authHeadersFrom, authHeadersOfParsed, headerPairs } from './auth-headers.js';
 
 export { idParts }; // defined beside splitId, so it can be had without loading the IMAP backend
 
@@ -543,6 +544,30 @@ export class ImapClient {
     return out;
   }
 
+  /**
+   * The authentication headers of many messages (a header fetch, no bodies):
+   * Map id → { results, bimiSelector, msAuthAs, fromEmail } (see
+   * auth-headers.js). Ids of another generation of their folder are left out.
+   */
+  async authHeadersOf(ids) {
+    const out = new Map();
+    const byPath = new Map();
+    for (const id of ids) {
+      const { path, uidValidity, uid } = parseId(id);
+      if (!byPath.has(path)) byPath.set(path, { uv: uidValidity, uids: [] });
+      byPath.get(path).uids.push(uid);
+    }
+    for (const [path, { uv, uids }] of byPath) {
+      await this.#inMailbox(path, async (c, mailbox) => {
+        if (String(mailbox.uidValidity) !== uv) return;
+        for await (const m of c.fetch(uids.join(','), { uid: true, envelope: true, headers: AUTH_HEADER_NAMES }, { uid: true })) {
+          out.set(makeId(path, uv, m.uid), { ...authHeadersFrom(headerPairs(m.headers)), fromEmail: String(m.envelope?.from?.[0]?.address || '').toLowerCase() });
+        }
+      });
+    }
+    return out;
+  }
+
   async #append(path, raw, flags) {
     const c = await this.#conn();
     const r = await c.append(path, raw, flags);
@@ -632,6 +657,7 @@ function shaped(item, parsed, bodyType = 'Text') {
     bcc: addrs(parsed.bcc),
     references: Array.isArray(parsed.references) ? parsed.references.join(' ') : parsed.references || '',
     isBulk: isBulkHeaders(parsed.headers),
+    authHeaders: authHeadersOfParsed(parsed),
     attachments: (parsed.attachments || []).map((a, i) => ({
       id: attachmentId(a, i),
       name: a.filename || '(unnamed)',

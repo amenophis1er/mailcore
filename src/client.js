@@ -20,6 +20,8 @@
 //   markRead(id, changeKey, isRead)     → true
 //   setFlag(id, changeKey, flagged)     → true
 //   getAttachment(attachmentId, messageId) → { name, contentType, content (Buffer) }
+//   authHeadersOf?(ids)                 → Map id → { results, bimiSelector, msAuthAs, fromEmail } (auth-headers.js)
+//   userPhoto?(email, { size })         → { contentType, data } | null   (EWS: GetUserPhoto)
 //   close?()                            → release connections (optional)
 //
 // Calendar (EWS backends only — AccountClient raises NO_CALENDAR otherwise):
@@ -154,6 +156,14 @@ export class AccountClient {
     }
     return out;
   }
+  /** The authentication headers of many messages (auth-headers.js): Map id → { results, bimiSelector, msAuthAs, fromEmail }; empty where the backend cannot say. */
+  async authHeadersOf(ids) {
+    if (typeof this.backend.authHeadersOf !== 'function') return new Map();
+    const m = await this.backend.authHeadersOf(ids.map((id) => this.#in(id)));
+    return new Map([...m].map(([id, v]) => [`${this.account}:${id}`, v]));
+  }
+  /** The photo the organisation keeps of an address (Exchange): { contentType, data } or null; null where the backend has no directory. */
+  async userPhoto(email, o) { return typeof this.backend.userPhoto === 'function' ? this.backend.userPhoto(email, o) : null; }
   async bulkFlags(ids) {
     const m = await this.backend.bulkFlags(ids.map((id) => this.#in(id)));
     return new Map([...m].map(([id, v]) => [`${this.account}:${id}`, v]));

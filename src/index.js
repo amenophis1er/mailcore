@@ -22,3 +22,4 @@ export { normalizeSubject, askedSomething, unquoted, snippet, groupThreads, look
 export { prepareBody, replaceAboveQuote, splitQuoted, splitBreaks, markdownToHtml, textToHtml, escapeHtml, BODY_FORMATS } from './body.js';
 export { GOOGLE_SCOPES } from './google-auth.js';
 export { jsonFileStore, memoryStore } from './store.js';
+export { AUTH_HEADER_NAMES, authHeadersFrom, headerPairs } from './auth-headers.js';

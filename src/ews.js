@@ -6,6 +6,7 @@ import httpntlm from './ntlm-guard.js'; // httpntlm, kept from following a redir
 import { XMLParser } from 'fast-xml-parser';
 import { envelope, esc, dig, toArray, textOf, parseMailbox, assertSuccess } from './ews-util.js';
 import { calendarMethods } from './ews-calendar.js';
+import { authHeadersFrom } from './auth-headers.js';
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -302,12 +303,14 @@ export class EwsClient {
         inline: String(a.IsInline) === 'true'
       }));
     const headers = {};
+    const pairs = [];
     for (const h of toArray(dig(msg, 'InternetMessageHeaders.InternetMessageHeader'))) {
       const k = String(h?.['@HeaderName'] || '').toLowerCase();
-      if (k) headers[k] = textOf(h);
+      if (k) { headers[k] = textOf(h); pairs.push([k, textOf(h)]); }
     }
     return {
       ...base,
+      authHeaders: authHeadersFrom(pairs),
       to: toArray(dig(msg, 'ToRecipients.Mailbox')).map(parseMailbox),
       cc: toArray(dig(msg, 'CcRecipients.Mailbox')).map(parseMailbox),
       bcc: toArray(dig(msg, 'BccRecipients.Mailbox')).map(parseMailbox), // only on a draft or a sent copy of one's own
@@ -594,6 +597,67 @@ export class EwsClient {
       });
     }
     return out;
+  }
+
+  /**
+   * The authentication headers of many messages (one GetItem per 50, headers
+   * and From only): Map id → { results, bimiSelector, msAuthAs, fromEmail }
+   * (see auth-headers.js). A message the server does not return is left out.
+   */
+  async authHeadersOf(ids) {
+    const out = new Map();
+    for (let i = 0; i < ids.length; i += 50) {
+      const batch = ids.slice(i, i + 50);
+      const xml = `
+        <m:GetItem>
+          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="item:InternetMessageHeaders"/><t:FieldURI FieldURI="message:From"/></t:AdditionalProperties></m:ItemShape>
+          <m:ItemIds>${batch.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join('')}</m:ItemIds>
+        </m:GetItem>`;
+      const json = await this.post(envelope(xml));
+      const rms = toArray(dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage'));
+      rms.forEach((rm, k) => {
+        if (rm?.['@ResponseClass'] !== 'Success') return;
+        const it = dig(rm, 'Items.Message') || dig(rm, 'Items.MeetingRequest') || dig(rm, 'Items.Item');
+        if (!it) return;
+        const pairs = toArray(dig(it, 'InternetMessageHeaders.InternetMessageHeader')).map((h) => [String(h?.['@HeaderName'] || ''), textOf(h)]);
+        out.set(batch[k], { ...authHeadersFrom(pairs), fromEmail: textOf(dig(it, 'From.Mailbox.EmailAddress')).toLowerCase() });
+      });
+    }
+    return out;
+  }
+
+  /**
+   * The photo the organisation keeps of an address (Exchange 2013 and later:
+   * GetUserPhoto), at `size` (HR48x48 … HR648x648; HR96x96 by default):
+   * { contentType, data: Buffer } or null when there is none. A server that
+   * does not know the operation throws (its error, with `unsupported: true`).
+   */
+  async userPhoto(email, { size = 'HR96x96' } = {}) {
+    const sizes = ['HR48x48', 'HR64x64', 'HR96x96', 'HR120x120', 'HR240x240', 'HR360x360', 'HR432x432', 'HR504x504', 'HR648x648'];
+    const want = sizes.includes(size) ? size : 'HR96x96';
+    let json;
+    try {
+      json = await this.post(envelope(`<m:GetUserPhoto><m:Email>${esc(email)}</m:Email><m:SizeRequested>${want}</m:SizeRequested></m:GetUserPhoto>`));
+    } catch (e) {
+      if (e.code === 'EWS_AUTH') throw e;
+      // a photo that is not there is answered 404 or 500 with ErrorItemNotFound; a server without the operation fails otherwise
+      if (/ErrorItemNotFound|ErrorPhotoNotFound|HTTP 404/i.test(e.message)) return null;
+      // an answer that refuses the request (an older server's schema error) means none will come; a dropped connection says nothing
+      if (/^EWS HTTP (400|500|501)\b/.test(e.message)) e.unsupported = true;
+      throw e;
+    }
+    const r = dig(json, 'Envelope.Body.GetUserPhotoResponse');
+    if (!r) throw Object.assign(new Error('GetUserPhoto: malformed EWS response'), { unsupported: true });
+    if (r['@ResponseClass'] !== 'Success') {
+      const code = textOf(r.ResponseCode);
+      if (/NotFound|ErrorNonExistentMailbox|ErrorInvalidSmtpAddress/i.test(code)) return null;
+      throw Object.assign(new Error(`GetUserPhoto: ${code || 'error'}`), { unsupported: !/ErrorServerBusy|Timeout/i.test(code) });
+    }
+    const b64 = textOf(r.PictureData).replace(/\s+/g, '');
+    if (!b64) return null;
+    const data = Buffer.from(b64, 'base64');
+    const contentType = data[0] === 0xff && data[1] === 0xd8 ? 'image/jpeg' : data.subarray(0, 4).toString('latin1') === '\x89PNG' ? 'image/png' : data.subarray(0, 3).toString('latin1') === 'GIF' ? 'image/gif' : '';
+    return contentType ? { contentType, data } : null;
   }
 
   /** The attachments of many messages at once (one GetItem per 50): Map id → [{ id, name, size, contentType, contentId, inline }]. */
