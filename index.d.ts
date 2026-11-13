@@ -17,6 +17,10 @@ export interface CalendarSettings {
   pollMinutes?: number;
 }
 export interface ServerSettings { host: string; port?: number; secure?: boolean; rejectUnauthorized?: boolean }
+export interface SmtpSettings extends ServerSettings {
+  /** Not encrypted from the start (secure: false): STARTTLS is required, or nothing is sent. */
+  requireTLS?: boolean;
+}
 
 export interface AccountDefinition {
   /** Required in the array form; the map key otherwise. */
@@ -31,13 +35,15 @@ export interface AccountDefinition {
   /** EWS: false turns push (streaming notifications) off */
   streaming?: boolean;
   imap?: ServerSettings;
-  smtp?: ServerSettings;
+  smtp?: SmtpSettings;
   /** CalDAV: icloud | fastmail | other */
   service?: string;
   server?: string;
   hostPattern?: string;
   /** Other addresses that are mine (awaiting-reply). */
   aliases?: string[];
+  /** The name mail is written as; on IMAP, the name in the From of what is sent and drafted (see displayNameOf). */
+  displayName?: string;
   cache?: CacheSettings;
   /** For IMAP accounts: a calendar of their own ({ provider: 'google' | 'caldav', … }). */
   calendar?: CalendarSettings & Partial<Pick<AccountDefinition, 'email' | 'username' | 'server' | 'service' | 'hostPattern'>> & { provider?: 'google' | 'caldav' } | false;
@@ -133,6 +139,8 @@ export interface FindOptions {
   limit?: number;
   offset?: number;
   unreadOnly?: boolean;
+  /** Flagged for follow-up (Exchange) or starred (IMAP \Flagged); never served from the cache. */
+  flaggedOnly?: boolean;
   senderContains?: string;
   subjectContains?: string;
   toContains?: string;
@@ -159,6 +167,8 @@ export interface ListItem {
   fromEmail: string;
   displayTo: string;
   isRead: boolean;
+  /** Absent where the listing does not say. */
+  isFlagged?: boolean;
   hasAttachments: boolean;
   /** ISO */
   received: string;
@@ -192,6 +202,7 @@ export interface ComposeOptions {
   subject?: string;
   body?: string;
   bodyType?: BodyType;
+  bcc?: string[] | string;
   /** Send at once instead of saving a draft. */
   send?: boolean;
 }
@@ -204,6 +215,7 @@ export interface UpdateDraftOptions {
   bodyType?: BodyType;
   to?: string[] | string;
   cc?: string[] | string;
+  bcc?: string[] | string;
   /** Replace only what is above the quoted thread of a reply/forward draft. */
   keepQuoted?: boolean;
 }
@@ -229,6 +241,54 @@ export interface AwaitingThread {
   isRead: boolean;
   askedSomething: boolean;
   snippet: string;
+}
+
+export interface AwaitingThemThread {
+  account: string;
+  threadId: string;
+  subject: string;
+  lastMessageId: string;
+  /** Whom it went to (names, else addresses), me and robots left out. */
+  to: string[];
+  /** When my last message went. */
+  sent: string;
+  messages: number;
+  lastTheirsAt: string | null;
+}
+
+export interface AwaitingOptions {
+  account?: string;
+  days?: number;
+  limit?: number;
+  /** Start of the window (instead of `days`). */
+  sinceIso?: string;
+  /** Shared between an awaitingReply and an awaitingThem call: the mail is gathered once for both. */
+  memo?: Map<string, unknown>;
+  onError?: OnAccountError;
+}
+
+export interface Person { name: string; email: string }
+export interface Contact extends Person { emails: string[]; company: string; title: string; phones: string[] }
+
+/** What changed in an IMAP folder since `mark` (see ImapClient.changesIn); null where the backend cannot say. */
+export interface FolderMark { path: string; validity: string; next: number; exists: number; modseq: string | null }
+export interface FolderChanges {
+  mark: FolderMark;
+  reset?: true;
+  same?: true;
+  flags?: Array<{ id: string; uid: number; isRead: boolean; isFlagged: boolean }>;
+  uids?: Set<number> | null;
+}
+
+/**
+ * Shared by an account's poll, push stream and calendar watcher: while
+ * blocked() nothing signs in; ok() after a sign-in that worked; failed(err)
+ * after one the server rejected.
+ */
+export interface AuthGate {
+  blocked(): boolean;
+  ok(): void;
+  failed(error: Error): void;
 }
 
 export type OnAccountError = (account: string, error: Error) => void;
@@ -333,8 +393,17 @@ export interface CalendarApi {
   resolveCalendar(spec?: string, account?: string): Promise<{ account: string | null; calendar?: string; mailbox?: string }>;
   listCalendars(account?: string, opts?: { mailbox?: string; onError?: OnAccountError }): Promise<CalendarInfo[]>;
   listEvents(opts?: { account?: string; start?: When; end?: When; calendar?: string; limit?: number; onError?: OnAccountError }): Promise<CalendarEvent[]>;
+  /**
+   * Events of every calendar the accounts see (own, other calendars, shared ones opened in Outlook/OWA).
+   * A secondary calendar that cannot be read is marked `failed`; an account whose own calendar fails goes to onError (or throws).
+   */
+  listAllEvents(opts?: { account?: string; start?: When; end?: When; limit?: number; onError?: OnAccountError }): Promise<{
+    items: Array<CalendarEvent & { calendarKey: string; calendarName: string; shared: boolean }>;
+    calendars: Array<{ key: string; name: string; account: string; isDefault: boolean; shared: boolean; writable: boolean; failed?: string }>;
+  }>;
   readEvent(id: string): Promise<EventDetail>;
-  createEvent(opts: EventFields & { account?: string; calendar?: string }): Promise<{ id: string; account: string; changeKey: string | null; invitationsSent?: boolean; [extra: string]: unknown }>;
+  /** allowShared: the event may go into a calendar shared with me, where its owner lets me write. */
+  createEvent(opts: EventFields & { account?: string; calendar?: string; allowShared?: boolean }): Promise<{ id: string; account: string; changeKey: string | null; invitationsSent?: boolean; [extra: string]: unknown }>;
   updateEvent(opts: EventFields & { id: string; changeKey?: string }): Promise<{ id: string; account: string; changeKey: string | null; [extra: string]: unknown }>;
   deleteEvent(id: string, opts?: { changeKey?: string; notify?: boolean }): Promise<unknown>;
   respondToEvent(id: string, response: 'accept' | 'tentative' | 'decline' | string, opts?: { changeKey?: string; message?: string; notify?: boolean }): Promise<unknown>;
@@ -352,18 +421,39 @@ export class AccountClient {
   constructor(name: string, backend: object | null, calendar?: object | (() => Promise<object | null>));
   readonly account: string;
   readonly hasMail: boolean;
+  /** The provider's own client (EwsClient, ImapClient), unprefixed ids. */
+  readonly backend: any;
   findInbox(opts?: FindOptions): Promise<ListItem[]>;
   getMessage(id: string, opts?: { bodyType?: BodyType }): Promise<Message>;
+  /** IMAP: what changed in a folder since `mark`; null elsewhere. */
+  changesIn(folder: Folder, opts?: { mark?: FolderMark | null; from?: number; flags?: 'changed' | 'all' | false }): Promise<FolderChanges | null>;
+  /** IMAP: list items of a folder's messages by UID. */
+  listByUids(folder: Folder, uids: number[]): Promise<ListItem[]>;
+  /** IMAP: inbox messages from a UID on (whole, with `bodies`; `html` beside `body`); null where unknown or too many. */
+  newSince(uid: number, opts?: { bodies?: boolean }): Promise<Array<ListItem & { body?: string; html?: string }> | null>;
   selfEmail(): Promise<string>;
+  /** Map id → attachments, one request where the backend can. */
+  attachmentsOf(ids: string[]): Promise<Map<string, AttachmentInfo[]>>;
   bulkFlags(ids: string[]): Promise<Map<string, boolean>>;
   draftReply(id: string, changeKey: string | null | undefined, body: string, opts?: { bodyType?: BodyType }): Promise<DraftResult>;
   draftReplyAll(id: string, changeKey: string | null | undefined, body: string, opts?: { bodyType?: BodyType }): Promise<DraftResult>;
+  draftForward(id: string, changeKey: string | null | undefined, body: string, opts?: { bodyType?: BodyType; to?: string[]; cc?: string[]; bcc?: string[] }): Promise<DraftResult>;
+  removeAttachment(id: string, changeKey: string | null | undefined, attachmentId: string): Promise<{ changeKey: string | null }>;
   createMessage(opts: Omit<ComposeOptions, 'account'>): Promise<SendResult>;
+  /** Directory and contacts matching `query` (Exchange); [] elsewhere. */
+  resolveNames(query: string): Promise<Person[]>;
+  /** The mailbox's own contacts (Exchange); [] elsewhere. */
+  contacts(opts?: { limit?: number }): Promise<Contact[]>;
   updateDraft(opts: UpdateDraftOptions): Promise<DraftResult>;
   addAttachment(id: string, changeKey: string | null | undefined, attachment: NewAttachment): Promise<{ attachmentId: string | null; changeKey: string | null }>;
   sendItem(id: string, changeKey?: string | null): Promise<boolean>;
   deleteItem(id: string, changeKey?: string | null): Promise<boolean>;
+  /** Map old id → new id, or → null for a message no longer there; ids missing were not moved. */
+  moveItems(ids: string[], folder: Folder): Promise<Map<string, string | null>>;
   markRead(id: string, changeKey: string | null | undefined, isRead: boolean): Promise<boolean>;
+  setFlag(id: string, changeKey: string | null | undefined, flagged: boolean): Promise<boolean>;
+  /** Outlook on the web link to the item (Exchange); null elsewhere. */
+  webLink(id: string): Promise<string | null>;
   getAttachment(attachmentId: string, messageId?: string): Promise<{ name: string; contentType: string; content: Buffer }>;
   findCalendars(opts?: { mailbox?: string }): Promise<CalendarInfo[]>;
   findEvents(opts?: { start?: Date; end?: Date; calendar?: string; mailbox?: string; limit?: number }): Promise<CalendarEvent[]>;
@@ -399,11 +489,33 @@ export interface MailCache {
   findCached(accounts: string[], opts?: Omit<FindOptions, 'fromMe'> & { fromMe?: string }): ListItem[];
   getCached(id: string, opts?: { bodyType?: BodyType }): Message | null;
   cachedSince(account: string, sinceIso: string, opts?: { limit?: number }): Array<ListItem & { to: Mailbox[] | null; cc: Mailbox[] | null; isBulk: boolean | null; bodyText: string | null; hasBody: boolean }>;
-  upsertItems(account: string, items: Partial<ListItem>[]): string[];
+  /** Returns the ids not seen before; `report.changed`: rows already held whose read or flag state changed. */
+  upsertItems(account: string, items: Partial<ListItem>[], report?: { changed?: number } | null): string[];
+  /** Rows of `account` received since `sinceIso` that `items` (the inbox listing of that span) does not hold are dropped; returns how many. */
+  dropUnlisted(account: string, items: Array<{ id: string }>, sinceIso: string): number;
+  /** The cached inbox from `sinceIso` on made to match the server's listing of it. */
+  reconcile(account: string, items: Partial<ListItem>[], sinceIso: string): { added: number; removed: number };
+  /** Sent messages' thread identity (with `sinceIso`, `items` is the whole Sent listing from then on). */
+  noteSent(account: string, items: Partial<ListItem>[], sinceIso?: string): { added: number; removed: number };
+  /** Only rows a watcher listed are written to. html: '' = the mail has none; null/absent = not known (kept). */
   upsertBody(account: string, msg: Partial<Message>, bodies?: { text?: string | null; html?: string | null }): void;
   setRead(id: string, isRead: boolean): void;
+  setFlagged(id: string, isFlagged: boolean): void;
   setBulk(id: string, isBulk: boolean): void;
   removeMessage(id: string): void;
+  getMeta(key: string): string | null;
+  setMeta(key: string, value: string | number): void;
+  idsOf(account: string, table?: 'messages' | 'sent'): string[];
+  /** Server differences applied at once; returns rows really changed. */
+  applyChanges(changes: { flags?: Array<{ id: string; isRead: boolean; isFlagged: boolean }>; gone?: string[]; goneSent?: string[] }): { read: number; flagged: number; gone: number };
+  /** "<account>|<conversationId>" → messages in the thread (inbox rows and sent). */
+  threadCounts(items: Array<Pick<ListItem, 'account'> & { conversationId?: string }>): Map<string, number>;
+  /** id → a preview line of the cached text body. */
+  snippets(ids: string[], length?: number): Map<string, string>;
+  /** id → the start of the cached text body, as stored. */
+  texts(ids: string[], length?: number): Map<string, string>;
+  /** People of the cached mail (senders and fellow recipients; newsletters and robots out), most frequent first. */
+  people(q?: string, opts?: { accounts?: string[]; limit?: number }): Array<Person & { n: number }>;
   lastSync(account: string): number | null;
   /** Drop rows older than each account's cache.days and rows of accounts no longer cached; returns rows removed. */
   prune(): number;
@@ -435,6 +547,8 @@ export interface MailWatchOptions {
   /** Write headers and new bodies to the cache; default true. */
   cache?: boolean;
   calendarSnapshot?: (account: string) => StateStore;
+  /** One gate per account, shared by its poll, stream and calendar watcher. */
+  authGate?: (account: string) => AuthGate | null | undefined;
   log?: (message: string) => void;
 }
 
@@ -478,6 +592,8 @@ export interface CalendarWatchOptions {
   log?: (message: string) => void;
   /** Start on the next tick (default true). */
   start?: boolean;
+  /** No refresh while blocked(); told ok() / failed(err) on auth errors. */
+  authGate?: AuthGate;
 }
 
 export function watchCalendar(core: Mailcore, opts: CalendarWatchOptions & { account: string }): CalendarWatch;
@@ -537,24 +653,47 @@ export class Mailcore {
   /** fn(client) with one same-credential retry and one refresh retry on auth failure; account may be a prefixed id. */
   withClient<T>(account: string | undefined, fn: (client: AccountClient) => Promise<T> | T, opts?: { onRefresh?: (error: Error) => void }): Promise<T>;
   withAuthRetry<T>(fn: (client: AccountClient) => Promise<T> | T, onRefresh: ((error: Error) => void) | null | undefined, account?: string): Promise<T>;
-  stream(name: string, hooks?: { onNewMail?: () => void; onCalendarChange?: () => void; onState?: (state: string) => void; log?: (message: string) => void }): Promise<PushStream>;
+  stream(name: string, hooks?: {
+    /** how: 'told' by the server's push, or 'asked' (IMAP's own look); from: IMAP, the first new UID when known. */
+    onNewMail?: (how?: 'told' | 'asked', from?: number | null) => void;
+    onCalendarChange?: () => void;
+    /** Exchange: the Drafts folder changed. */
+    onDraftsChange?: () => void;
+    authGate?: AuthGate;
+    onState?: (state: string) => void;
+    log?: (message: string) => void;
+  }): Promise<PushStream>;
 
   find(account: string | undefined, opts?: FindOptions, onError?: OnAccountError): Promise<ListItem[]>;
   read(id: string, opts?: { bodyType?: BodyType; live?: boolean }): Promise<Message>;
   getAttachment(messageId: string, attachmentId: string): Promise<{ name: string; contentType: string; content: Buffer }>;
   saveAttachments(id: string, dir: string, opts?: { only?: string }): Promise<SavedAttachment[]>;
   reply(id: string, body: string, opts?: { all?: boolean; send?: boolean; changeKey?: string; bodyType?: BodyType }): Promise<SendResult>;
+  /** A forward draft (never sent here); the server adds the original and its attachments. */
+  forward(id: string, body: string, opts?: { to?: string[]; cc?: string[]; bcc?: string[]; changeKey?: string; bodyType?: BodyType }): Promise<DraftResult>;
   compose(opts: ComposeOptions): Promise<SendResult>;
   updateDraft(opts: UpdateDraftOptions): Promise<DraftResult>;
   addAttachment(id: string, changeKey: string | null | undefined, attachment: NewAttachment): Promise<{ attachmentId: string | null; changeKey: string | null }>;
+  removeAttachment(id: string, changeKey: string | null | undefined, attachmentId: string): Promise<{ changeKey: string | null }>;
   deleteItem(id: string, changeKey?: string | null): Promise<boolean>;
   markRead(id: string, isRead?: boolean, changeKey?: string | null): Promise<boolean>;
+  setFlag(id: string, flagged?: boolean, changeKey?: string | null): Promise<boolean>;
+  /**
+   * Move messages (of any accounts) to a folder: old id → new id, or → null for one no longer there. Ids missing
+   * were not moved (their account failed: onError is told; without it the error is thrown when nothing moved).
+   */
+  moveItems(ids: string[], folder: Folder, opts?: { onError?: OnAccountError }): Promise<Map<string, string | null>>;
   send(id: string, changeKey?: string | null): Promise<boolean>;
+  /** People of the cached mail (see MailCache.people); [] without a cache. */
+  people(q?: string, opts?: { accounts?: string[]; limit?: number }): Array<Person & { n: number }>;
   noteRead(id: string, isRead?: boolean): void;
+  noteFlagged(id: string, isFlagged?: boolean): void;
   noteRemoved(id: string): void;
 
   getThread(opts: { id?: string; subject?: string; days?: number; account?: string; limit?: number; onError?: OnAccountError }): Promise<ThreadMessage[]>;
-  awaitingReply(opts?: { account?: string; days?: number; limit?: number; includeCc?: boolean; since?: string; onError?: OnAccountError }): Promise<{ threads: AwaitingThread[]; scanned: { inbound: number; sent: number; days: number }; cursor: string }>;
+  awaitingReply(opts?: AwaitingOptions & { includeCc?: boolean; since?: string }): Promise<{ threads: AwaitingThread[]; scanned: { inbound: number; sent: number; days: number }; cursor: string }>;
+  /** "Who am I waiting on?": threads whose last message is mine, to someone else, unanswered since. */
+  awaitingThem(opts?: AwaitingOptions & { olderThanHours?: number }): Promise<{ threads: AwaitingThemThread[] }>;
 
   watch(opts?: MailWatchOptions): Promise<MailWatch>;
   watchCalendar(account: string, opts?: CalendarWatchOptions): Promise<CalendarWatch>;
@@ -574,7 +713,11 @@ export function normalizeAccount(name: string, def?: AccountDefinition): Account
 export function normalizeAccounts(accounts: AccountsInput): Record<string, Account>;
 export function calendarProvider(account: AccountDefinition | null | undefined): CalendarProvider | null;
 export function hasMail(account: AccountDefinition | null | undefined): boolean;
+/** The name an account writes as: one line, at most 100 characters; '' when none. */
+export function displayNameOf(account: AccountDefinition | null | undefined): string;
 export function splitId(id: string): { account: string | null; rawId: string };
+/** The folder, mailbox generation and UID an IMAP raw id holds; null for anything else. */
+export function idParts(rawId: string): { path: string; validity: string; uid: number } | null;
 export function isAuthError(error: unknown): boolean;
 
 export interface Rule {
@@ -606,10 +749,14 @@ export const BODY_FORMATS: Array<'text' | 'markdown' | 'html'>;
 export function prepareBody(body: string, format?: 'text' | 'markdown' | 'html'): { body: string; bodyType: BodyType };
 export function replaceAboveQuote(prepared: { body: string; bodyType: BodyType }, currentBody: string, currentType: BodyType): { body: string; bodyType: BodyType };
 export function splitQuoted(body: string, bodyType?: BodyType): { head: string; tail: string };
+/** The line breaks an HTML text ends with, told from the text. */
+export function splitBreaks(html: string): { text: string; breaks: string };
 export function markdownToHtml(md: string): string;
 export function textToHtml(text: string): string;
 export function escapeHtml(s: string): string;
 export function htmlToText(html: string): string;
+/** A text part as text (one that is really HTML is read as HTML). */
+export function plainText(text: string): string;
 
 export const GOOGLE_SCOPES: string[];
 export function jsonFileStore<T = Record<string, unknown>>(file: string, fallback?: () => T): StateStore<T>;

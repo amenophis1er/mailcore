@@ -123,7 +123,7 @@ export const calendarMethods = {
 
     const find = `
       <m:FindFolder Traversal="Deep">
-        <m:FolderShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="folder:DisplayName"/><t:FieldURI FieldURI="folder:TotalCount"/></t:AdditionalProperties></m:FolderShape>
+        <m:FolderShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="folder:DisplayName"/><t:FieldURI FieldURI="folder:TotalCount"/><t:FieldURI FieldURI="folder:FolderClass"/></t:AdditionalProperties></m:FolderShape>
         <m:Restriction>
           <t:Contains ContainmentMode="Prefixed" ContainmentComparison="IgnoreCase"><t:FieldURI FieldURI="folder:FolderClass"/><t:Constant Value="IPF.Appointment"/></t:Contains>
         </m:Restriction>
@@ -135,14 +135,32 @@ export const calendarMethods = {
     for (const f of toArray(dig(rm2, 'RootFolder.Folders.CalendarFolder'))) {
       const id = f.FolderId?.['@Id'] || '';
       if (!id || out.some((c) => c.id === id)) continue;
-      out.push(parseFolder(f, false));
+      // Birthdays and the like (IPF.Appointment.Birthday) are filled in by Exchange: not for new events
+      const cls = textOf(f.FolderClass);
+      out.push({ ...parseFolder(f, false), ...(cls && cls !== 'IPF.Appointment' ? { readOnly: true } : {}) });
     }
     // "Other calendars" opened in Outlook/OWA are not folders of this
     // mailbox but shortcuts to someone else's calendar — list them too.
     try {
-      for (const link of await this.findSharedCalendarLinks()) out.push({ id: '', changeKey: '', name: link.name, itemCount: null, isDefault: false, mailbox: link.email, shared: true, owner: link.owner });
+      const links = await this.findSharedCalendarLinks();
+      // may I add events there? (a team's calendar usually yes, a colleague's own usually no)
+      const mayWrite = await Promise.all(links.map((link) => this.canCreateIn(link.email).catch(() => false)));
+      links.forEach((link, i) => out.push({ id: '', changeKey: '', name: link.name, itemCount: null, isDefault: false, mailbox: link.email, shared: true, owner: link.owner, readOnly: !mayWrite[i] }));
     } catch {}
     return out;
+  },
+
+  /** Whether this account may create events in the default calendar of `mailbox`. */
+  async canCreateIn(mailbox) {
+    const body = `
+      <m:GetFolder>
+        <m:FolderShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="folder:EffectiveRights"/></t:AdditionalProperties></m:FolderShape>
+        <m:FolderIds><t:DistinguishedFolderId Id="calendar"><t:Mailbox><t:EmailAddress>${esc(mailbox)}</t:EmailAddress></t:Mailbox></t:DistinguishedFolderId></m:FolderIds>
+      </m:GetFolder>`;
+    const json = await this.post(tzEnvelope(body));
+    const rm = dig(json, 'Envelope.Body.GetFolderResponse.ResponseMessages.GetFolderResponseMessage');
+    assertSuccess(rm, `GetFolder(rights on the calendar of ${mailbox})`);
+    return String(dig(rm, 'Folders.CalendarFolder.EffectiveRights.CreateContents')) === 'true';
   },
 
   /**
@@ -257,7 +275,7 @@ export const calendarMethods = {
    * Create an appointment (no attendees) or a meeting (attendees → invitations
    * go out when notify is true; otherwise it is saved without inviting anyone).
    */
-  async createEvent({ subject, start, end, allDay = false, location, body, attendees = [], optionalAttendees = [], reminderMinutes, showAs, calendar, notify = true, timeZone }) {
+  async createEvent({ subject, start, end, allDay = false, location, body, attendees = [], optionalAttendees = [], reminderMinutes, showAs, calendar, mailbox, notify = true, timeZone }) {
     if (!subject) throw new Error('createEvent: subject is required');
     const s = new Date(start);
     const e = end ? new Date(end) : new Date(s.getTime() + (allDay ? 86400e3 : 30 * 60e3));
@@ -266,7 +284,9 @@ export const calendarMethods = {
     const mailboxes = (list) => list.map((a) => `<t:Attendee><t:Mailbox><t:EmailAddress>${esc(a)}</t:EmailAddress></t:Mailbox></t:Attendee>`).join('');
     const hasAttendees = attendees.length + optionalAttendees.length > 0;
     const disposition = hasAttendees && notify ? 'SendToAllAndSaveCopy' : 'SendToNone';
-    const saved = calendar ? `<m:SavedItemFolderId><t:FolderId Id="${esc(calendar)}"/></m:SavedItemFolderId>` : '';
+    // one of my calendars by folder id, or the default calendar of a mailbox that lets me write in it (a team's)
+    const saved = calendar ? `<m:SavedItemFolderId><t:FolderId Id="${esc(calendar)}"/></m:SavedItemFolderId>`
+      : mailbox ? `<m:SavedItemFolderId><t:DistinguishedFolderId Id="calendar"><t:Mailbox><t:EmailAddress>${esc(mailbox)}</t:EmailAddress></t:Mailbox></t:DistinguishedFolderId></m:SavedItemFolderId>` : '';
     const xml = `
       <m:CreateItem SendMeetingInvitations="${disposition}">
         ${saved}

@@ -87,15 +87,63 @@ export function calendarApi(core) {
     return lists.flat().sort((a, b) => new Date(a.start) - new Date(b.start)).slice(0, limit);
   }
 
+  // which calendars an account has changes rarely: asked once every few minutes, not with every agenda
+  const CALENDARS_TTL_MS = 5 * 60e3;
+  const knownCalendars = new Map(); // account → { at, list }
+
+  /**
+   * Events in [start, end] of EVERY calendar the accounts can see: the default
+   * one, the other calendars of the mailbox, and the shared calendars opened
+   * in Outlook/OWA (other people's, a team's). Each event carries `calendarKey`,
+   * `calendarName` and `shared`.
+   * { items, calendars: [{ key, name, account, isDefault, shared, writable, failed? }] }
+   * (`writable`: new events may go there)
+   * A secondary calendar that cannot be read is marked `failed` and left out;
+   * an account whose own calendar cannot be read goes to onError (or throws).
+   */
+  async function listAllEvents({ account, start, end, limit = 200, onError } = {}) {
+    const names = calendarAccounts(account);
+    const perAccount = await Promise.all(names.map((n) => withAuthRetry(async (c) => {
+      const hit = knownCalendars.get(n);
+      let list = hit && Date.now() - hit.at < CALENDARS_TTL_MS ? hit.list : null;
+      if (!list) {
+        list = await c.findCalendars();
+        if (!list.some((k) => k.isDefault)) list = [{ id: '', name: 'Calendar', isDefault: true }, ...list];
+        knownCalendars.set(n, { at: Date.now(), list });
+      }
+      const read = await Promise.all(list.map(async (k) => {
+        const shared = !!(k.shared && k.mailbox);
+        const info = { key: `${n}|${k.isDefault ? 'default' : shared ? 'mailbox:' + String(k.mailbox).toLowerCase() : k.id}`, name: k.name || (shared ? k.mailbox : 'Calendar'), account: n, isDefault: !!k.isDefault, shared, writable: !k.readOnly };
+        try {
+          const events = await c.findEvents({ start, end, limit, ...(k.isDefault ? {} : shared ? { mailbox: k.mailbox } : { calendar: k.id }) });
+          return { info, events: events.map((e) => ({ ...e, calendarKey: info.key, calendarName: info.name, shared })) };
+        } catch (e) {
+          if (k.isDefault) throw e; // the account itself is in trouble: let the sign-in retry see it
+          return { info: { ...info, failed: e.message }, events: [] };
+        }
+      }));
+      return read;
+    }, null, n).catch((e) => {
+      if (onError) { onError(n, e); return []; }
+      throw e;
+    })));
+    const read = perAccount.flat();
+    return {
+      items: read.flatMap((r) => r.events).sort((a, b) => new Date(a.start) - new Date(b.start)).slice(0, limit * 3),
+      calendars: read.map((r) => r.info)
+    };
+  }
+
   function readEvent(id) {
     return withAuthRetry((c) => c.getEvent(id), null, id);
   }
 
-  async function createEvent({ account, calendar, ...fields }) {
+  /** `allowShared`: the event may go into a calendar shared with me (a team's), when its owner lets me write there. */
+  async function createEvent({ account, calendar, allowShared = false, ...fields }) {
     const target = await resolveCalendar(calendar, account);
-    if (target.mailbox) throw new Error('events can only be created in your own calendars — invite that person instead');
+    if (target.mailbox && !allowShared) throw new Error('events can only be created in your own calendars — invite that person instead');
     const name = target.account || oneCalendarAccount(account);
-    return withAuthRetry((c) => c.createEvent({ ...fields, calendar: target.calendar, timeZone: core.timeZone }), null, name);
+    return withAuthRetry((c) => c.createEvent({ ...fields, calendar: target.calendar, ...(target.mailbox ? { mailbox: target.mailbox } : {}), timeZone: core.timeZone }), null, name);
   }
 
   /** Update with the item's current changeKey fetched when not supplied; refuses silent meeting edits unless allowed. */
@@ -167,7 +215,7 @@ export function calendarApi(core) {
     return { emails, durationMinutes, window: { start: from.toISOString(), end: to.toISOString() }, slots, people: fb.map((r) => ({ email: r.email, view: r.view })) };
   }
 
-  return { calendarAccounts, oneCalendarAccount, resolveCalendar, listCalendars, listEvents, readEvent, createEvent, updateEvent, deleteEvent, respondToEvent, freeBusy, findFreeSlots };
+  return { calendarAccounts, oneCalendarAccount, resolveCalendar, listCalendars, listEvents, listAllEvents, readEvent, createEvent, updateEvent, deleteEvent, respondToEvent, freeBusy, findFreeSlots };
 }
 
 // --- human dates --------------------------------------------------------------

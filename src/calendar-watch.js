@@ -15,14 +15,19 @@
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { jsonFileStore, memoryStore } from './store.js';
+import { isAuthError } from './client.js';
 
 const KEY_FIELDS = ['subject', 'start', 'end', 'location', 'isCancelled', 'organizerEmail'];
 
 /**
- * watchCalendar(core, { account, snapshot?, settings?, log? }) → EventEmitter & { refresh(), stop() }
+ * watchCalendar(core, { account, snapshot?, settings?, log?, authGate? }) → EventEmitter & { refresh(), stop() }
  *   settings: () => { lookaheadDays, pollMinutes, remindMinutes } (default: the account's calendar block)
+ *   authGate: { blocked(), ok(), failed(err) } shared with the caller's other
+ *     users of this account: no refresh while blocked() (a sign-in known to
+ *     fail is not tried again and again), ok() after a refresh that went
+ *     through, failed(err) on an auth error
  */
-export function watchCalendar(core, { account, snapshot, settings, log = () => {}, start = true } = {}) {
+export function watchCalendar(core, { account, snapshot, settings, log = () => {}, start = true, authGate } = {}) {
   const fresh = () => ({ baselined: false, events: {}, fired: {} });
   const store = snapshot || (core.dataDir ? jsonFileStore(path.join(core.dataDir, `calendar-${account}.json`), fresh) : memoryStore(fresh));
   let snap = { ...fresh(), ...(store.load() ?? {}) };
@@ -39,6 +44,7 @@ export function watchCalendar(core, { account, snapshot, settings, log = () => {
   let refreshing = false;
   let again = false;
   const refresh = async () => {
+    if (authGate?.blocked()) return;
     if (refreshing) { again = true; return; }
     const mine = gen;
     refreshing = true;
@@ -48,6 +54,7 @@ export function watchCalendar(core, { account, snapshot, settings, log = () => {
       const to = new Date(Date.now() + (cfg.lookaheadDays || 7) * 86400e3);
       const list = await core.withClient(account, (c) => c.findEvents({ start: from, end: to, limit: 500 }));
       if (mine !== gen) return; // stopped meanwhile
+      authGate?.ok();
       const next = {};
       for (const e of list) next[e.id] = pick(e);
       const changes = snap.baselined ? diff(snap.events, next) : [];
@@ -68,6 +75,7 @@ export function watchCalendar(core, { account, snapshot, settings, log = () => {
     } catch (e) {
       if (mine !== gen) return;
       log(`[${account}] calendar refresh failed: ${e.message}`);
+      if (isAuthError(e)) authGate?.failed(e);
       out.emit('failure', e);
     } finally {
       refreshing = false;

@@ -2,7 +2,7 @@
 // Talks SOAP to /EWS/Exchange.asmx — the server advertises NTLM/Negotiate,
 // so every call authenticates with the AD username/password it is given.
 
-import httpntlm from 'httpntlm';
+import httpntlm from './ntlm-guard.js'; // httpntlm, kept from following a redirect elsewhere with the sign-in
 import { XMLParser } from 'fast-xml-parser';
 import { envelope, esc, dig, toArray, textOf, parseMailbox, assertSuccess } from './ews-util.js';
 import { calendarMethods } from './ews-calendar.js';
@@ -42,6 +42,49 @@ export class EwsClient {
     return this.self;
   }
 
+  /**
+   * People whose name or address starts with `query`: the organisation's
+   * directory first, then the mailbox's own Contacts. [{ name, email }], at
+   * most what the server returns for an ambiguous name (100).
+   */
+  async resolveNames(query) {
+    const json = await this.post(envelope(`<m:ResolveNames ReturnFullContactData="false" SearchScope="ActiveDirectoryContacts"><m:UnresolvedEntry>${esc(query)}</m:UnresolvedEntry></m:ResolveNames>`));
+    // "several matches" is a warning and "none" an error: both are answers here
+    const set = dig(json, 'Envelope.Body.ResolveNamesResponse.ResponseMessages.ResolveNamesResponseMessage.ResolutionSet');
+    return toArray(set?.Resolution)
+      .map((r) => ({ name: textOf(r?.Mailbox?.Name), email: textOf(r?.Mailbox?.EmailAddress), routing: textOf(r?.Mailbox?.RoutingType) }))
+      .filter((p) => p.email.includes('@') && (!p.routing || p.routing === 'SMTP'))
+      .map(({ name, email }) => ({ name, email }));
+  }
+
+  /**
+   * The people of the mailbox's own Contacts folder: [{ name, email, emails, company, title, phones }], at most
+   * `limit` (the folder's first ones, by name). Those with no address are left out.
+   */
+  async contacts({ limit = 500 } = {}) {
+    // by name, a page at a time, up to `limit`
+    const all = [];
+    for (let offset = 0; offset < limit; offset += 500) {
+      const json = await this.post(envelope(`
+        <m:FindItem Traversal="Shallow">
+          <m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape>
+          <m:IndexedPageItemView MaxEntriesReturned="${Math.min(500, limit - offset)}" Offset="${offset}" BasePoint="Beginning"/>
+          <m:SortOrder><t:FieldOrder Order="Ascending"><t:FieldURI FieldURI="contacts:DisplayName"/></t:FieldOrder></m:SortOrder>
+          <m:ParentFolderIds><t:DistinguishedFolderId Id="contacts"/></m:ParentFolderIds>
+        </m:FindItem>`));
+      const rm = dig(json, 'Envelope.Body.FindItemResponse.ResponseMessages.FindItemResponseMessage');
+      assertSuccess(rm, 'FindItem(contacts)');
+      const page = toArray((rm?.RootFolder?.Items || {}).Contact);
+      all.push(...page);
+      if (page.length < 500 || String(rm?.RootFolder?.['@IncludesLastItemInRange']) === 'true') break;
+    }
+    return all.map((c) => {
+      const emails = toArray(c?.EmailAddresses?.Entry).map((e) => textOf(e)).filter((e) => e.includes('@') && !/^\/o=/i.test(e));
+      const phones = toArray(c?.PhoneNumbers?.Entry).map((p) => ({ kind: String(p?.['@Key'] || ''), number: textOf(p) })).filter((p) => p.number);
+      return { name: textOf(c?.DisplayName) || textOf(c?.CompleteName?.FullName), email: emails[0] || '', emails, company: textOf(c?.CompanyName), title: textOf(c?.JobTitle), phones };
+    }).filter((c) => c.email);
+  }
+
   post(xml) {
     return new Promise((resolve, reject) => {
       httpntlm.post(
@@ -73,7 +116,7 @@ export class EwsClient {
   // --- operations -----------------------------------------------------------
 
   /**
-   * List newest items in a folder. Options: limit, unreadOnly, senderContains,
+   * List newest items in a folder. Options: limit, unreadOnly, flaggedOnly, senderContains,
    * subjectContains, sinceIso, folder (inbox|junk|sent|drafts|trash|archive),
    * text (subject OR body, via Exchange's content index), hasAttachments.
    */
@@ -87,7 +130,8 @@ export class EwsClient {
     // restrictions — they need an AQS QueryString (the content index, same as
     // OWA's search box). When either is requested, translate ALL filters to
     // AQS, since QueryString and Restriction cannot be combined.
-    if (opts.text || opts.hasAttachments) {
+    // Recipients cannot be restricted on (a Contains over To or Cc matched nothing, ever): they go through AQS too.
+    if (opts.text || opts.hasAttachments || opts.toContains) {
       const parts = [];
       // text may be one term or a list — every term must match (AND),
       // each in the subject OR the body.
@@ -107,7 +151,23 @@ export class EwsClient {
         const d = new Date(opts.untilIso);
         parts.push(`received:<=${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`);
       }
-      return this.#find(folderId, opts.limit, '', `<m:QueryString>${esc(parts.join(' AND '))}</m:QueryString>`, opts.offset);
+      const query = `<m:QueryString>${esc(parts.join(' AND '))}</m:QueryString>`;
+      // AQS dates are whole days, and it has no word for a flag: what it gives is narrowed here, to the exact
+      // moment (a page's cursor is the time of its last mail: the next page must not hand the same day back) and to
+      // the flag, page after page of it until enough are found or it has no more
+      const since = opts.sinceIso ? new Date(opts.sinceIso).getTime() : -Infinity;
+      const until = opts.untilIso ? new Date(opts.untilIso).getTime() : Infinity;
+      const keep = (i) => { const t = new Date(i.received).getTime(); return t >= since && t <= until && (!opts.flaggedOnly || i.isFlagged); };
+      const want = Math.min(opts.limit || 25, 100);
+      const out = [];
+      let offset = Math.max(0, Number(opts.offset) || 0);
+      for (let round = 0; round < 10 && out.length < want; round++) {
+        const batch = await this.#find(folderId, 100, '', query, offset);
+        out.push(...batch.filter(keep));
+        if (batch.length < 100) break; // the end of the matches
+        offset += batch.length;
+      }
+      return out.slice(0, want);
     }
     const limit = Math.min(opts.limit || 25, 100);
     const conditions = [];
@@ -123,14 +183,17 @@ export class EwsClient {
           `<t:FieldURI FieldURI="message:Sender"/><t:Constant Value="${esc(opts.fromMe ? await this.selfEmail() : opts.senderContains)}"/></t:Contains>`
       );
     }
-    if (opts.toContains) {
-      const c = (f) => `<t:Contains ContainmentMode="Substring" ContainmentComparison="IgnoreCase"><t:FieldURI FieldURI="${f}"/><t:Constant Value="${esc(opts.toContains)}"/></t:Contains>`;
-      conditions.push(`<t:Or>${c('message:ToRecipients')}${c('message:CcRecipients')}</t:Or>`);
-    }
     if (opts.unreadOnly) {
       conditions.push(
         `<t:IsEqualTo><t:FieldURI FieldURI="message:IsRead"/>` +
           `<t:FieldURIOrConstant><t:Constant Value="false"/></t:FieldURIOrConstant></t:IsEqualTo>`
+      );
+    }
+    if (opts.flaggedOnly) {
+      // PidTagFlagStatus: 2 is "flagged" (1 is "complete", which counts as cleared, as in setFlag)
+      conditions.push(
+        `<t:IsEqualTo><t:ExtendedFieldURI PropertyTag="0x1090" PropertyType="Integer"/>` +
+          `<t:FieldURIOrConstant><t:Constant Value="2"/></t:FieldURIOrConstant></t:IsEqualTo>`
       );
     }
     if (opts.sinceIso) {
@@ -169,6 +232,7 @@ export class EwsClient {
             <t:FieldURI FieldURI="item:Subject"/>
             <t:FieldURI FieldURI="message:From"/>
             <t:FieldURI FieldURI="message:IsRead"/>
+            <t:FieldURI FieldURI="item:Flag"/>
             <t:FieldURI FieldURI="item:DateTimeReceived"/>
             <t:FieldURI FieldURI="item:HasAttachments"/>
             <t:FieldURI FieldURI="item:DisplayTo"/>
@@ -204,7 +268,9 @@ export class EwsClient {
             <t:FieldURI FieldURI="message:From"/>
             <t:FieldURI FieldURI="message:ToRecipients"/>
             <t:FieldURI FieldURI="message:CcRecipients"/>
+            <t:FieldURI FieldURI="message:BccRecipients"/>
             <t:FieldURI FieldURI="message:IsRead"/>
+            <t:FieldURI FieldURI="item:Flag"/>
             <t:FieldURI FieldURI="item:DateTimeReceived"/>
             <t:FieldURI FieldURI="item:HasAttachments"/>
             <t:FieldURI FieldURI="item:Attachments"/>
@@ -232,6 +298,7 @@ export class EwsClient {
         name: textOf(a.Name),
         size: Number(a.Size) || 0,
         contentType: textOf(a.ContentType),
+        contentId: textOf(a.ContentId) || undefined,
         inline: String(a.IsInline) === 'true'
       }));
     const headers = {};
@@ -243,6 +310,7 @@ export class EwsClient {
       ...base,
       to: toArray(dig(msg, 'ToRecipients.Mailbox')).map(parseMailbox),
       cc: toArray(dig(msg, 'CcRecipients.Mailbox')).map(parseMailbox),
+      bcc: toArray(dig(msg, 'BccRecipients.Mailbox')).map(parseMailbox), // only on a draft or a sent copy of one's own
       references: textOf(msg.References),
       isBulk: isBulkHeaders(headers),
       attachments,
@@ -294,10 +362,36 @@ export class EwsClient {
   }
 
   /**
-   * Edit an existing draft: any of subject, body (Text or HTML), to, cc.
+   * Forward DRAFT: the server adds the original message below the new body
+   * and carries its attachments over. Recipients may be set later (updateDraft).
+   */
+  async draftForward(id, changeKey, newBodyText, { bodyType = 'Text', to = [], cc = [], bcc = [] } = {}) {
+    const ck = changeKey ? ` ChangeKey="${esc(changeKey)}"` : '';
+    const mailboxes = (list) => list.map((a) => `<t:Mailbox><t:EmailAddress>${esc(a)}</t:EmailAddress></t:Mailbox>`).join('');
+    const body = `
+      <m:CreateItem MessageDisposition="SaveOnly">
+        <m:Items>
+          <t:ForwardItem>
+            ${to.length ? `<t:ToRecipients>${mailboxes(to)}</t:ToRecipients>` : ''}
+            ${cc.length ? `<t:CcRecipients>${mailboxes(cc)}</t:CcRecipients>` : ''}
+            ${bcc.length ? `<t:BccRecipients>${mailboxes(bcc)}</t:BccRecipients>` : ''}
+            <t:ReferenceItemId Id="${esc(id)}"${ck}/>
+            <t:NewBodyContent BodyType="${bodyType === 'HTML' ? 'HTML' : 'Text'}">${esc(newBodyText)}</t:NewBodyContent>
+          </t:ForwardItem>
+        </m:Items>
+      </m:CreateItem>`;
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.CreateItemResponse.ResponseMessages.CreateItemResponseMessage');
+    assertSuccess(rm, 'CreateItem(draft forward)');
+    const created = dig(rm, 'Items.Message.ItemId');
+    return { draftId: created?.['@Id'] || null, changeKey: created?.['@ChangeKey'] || null };
+  }
+
+  /**
+   * Edit an existing draft: any of subject, body (Text or HTML), to, cc, bcc.
    * Requires the current changeKey; returns the new one for further edits.
    */
-  async updateDraft({ id, changeKey, subject, body, bodyType = 'Text', to, cc }) {
+  async updateDraft({ id, changeKey, subject, body, bodyType = 'Text', to, cc, bcc }) {
     const mailboxes = (list) =>
       list.map((a) => `<t:Mailbox><t:EmailAddress>${esc(a)}</t:EmailAddress></t:Mailbox>`).join('');
     const sets = [];
@@ -312,6 +406,11 @@ export class EwsClient {
     }
     if (cc !== undefined) {
       sets.push(`<t:SetItemField><t:FieldURI FieldURI="message:CcRecipients"/><t:Message><t:CcRecipients>${mailboxes(cc)}</t:CcRecipients></t:Message></t:SetItemField>`);
+    }
+    if (bcc !== undefined) {
+      sets.push(bcc.length
+        ? `<t:SetItemField><t:FieldURI FieldURI="message:BccRecipients"/><t:Message><t:BccRecipients>${mailboxes(bcc)}</t:BccRecipients></t:Message></t:SetItemField>`
+        : '<t:DeleteItemField><t:FieldURI FieldURI="message:BccRecipients"/></t:DeleteItemField>');
     }
     if (sets.length === 0) throw new Error('updateDraft: nothing to change');
 
@@ -361,6 +460,18 @@ export class EwsClient {
     return { attachmentId: att?.['@Id'] || null, changeKey: att?.['@RootItemChangeKey'] || null };
   }
 
+  /** Remove one attachment from a draft. Returns the draft's new changeKey. */
+  async removeAttachment(_parentId, _parentChangeKey, attachmentId) {
+    const xml = `
+      <m:DeleteAttachment>
+        <m:AttachmentIds><t:AttachmentId Id="${esc(attachmentId)}"/></m:AttachmentIds>
+      </m:DeleteAttachment>`;
+    const json = await this.post(envelope(xml));
+    const rm = dig(json, 'Envelope.Body.DeleteAttachmentResponse.ResponseMessages.DeleteAttachmentResponseMessage');
+    assertSuccess(rm, 'DeleteAttachment');
+    return { changeKey: dig(rm, 'RootItemId')?.['@RootItemChangeKey'] || null };
+  }
+
   /** Send an existing draft (used by the CLI's --send after attaching). */
   async sendItem(id, changeKey) {
     // Exchange needs the draft's current ChangeKey to send it; a caller that has only the id gets it looked up here
@@ -393,10 +504,47 @@ export class EwsClient {
   }
 
   /**
+   * Move messages to a folder (inbox|junk|sent|drafts|trash|archive). A moved
+   * item gets a new id: returns Map old id → new id; old id → null for a
+   * message that is no longer there (moved or deleted elsewhere); an id that
+   * could not be moved for another reason is absent.
+   */
+  async moveItems(ids, folder) {
+    const to = FOLDERS[String(folder || '').toLowerCase()];
+    if (!to) throw new Error(`unknown folder "${folder}" — use: ${Object.keys(FOLDERS).join(', ')}`);
+    const out = new Map();
+    let refused = null; // a batch the server failed outright: those before it are moved, and must be said so
+    for (let i = 0; i < ids.length; i += 50) {
+      const batch = ids.slice(i, i + 50);
+      const xml = `
+        <m:MoveItem>
+          <m:ToFolderId><t:DistinguishedFolderId Id="${to}"/></m:ToFolderId>
+          <m:ItemIds>${batch.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join('')}</m:ItemIds>
+        </m:MoveItem>`;
+      let json;
+      try { json = await this.post(envelope(xml)); } catch (e) { refused = e; break; }
+      const rms = toArray(dig(json, 'Envelope.Body.MoveItemResponse.ResponseMessages.MoveItemResponseMessage'));
+      if (!rms.length) { refused = new Error('MoveItem: no response'); break; }
+      rms.forEach((rm, k) => {
+        if (rm?.['@ResponseClass'] !== 'Success') {
+          if (/ErrorItemNotFound|ErrorInvalidIdMalformed/.test(textOf(rm?.ResponseCode))) out.set(batch[k], null);
+          return;
+        }
+        const moved = Object.values(rm?.Items || {}).flatMap((v) => toArray(v))[0];
+        out.set(batch[k], moved?.ItemId?.['@Id'] || batch[k]);
+      });
+      // nothing moved at all: say why, as the server did for the first one
+      if (!out.size && i + 50 >= ids.length) assertSuccess(rms[0], 'MoveItem');
+    }
+    if (refused && !out.size) throw refused;
+    return out; // an id not in it was not moved (the caller says so)
+  }
+
+  /**
    * Compose a new message. send=false saves a draft in Drafts;
    * send=true sends it and keeps a copy in Sent Items.
    */
-  async createMessage({ to = [], cc = [], subject = '', body = '', bodyType = 'Text', send = false }) {
+  async createMessage({ to = [], cc = [], bcc = [], subject = '', body = '', bodyType = 'Text', send = false }) {
     const mailboxes = (list) =>
       list.map((a) => `<t:Mailbox><t:EmailAddress>${esc(a)}</t:EmailAddress></t:Mailbox>`).join('');
     const disposition = send ? 'SendAndSaveCopy' : 'SaveOnly';
@@ -408,8 +556,9 @@ export class EwsClient {
           <t:Message>
             <t:Subject>${esc(subject)}</t:Subject>
             <t:Body BodyType="${bodyType === 'HTML' ? 'HTML' : 'Text'}">${esc(body)}</t:Body>
-            <t:ToRecipients>${mailboxes(to)}</t:ToRecipients>
+            ${to.length ? `<t:ToRecipients>${mailboxes(to)}</t:ToRecipients>` : ''}
             ${cc.length ? `<t:CcRecipients>${mailboxes(cc)}</t:CcRecipients>` : ''}
+            ${bcc.length ? `<t:BccRecipients>${mailboxes(bcc)}</t:BccRecipients>` : ''}
           </t:Message>
         </m:Items>
       </m:CreateItem>`;
@@ -447,6 +596,37 @@ export class EwsClient {
     return out;
   }
 
+  /** The attachments of many messages at once (one GetItem per 50): Map id → [{ id, name, size, contentType, contentId, inline }]. */
+  async attachmentsOf(ids) {
+    const out = new Map();
+    for (let i = 0; i < ids.length; i += 50) {
+      const batch = ids.slice(i, i + 50);
+      const xml = `
+        <m:GetItem>
+          <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="item:Attachments"/></t:AdditionalProperties></m:ItemShape>
+          <m:ItemIds>${batch.map((id) => `<t:ItemId Id="${esc(id)}"/>`).join('')}</m:ItemIds>
+        </m:GetItem>`;
+      const json = await this.post(envelope(xml));
+      const rms = toArray(dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage'));
+      rms.forEach((rm, k) => {
+        if (rm?.['@ResponseClass'] !== 'Success') return;
+        const it = dig(rm, 'Items.Message') || dig(rm, 'Items.MeetingRequest') || dig(rm, 'Items.Item') || Object.values(rm?.Items || {})[0];
+        const list = ['FileAttachment', 'ItemAttachment']
+          .flatMap((kind) => toArray(dig(it, 'Attachments.' + kind)))
+          .map((a) => ({
+            id: a.AttachmentId?.['@Id'] || '',
+            name: textOf(a.Name),
+            size: Number(a.Size) || 0,
+            contentType: textOf(a.ContentType),
+            contentId: textOf(a.ContentId) || undefined,
+            inline: String(a.IsInline) === 'true'
+          }));
+        out.set(batch[k], list);
+      });
+    }
+    return out;
+  }
+
   /** Download one file attachment (id from getMessage().attachments). */
   async getAttachment(attachmentId) {
     const body = `
@@ -461,8 +641,35 @@ export class EwsClient {
     return {
       name: textOf(file.Name) || 'attachment',
       contentType: textOf(file.ContentType) || 'application/octet-stream',
+      contentId: textOf(file.ContentId) || undefined,
       content: Buffer.from(String(textOf(file.Content) || ''), 'base64')
     };
+  }
+
+  /**
+   * Link that opens the item in Outlook on the web (a draft opens in the
+   * compose form). Exchange 2013+ returns a full URL; older servers a query
+   * string for /owa/. null when the server has none.
+   */
+  async webLink(id) {
+    const body = `
+      <m:GetItem>
+        <m:ItemShape>
+          <t:BaseShape>IdOnly</t:BaseShape>
+          <t:AdditionalProperties>
+            <t:FieldURI FieldURI="item:WebClientEditFormQueryString"/>
+            <t:FieldURI FieldURI="item:WebClientReadFormQueryString"/>
+          </t:AdditionalProperties>
+        </m:ItemShape>
+        <m:ItemIds><t:ItemId Id="${esc(id)}"/></m:ItemIds>
+      </m:GetItem>`;
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.GetItemResponse.ResponseMessages.GetItemResponseMessage');
+    assertSuccess(rm, 'GetItem');
+    const item = dig(rm, 'Items.Message') || {};
+    const link = textOf(item.WebClientEditFormQueryString) || textOf(item.WebClientReadFormQueryString);
+    if (!link) return null;
+    return /^https?:/i.test(link) ? link : this.url.replace(/\/EWS\/Exchange\.asmx$/, '/owa/') + link.replace(/^\/?(owa\/)?/, '');
   }
 
   /** Mark a message read (requires the changeKey from a listing). */
@@ -485,6 +692,29 @@ export class EwsClient {
     const json = await this.post(envelope(body));
     const rm = dig(json, 'Envelope.Body.UpdateItemResponse.ResponseMessages.UpdateItemResponseMessage');
     assertSuccess(rm, 'UpdateItem(markRead)');
+    return true;
+  }
+
+  /** Flag a message for follow-up, or clear its flag (a flag marked complete counts as cleared). */
+  async setFlag(id, changeKey, flagged = true) {
+    const body = `
+      <m:UpdateItem ConflictResolution="AutoResolve" MessageDisposition="SaveOnly">
+        <m:ItemChanges>
+          <t:ItemChange>
+            <t:ItemId Id="${esc(id)}" ChangeKey="${esc(changeKey)}"/>
+            <t:Updates>
+              <t:SetItemField>
+                <t:FieldURI FieldURI="item:Flag"/>
+                <t:Message><t:Flag><t:FlagStatus>${flagged ? 'Flagged' : 'NotFlagged'}</t:FlagStatus></t:Flag></t:Message>
+              </t:SetItemField>
+            </t:Updates>
+          </t:ItemChange>
+        </m:ItemChanges>
+      </m:UpdateItem>`;
+
+    const json = await this.post(envelope(body));
+    const rm = dig(json, 'Envelope.Body.UpdateItemResponse.ResponseMessages.UpdateItemResponseMessage');
+    assertSuccess(rm, 'UpdateItem(setFlag)');
     return true;
   }
 }
@@ -510,6 +740,7 @@ function parseListItem(m) {
     fromEmail: textOf(from?.EmailAddress),
     displayTo: textOf(m.DisplayTo),
     isRead: String(m.IsRead) !== 'false',
+    isFlagged: textOf(dig(m, 'Flag.FlagStatus')) === 'Flagged',
     hasAttachments: String(m.HasAttachments) === 'true',
     received: textOf(m.DateTimeReceived),
     conversationId: m.ConversationId?.['@Id'] || '',

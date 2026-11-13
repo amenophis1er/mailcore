@@ -8,6 +8,9 @@
 //   { provider: 'caldav', service, server, username, email, calendar }   (calendar only)
 //   { provider: 'google', email, calendar }                               (calendar only)
 //
+//   displayName (optional, ews and imap): the name mail is written as — on
+//   IMAP the name in the From of what is sent and drafted (see displayNameOf).
+//
 // Unknown fields are kept as they are (front ends carry their own, such as
 // where the password comes from).
 
@@ -77,3 +80,9 @@ export function calendarProvider(acct) {
 }
 
 export function hasMail(acct) { return !!acct && MAIL_PROVIDERS.includes(acct.provider); }
+
+/** The name an account writes as (`displayName`): one line, control characters out, at most 100 characters; '' when none. */
+export function displayNameOf(acct) {
+  const v = typeof acct?.displayName === 'string' ? acct.displayName : '';
+  return v.replace(/[\x00-\x1f\x7f\u2028\u2029]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 100);
+}

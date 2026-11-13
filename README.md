@@ -52,19 +52,22 @@ Ids are `"<account>:<id>"` everywhere, so any id routes back to its account.
 |---|---|
 | `createMailcore(options)` | the instance (`options` in `index.d.ts`: `MailcoreOptions`) |
 | `accountNames()`, `mailAccountNames()`, `account(name?)`, `listAccounts()`, `selectAccounts(name?)` | accounts |
-| `find(account?, opts?, onError?)` | listing/search across accounts, newest first: `limit offset unreadOnly senderContains subjectContains toContains text fromMe hasAttachments sinceIso untilIso folder live` |
+| `find(account?, opts?, onError?)` | listing/search across accounts, newest first: `limit offset unreadOnly flaggedOnly senderContains subjectContains toContains text fromMe hasAttachments sinceIso untilIso folder live` |
 | `read(id, { bodyType?, live? })` | one message with body, recipients and attachment list |
 | `getThread({ id?, subject?, days?, account?, limit? })` | a thread across Inbox and Sent, oldest first |
 | `awaitingReply({ account?, days?, limit?, includeCc?, since? })` | threads whose last message is theirs, unanswered |
+| `awaitingThem({ account?, days?, limit?, olderThanHours? })` | threads whose last message is mine, to someone else, unanswered (`memo` shares the gathering with `awaitingReply`) |
 | `getAttachment(id, attachmentId)`, `saveAttachments(id, dir, { only? })` | attachments |
-| `reply(id, body, { all?, send?, bodyType? })`, `compose({ account, to, cc, subject, body, bodyType, send? })` | drafts and send |
-| `updateDraft({ id, …, keepQuoted? })`, `addAttachment(id, ck, att)`, `deleteItem(id)`, `markRead(id, isRead?)`, `send(id)` | draft and message changes |
+| `reply(id, body, { all?, send?, bodyType? })`, `forward(id, body, { to?, cc?, bcc? })`, `compose({ account, to, cc, bcc, subject, body, bodyType, send? })` | drafts and send |
+| `updateDraft({ id, …, keepQuoted? })`, `addAttachment(id, ck, att)`, `removeAttachment(id, ck, attId)`, `deleteItem(id)`, `markRead(id, isRead?)`, `setFlag(id, flagged?)`, `send(id)` | draft and message changes |
+| `moveItems(ids, folder, { onError? })` | move across accounts: old id → new id (null: no longer there); ids missing were not moved |
+| `people(q, { accounts?, limit? })` | people of the cached mail (senders and fellow recipients, newsletters and robots out) |
 | `client(name)`, `withClient(account, fn)` | an `AccountClient` for anything else, with the auth-retry policy |
-| `calendar.*` | `calendarAccounts listCalendars listEvents readEvent createEvent updateEvent deleteEvent respondToEvent freeBusy findFreeSlots resolveCalendar` |
+| `calendar.*` | `calendarAccounts listCalendars listEvents listAllEvents readEvent createEvent updateEvent deleteEvent respondToEvent freeBusy findFreeSlots resolveCalendar` |
 | `watch(opts)` → `MailWatch` | polling + push per account; events `mail baseline poll failure stream calendar reminder` |
 | `watchCalendar(account, opts)` | one calendar's changes and reminders |
 | `stream(name, hooks)` | the raw push stream of one account |
-| `cache.*` | `cachedAccounts cacheUsable findCached getCached cacheStats prune clearCache …` |
+| `cache.*` | `cachedAccounts cacheUsable findCached getCached cacheStats prune clearCache`, and for a watcher of its own `upsertItems dropUnlisted reconcile noteSent applyChanges getMeta setMeta idsOf threadCounts snippets texts people …` |
 | `google.login(account, { openUrl })`, `google.signedIn(account)` | Google sign-in (PKCE, loopback) |
 
 Also exported: `EventLog` (a cursor-backed, bounded, optionally persisted event queue with long-poll `wait()` and
@@ -93,8 +96,14 @@ w.on('reminder', (event) => { /* remindMinutes before start */ });
 await w.start();
 ```
 
-The first poll of an account sets a baseline and reports nothing. Seen ids live in the `state` store (default
-`<dataDir>/state.json`), so a restart does not re-announce mail.
+The first poll of an account sets a baseline and reports nothing. Seen ids, and seen Message-IDs (so a mail moved
+out of the inbox and back is not new), live in the `state` store (default `<dataDir>/state.json`), so a restart
+does not re-announce mail. The Message-IDs are shared by all accounts on purpose: a mail delivered to two of your
+accounts emits one `mail` event, from whichever account polls first.
+
+`authGate: (account) => ({ blocked(), ok(), failed(err) })` lets the caller pause an account whose sign-in is
+rejected: its poll, push stream and calendar refresh all wait while `blocked()`, and each tells the gate how
+sign-in went.
 
 ## Tools (`mailcore/tools`)
 

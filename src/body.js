@@ -121,11 +121,13 @@ const HTML_QUOTE_MARKERS = [
   /<hr[^>]*>\s*(<[^>]+>\s*)*<b>\s*From:/i,      // Outlook desktop
   /<div[^>]+border-top:\s*solid\s+#E1E1E1/i,    // Outlook desktop (styled separator)
   /<div[^>]*>\s*On .{3,120}? wrote:\s*<\/div>/i, // our own IMAP replies and most clients
+  /<div[^>]*>\s*-{5,} ?Forwarded message ?-{5,}/i, // our own IMAP forwards
   /_{10,}\s*<br\s*\/?>\s*From:/i,                // Exchange "converted from text" replies
-  /<blockquote/i                                // last resort
+  /<blockquote(?![^>]*\bmw-quote\b)/i           // last resort (not a quote typed in the side panel's editor: it marks its own)
 ];
 const TEXT_QUOTE_MARKERS = [
   /^-{3,}\s*Original Message\s*-{3,}\s*$/im,
+  /^-{5,} ?Forwarded message ?-{5,}\s*$/im,
   /^_{10,}\s*$/m,
   /^On .{3,200}? wrote:\s*$/im,
   /^From:\s.+\r?\n(Sent|Date):\s/im,
@@ -140,13 +142,58 @@ const TEXT_QUOTE_MARKERS = [
 export function splitQuoted(body, bodyType = 'Text') {
   const s = String(body ?? '');
   const markers = bodyType === 'HTML' ? HTML_QUOTE_MARKERS : TEXT_QUOTE_MARKERS;
-  let at = -1;
-  for (const re of markers) {
-    const m = re.exec(s);
-    if (m && (at < 0 || m.index < at)) at = m.index;
+  const first = (from) => {
+    const rest = from ? s.slice(from) : s;
+    let at = -1;
+    for (const re of markers) {
+      const m = re.exec(rest);
+      if (m && (at < 0 || m.index < at)) at = m.index;
+    }
+    return at < 0 ? -1 : at + from;
+  };
+  let at = first(0);
+  if (at >= 0 && bodyType === 'HTML') {
+    // a signature is the person's own words: a line of it that reads like the start of a quote is not one
+    const sig = signatureSpan(s);
+    if (sig && sig.start < at && at < sig.end) at = first(sig.end);
   }
   if (at < 0) return { head: s, tail: '' };
   return { head: s.slice(0, at), tail: s.slice(at) };
+}
+
+/**
+ * Where the signature block the side panel puts under the text is in an HTML
+ * body (extension: panel/lib/signatures.ts, `<div … id="mw-sig-…">`): the
+ * first one, which is the draft's own when it has one. null when there is
+ * none, or it is never closed.
+ */
+function signatureSpan(s) {
+  const open = /<div\s[^>]*\bid=["']?mw-sig-[^>]*>/i.exec(s);
+  if (!open) return null;
+  const tag = /<(\/?)div\b[^>]*>/gi;
+  tag.lastIndex = open.index + open[0].length;
+  let depth = 1;
+  for (let m; (m = tag.exec(s));) {
+    depth += m[1] ? -1 : 1;
+    if (depth === 0) return { start: open.index, end: tag.lastIndex };
+  }
+  return null;
+}
+
+/**
+ * The text written above a quote, and the line breaks it ends with: a reply
+ * is built as text, two breaks, quote, and those breaks are the space
+ * between the two, not something that was typed.
+ */
+export function splitBreaks(html) {
+  const s = String(html ?? '');
+  let end = s.length;
+  for (;;) {
+    while (end > 0 && /\s/.test(s[end - 1])) end--;
+    const lt = s.lastIndexOf('<', end - 1);
+    if (lt >= 0 && end - lt <= 8 && /^<br\s*\/?>$/i.test(s.slice(lt, end))) end = lt;
+    else return { text: s.slice(0, end), breaks: s.slice(end) };
+  }
 }
 
 /**
@@ -160,7 +207,8 @@ export function replaceAboveQuote(prepared, currentBody, currentType) {
   if (!tail) return prepared;
   if (currentType === 'HTML') {
     const head = prepared.bodyType === 'HTML' ? prepared.body : textToHtml(prepared.body);
-    return { body: `${htmlShell(oldHead)}${head}${tail}`, bodyType: 'HTML' };
+    // the space there was between the text and the quote stays between them
+    return { body: `${htmlShell(oldHead)}${splitBreaks(head).text}${splitBreaks(oldHead).breaks}${tail}`, bodyType: 'HTML' };
   }
   if (prepared.bodyType === 'HTML') {
     // the new part needs HTML: upgrade the whole draft, quoting the old thread verbatim

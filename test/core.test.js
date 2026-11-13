@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createMailcore, AccountClient, splitId, normalizeAccount, memoryStore } from '../src/index.js';
+import { createMailcore, AccountClient, splitId, idParts, displayNameOf, normalizeAccount, memoryStore } from '../src/index.js';
 
 const ACCOUNTS = {
   work: { provider: 'ews', host: 'https://mail.example.org', username: 'me', email: 'me@example.org' },
@@ -142,4 +142,81 @@ test('AccountClient.close() waits for the backends to close', async () => {
   assert.deepEqual(order.sort(), ['calendar', 'mail']);
   const failing = new AccountClient('x', { close: async () => { throw new Error('logout failed'); } });
   await failing.close(); // never rejects
+});
+
+test('displayNameOf and idParts', () => {
+  assert.equal(displayNameOf({ displayName: ' Ann \n Lee  ' }), 'Ann Lee');
+  assert.equal(displayNameOf({ displayName: 'x'.repeat(150) }).length, 100);
+  assert.equal(displayNameOf({}), '');
+  assert.deepEqual(idParts('INBOX%2FWork/12/34'), { path: 'INBOX/Work', validity: '12', uid: 34 });
+  assert.equal(idParts('AAMk'), null);
+});
+
+test('moveItems: per account, partial, the cache told; setFlag keeps the cache in step', async () => {
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: noCreds });
+  const backends = {
+    work: { moveItems: async (ids) => new Map(ids.map((id) => [id, id === 'GONE' ? null : 'N' + id])), setFlag: async (id, ck, f) => [id, ck, f] },
+    home: { moveItems: async () => { throw new Error('server down'); } }
+  };
+  mc.withClient = async (id, fn) => { const name = splitId(id).account || id; return fn(new AccountClient(name, backends[name])); };
+  const removed = [];
+  const flagged = [];
+  mc.noteRemoved = (id) => removed.push(id);
+  mc.noteFlagged = (id, f) => flagged.push([id, f]);
+  const errors = [];
+  const out = await mc.moveItems(['work:A', 'work:GONE', 'home:INBOX/1/2'], 'archive', { onError: (name, e) => errors.push([name, e.message]) });
+  assert.deepEqual([...out], [['work:A', 'work:NA'], ['work:GONE', null]]);
+  assert.deepEqual(removed, ['work:A', 'work:GONE']);
+  assert.deepEqual(errors, [['home', 'server down']]);
+  await assert.rejects(mc.moveItems(['home:INBOX/1/2'], 'trash'), /server down/); // nothing moved: the error is the answer
+  assert.deepEqual(await mc.setFlag('work:A', false, 'CK'), ['A', 'CK', false]);
+  assert.deepEqual(flagged, [['work:A', false]]);
+});
+
+test('calendar: every calendar listed once, a failing secondary marked; a shared calendar written to only when allowed', async () => {
+  const mc = createMailcore({ accounts: { work: ACCOUNTS.work }, credentials: noCreds });
+  const asked = [];
+  const created = [];
+  mc.withClient = async (id, fn) => fn({
+    findCalendars: async () => { asked.push('calendars'); return [{ id: 'work:C1', name: 'Team', shared: true, mailbox: 'Team@x.org' }, { id: 'work:C2', name: 'Broken' }]; },
+    findEvents: async (o) => {
+      if (o.calendar === 'work:C2') throw new Error('no access');
+      return [{ id: o.mailbox ? 'work:T' : 'work:D', subject: o.mailbox ? 'team' : 'mine', start: o.mailbox ? '2026-11-02T09:00:00Z' : '2026-11-01T09:00:00Z' }];
+    },
+    createEvent: async (o) => { created.push(o); return { id: 'work:new', account: 'work' }; }
+  });
+  const r = await mc.calendar.listAllEvents({ start: new Date(), end: new Date() });
+  assert.deepEqual(r.items.map((e) => [e.id, e.calendarKey, e.shared]), [['work:D', 'work|default', false], ['work:T', 'work|mailbox:team@x.org', true]]);
+  assert.deepEqual(r.calendars.map((c) => [c.name, c.isDefault, c.failed || null]), [['Calendar', true, null], ['Team', false, null], ['Broken', false, 'no access']]);
+  await mc.calendar.listAllEvents({ start: new Date(), end: new Date() });
+  assert.equal(asked.length, 1, 'which calendars there are is asked once in a while, not every time');
+  await assert.rejects(mc.calendar.createEvent({ calendar: 'Team', subject: 'x' }), /only be created in your own calendars/);
+  await mc.calendar.createEvent({ calendar: 'Team', subject: 'x', allowShared: true });
+  assert.equal(created[0].mailbox, 'Team@x.org');
+});
+
+test('a username "DOMAIN\\user" is split, so NTLM does not get the domain twice', async () => {
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: { getPassword: async () => ({ username: 'CORP\\me', domain: 'OTHER', password: 'pw' }) } });
+  const got = await mc.withClient('work', (c) => [c.backend.domain, c.backend.username]);
+  assert.deepEqual(got, ['CORP', 'me']);
+});
+
+test('moveItems: unprefixed ids go to the default account; moving nothing is an error; mail moved back to the inbox is cached at once', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailcore-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const mc = createMailcore({ accounts: { work: ACCOUNTS.work, home: ACCOUNTS.home }, defaultAccount: 'work', credentials: noCreds, dataDir: dir, cacheKey: 'k'.repeat(64) });
+  t.after(() => mc.close());
+  const backend = {
+    moveItems: async (ids) => new Map(ids.filter((id) => id !== 'REFUSED').map((id) => [id, 'N' + id])),
+    getMessage: async (id) => ({ id, subject: 'back', fromEmail: 'ann@x.org', received: new Date().toISOString(), isRead: true })
+  };
+  const used = [];
+  mc.withClient = async (name, fn) => { used.push(name); return fn(new AccountClient(name, backend)); };
+  const errors = [];
+  const out = await mc.moveItems(['A'], 'inbox', { onError: (name, e) => errors.push(name) });
+  assert.deepEqual(used, ['work']);
+  assert.deepEqual([...out], [['work:A', 'work:NA']]); // keyed by the full id
+  assert.deepEqual(mc.cache.idsOf('work'), ['work:NA'], 'restored mail is in the cached inbox now');
+  await assert.rejects(mc.moveItems(['work:REFUSED'], 'archive'), /none of these messages could be moved/);
+  assert.deepEqual(errors, []);
 });

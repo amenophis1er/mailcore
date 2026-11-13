@@ -40,7 +40,7 @@ test('findInbox builds a restriction and parses the listing', async () => {
   assert.match(xml, /<m:SortOrder>/);
   assert.deepEqual(items, [{
     id: 'AAMkAD1', changeKey: 'CQAAAB', subject: 'Q3 &lt;draft&gt; & notes', fromName: 'Ann', fromEmail: 'ann@x.org',
-    displayTo: 'Me', isRead: false, hasAttachments: true, received: '2026-10-24T08:30:00Z',
+    displayTo: 'Me', isRead: false, isFlagged: false, hasAttachments: true, received: '2026-10-24T08:30:00Z',
     conversationId: 'CONV1', messageId: '<m1@x.org>', inReplyTo: ''
   }]);
 });

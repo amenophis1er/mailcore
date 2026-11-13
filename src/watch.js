@@ -17,18 +17,25 @@
 //   'reminder'  { account, minutes, …event }
 //
 // Rules, alerts and actions are the caller's: see rules.js for matching.
+//
+// authGate (optional): (account) => { blocked(), ok(), failed(err) }, one
+// per account, shared by its poll, push stream and calendar watcher, so a
+// sign-in the server rejects is not retried at every poll (which can lock
+// the account out). While blocked() the account is not polled, its stream
+// does not reconnect and its calendar is not refreshed.
 
 import { EventEmitter } from 'node:events';
 import { calendarProvider, hasMail } from './accounts.js';
+import { isAuthError } from './client.js';
 
 const SEEN_MAX = 4000;
 
 export class MailWatch extends EventEmitter {
   /**
    * @param {import('./core.js').Mailcore} core
-   * @param {{ accounts?: string[], pollSeconds?: number, push?: boolean, calendar?: boolean, cache?: boolean, log?: Function, calendarSnapshot?: (account: string) => { load(): any, save(o: any): void } }} [o]
+   * @param {{ accounts?: string[], pollSeconds?: number, push?: boolean, calendar?: boolean, cache?: boolean, log?: Function, calendarSnapshot?: (account: string) => { load(): any, save(o: any): void }, authGate?: (account: string) => { blocked(): boolean, ok(): void, failed(e: Error): void } }} [o]
    */
-  constructor(core, { accounts, pollSeconds, push = true, calendar = true, cache = true, log, calendarSnapshot } = {}) {
+  constructor(core, { accounts, pollSeconds, push = true, calendar = true, cache = true, log, calendarSnapshot, authGate } = {}) {
     super();
     this.core = core;
     this.names = accounts || null;
@@ -38,6 +45,7 @@ export class MailWatch extends EventEmitter {
     this.useCache = cache;
     this.log = log || core.log;
     this.calendarSnapshot = calendarSnapshot;
+    this.authGate = authGate;
     this.timers = [];
     this.timeouts = new Set();
     this.streams = [];
@@ -115,8 +123,9 @@ export class MailWatch extends EventEmitter {
     let failures = 0;
     let ticking = false;
     let again = false; // a push arrived mid-poll: run once more right after
+    const authGate = this.authGate?.(name) || undefined;
     const tick = async () => {
-      if (!mail || !this.#alive(gen)) return;
+      if (!mail || !this.#alive(gen) || authGate?.blocked()) return;
       if (ticking) { again = true; return; }
       ticking = true;
       try {
@@ -124,10 +133,12 @@ export class MailWatch extends EventEmitter {
           onRefresh: () => this.log(`[${name}] password rejected — asking for fresh credentials…`)
         });
         failures = 0;
+        authGate?.ok();
       } catch (e) {
         if (!this.#alive(gen)) return;
         failures++;
         this.log(`[${name}] poll failed (${failures}): ${e.message}`);
+        if (isAuthError(e)) authGate?.failed(e);
         this.emit('failure', { account: name, error: e, failures });
       } finally {
         ticking = false;
@@ -147,7 +158,7 @@ export class MailWatch extends EventEmitter {
       try {
         const { watchCalendar } = await import('./calendar-watch.js');
         if (!this.#alive(gen)) return;
-        calendar = watchCalendar(core, { account: name, log: this.log, snapshot: this.calendarSnapshot?.(name), start: false });
+        calendar = watchCalendar(core, { account: name, log: this.log, snapshot: this.calendarSnapshot?.(name), start: false, authGate });
         calendar.on('changes', (changes) => this.emit('calendar', { account: name, changes }));
         calendar.on('reminder', (r) => this.emit('reminder', r));
         calendar.start();
@@ -164,6 +175,7 @@ export class MailWatch extends EventEmitter {
       const stream = await core.stream(name, {
         onNewMail: () => this.#later(gen, tick, 500), // small delay lets the item settle
         onCalendarChange: calendar ? () => calendar.refresh() : undefined,
+        authGate,
         onState: (s) => {
           if (!this.#alive(gen)) return;
           try {
@@ -205,15 +217,22 @@ export class MailWatch extends EventEmitter {
     // ids are "<account>:<raw>"; an older seen-set may hold raw ids for the
     // account named "default" — honour those too so nothing re-alerts.
     const known = (id) => seen.has(id) || seen.has(id.slice(account.length + 1));
-    const fresh = items.filter((i) => i.id && !known(i.id));
-    for (const i of items) if (i.id) seen.add(i.id);
+    // A mail moved out of the inbox and back (an archive taken back, a restore from the trash) comes back
+    // under a new id. It is the same mail, by its Message-ID: not new, and not to be alerted about again.
+    // The set is shared by all accounts on purpose (as in MailWatcher): one mail delivered to two of my
+    // accounts is announced once, by whichever account polls first.
+    const seenMail = new Set(state.seenMessageIds || []);
+    const fresh = items.filter((i) => i.id && !known(i.id) && !(i.messageId && seenMail.has(i.messageId)));
+    for (const i of items) { if (i.id) seen.add(i.id); if (i.messageId) seenMail.add(i.messageId); }
     let ids = Array.from(seen);
     if (ids.length > SEEN_MAX) ids = ids.slice(ids.length - SEEN_MAX);
+    let mailIds = Array.from(seenMail);
+    if (mailIds.length > SEEN_MAX) mailIds = mailIds.slice(mailIds.length - SEEN_MAX);
 
     const baselined = { ...(state.baselinedAccounts || {}) };
     const wasBaselined = baselined[account] || (account === 'default' && state.baselined);
     baselined[account] = true;
-    core.state.save({ ...state, seenIds: ids, baselined: true, baselinedAccounts: baselined, lastPollAt: Date.now() });
+    core.state.save({ ...state, seenIds: ids, seenMessageIds: mailIds, baselined: true, baselinedAccounts: baselined, lastPollAt: Date.now() });
     this.emit('poll', { account, items });
 
     if (!wasBaselined) {
@@ -233,7 +252,8 @@ export class MailWatch extends EventEmitter {
         const text = await client.getMessage(item.id, { bodyType: 'Text' });
         let html = null;
         try { html = await client.getMessage(item.id, { bodyType: 'HTML' }); } catch {}
-        this.core.cache.upsertBody(account, text, { text: text.body, html: html && html.bodyType === 'HTML' ? html.body : null });
+        // '': no HTML in this mail; null: it could not be asked
+        this.core.cache.upsertBody(account, text, { text: text.body, html: html ? (html.bodyType === 'HTML' ? html.body : '') : null });
       } catch (e) {
         this.log(`[${account}] body cache failed for ${item.subject}: ${e.message}`);
       }

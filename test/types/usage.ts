@@ -45,6 +45,19 @@ async function main(): Promise<void> {
   const closed: Promise<void> = c.close();
   await closed;
   console.log(cached.length);
+  // what MailWatcher's daemon and panel use
+  const flagged = await mc.find('work', { flaggedOnly: true });
+  const moved: Map<string, string | null> = await mc.moveItems(flagged.map((i) => i.id), 'archive', { onError: (a, e) => console.error(a, e.message) });
+  await mc.setFlag(flagged[0]!.id, false);
+  const them = await mc.awaitingThem({ days: 7, memo: new Map(), olderThanHours: 24 });
+  const all = await mc.calendar.listAllEvents({ start: new Date(), end: '+7d' });
+  const counts: Map<string, number> = mc.cache.threadCounts(flagged);
+  const people = mc.people('ann', { limit: 5 });
+  const changes = await c.changesIn('inbox', { mark: null });
+  const gate = { blocked: () => false, ok: () => {}, failed: (e: Error) => console.error(e.message) };
+  await mc.watch({ authGate: () => gate });
+  await mc.stream('work', { onNewMail: (how) => console.log(how), onDraftsChange: () => {}, authGate: gate });
+  console.log(moved.size, them.threads[0]?.to, all.calendars[0]?.writable, counts.size, people[0]?.n, changes?.reset);
 }
 void main;
 

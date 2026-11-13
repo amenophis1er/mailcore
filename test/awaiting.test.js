@@ -46,3 +46,24 @@ test('groupThreads: conversation id, then the In-Reply-To chain, then the subjec
   const threads = [...groupThreads(msgs).values()].map((l) => l.map((x) => x.id));
   assert.deepEqual(threads.sort(), [['1', '2'], ['3', '4'], ['5', '6']]);
 });
+
+const at = (h) => new Date(Date.UTC(2026, 10, 10, h)).toISOString();
+
+test('my answer to a mail older than the window, and the answer to mine: one thread', () => {
+  // <bob1> is not here (older than the window); mine answers it, and Bob's answers mine
+  const mine = { id: 's1', subject: 'Re: Contract', messageId: '<me2@x>', inReplyTo: '<bob1@x>', received: at(9), fromMe: true };
+  const bob = { id: 'i1', subject: 'Re: Contract', messageId: '<bob3@x>', inReplyTo: '<me2@x>', received: at(11), fromMe: false };
+  for (const order of [[bob, mine], [mine, bob]]) {
+    const threads = [...groupThreads(order).values()];
+    assert.equal(threads.length, 1);
+    assert.deepEqual(threads[0].map((m) => m.id), ['s1', 'i1']); // oldest first: the last is Bob's, so nobody waits on Bob
+  }
+});
+
+test('the server\'s own thread id wins; unrelated mail with the same subject stays apart only without one', () => {
+  const a = { id: 'a', subject: 'Hello', conversationId: 'T1', received: at(1) };
+  const b = { id: 'b', subject: 'Re: Hello', conversationId: 'T1', received: at(2) };
+  const c = { id: 'c', subject: 'Hello', conversationId: 'T2', received: at(3) };
+  const threads = [...groupThreads([a, b, c]).values()].map((l) => l.map((m) => m.id));
+  assert.deepEqual(threads.sort(), [['a', 'b'], ['c']]);
+});

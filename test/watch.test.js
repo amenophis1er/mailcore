@@ -111,3 +111,38 @@ test('a calendar refresh in flight at stop() emits nothing and schedules nothing
   assert.deepEqual(changes, []);
   assert.equal(n, 1);
 });
+
+test('an auth gate holds the calendar refresh and the poll back, and hears how sign-in went', async () => {
+  const { mc, calls } = fakeCore();
+  let blocked = true;
+  const heard = [];
+  const gate = { blocked: () => blocked, ok: () => heard.push('ok'), failed: (e) => heard.push('failed:' + e.code) };
+  const cw = watchCalendar(mc, { account: 'work', start: false, authGate: gate });
+  await cw.refreshNow();
+  assert.equal(calls.findEvents, 0);
+  blocked = false;
+  await cw.refreshNow();
+  assert.equal(calls.findEvents, 1);
+  mc.withClient = async () => { throw Object.assign(new Error('401'), { code: 'EWS_AUTH' }); };
+  await cw.refreshNow();
+  assert.deepEqual(heard, ['ok', 'failed:EWS_AUTH']);
+  cw.stop();
+
+  const w = await mc.watch({ push: false, calendar: false, authGate: () => ({ blocked: () => true, ok() {}, failed() {} }) });
+  await w.start();
+  assert.equal(calls.findInbox, 0, 'a blocked account is not polled');
+  w.stop();
+});
+
+test('a poll tells the auth gate how sign-in went', async () => {
+  const { mc } = fakeCore();
+  const heard = [];
+  const gate = { blocked: () => false, ok: () => heard.push('ok'), failed: (e) => heard.push('failed:' + e.code) };
+  const w = await mc.watch({ push: false, calendar: false, authGate: () => gate });
+  await w.start();
+  assert.deepEqual(heard, ['ok']);
+  mc.withClient = async () => { throw Object.assign(new Error('401'), { code: 'EWS_AUTH' }); };
+  await w.check('work');
+  assert.deepEqual(heard, ['ok', 'failed:EWS_AUTH']);
+  w.stop();
+});
