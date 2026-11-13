@@ -68,7 +68,7 @@ Ids are `"<account>:<id>"` everywhere, so any id routes back to its account.
 | `watchCalendar(account, opts)` | one calendar's changes and reminders |
 | `stream(name, hooks)` | the raw push stream of one account |
 | `cache.*` | `cachedAccounts cacheUsable findCached getCached cacheStats prune clearCache`, and for a watcher of its own `upsertItems dropUnlisted reconcile noteSent applyChanges getMeta setMeta idsOf threadCounts snippets texts people …` |
-| `google.login(account, { openUrl })`, `google.signedIn(account)` | Google sign-in (PKCE, loopback) |
+| `google.login(account, { openUrl })`, `google.beginLogin(account)`, `google.signedIn(account)`, `google.tokens(account)` | Google sign-in (PKCE, loopback): blocking, or started and settled later (`{ url, done, cancel }`); what was granted |
 
 Also exported: `EventLog` (a cursor-backed, bounded, optionally persisted event queue with long-poll `wait()` and
 an async iterator `events()`), rule matching (`ruleMatches`, `matchRule`, `accountOk`, `inQuietHours`), date
@@ -80,7 +80,12 @@ helpers (`parseWhen`, `parseDuration`, `dayStart`), body helpers (`prepareBody`,
 - `credentials.getPassword(account, { refresh })` returns `{ username?, domain?, password }`. On an auth failure
   mailcore retries once with the same credentials (NTLM 401s are sometimes transient), then once with
   `refresh: true`. For the CalDAV calendar of an IMAP account, `account.name` is `"<account>/calendar"`.
-- `credentials.google` stores Google tokens (`{ refresh_token, access_token, expires_at, … }`, or a JSON string).
+- `credentials.google` stores Google tokens (`{ refresh_token, access_token, expires_at, scope, … }`, or a JSON string).
+  `scope` is what Google granted (`grantedScopes(tokens)` lists it); `refused_at` is set when Google refused a renewal.
+- A sign-in asks for the calendar (`GOOGLE_SCOPES`) unless told otherwise: `scopes`, `extraScopes`
+  (`GOOGLE_CONTACTS_SCOPES` for contacts), `loginHint`, `timeoutMs`, `appName` (named on the page the browser tab
+  shows at the end). Its loopback server answers one request, a GET of `/` with Host `127.0.0.1:<port>` and the
+  state sent; another path, Host or state is refused without ending it.
 - `google` is the OAuth client, `{ clientId, clientSecret, signInHint? }`, or a function returning it (asked each
   time one is needed, so a changed setting is seen). `signInHint(account)` is what a Google auth error tells the
   user to do (default "sign in to Google again").

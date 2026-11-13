@@ -81,9 +81,34 @@ export interface GoogleTokens {
   refresh_token: string;
   access_token?: string;
   expires_at?: number;
+  /** the scopes granted, space-separated (the token response's `scope`) */
   scope?: string;
   signed_in_at?: string;
+  /** when Google refused to renew it (invalid_grant) */
+  refused_at?: string;
   [extra: string]: unknown;
+}
+
+export interface GoogleSignInOptions {
+  /** the scopes asked for (default GOOGLE_SCOPES) */
+  scopes?: string[];
+  /** asked for besides `scopes` */
+  extraScopes?: string[];
+  /** the address to sign in as (preselected by Google) */
+  loginHint?: string;
+  /** how long the loopback server waits (default 10 minutes) */
+  timeoutMs?: number;
+  /** what the page shown at the end tells to return to */
+  appName?: string;
+}
+
+export interface GoogleSignIn {
+  /** Google's consent page, to open in a browser */
+  url: string;
+  redirectUri: string;
+  scopes: string[];
+  done: Promise<GoogleTokens>;
+  cancel(): void;
 }
 
 export interface CredentialsProvider {
@@ -665,8 +690,15 @@ export class Mailcore {
   readonly google: {
     accessToken(account: string, opts?: { force?: boolean }): Promise<string>;
     /** Interactive OAuth sign-in on a loopback port; stores the tokens through credentials.google. */
-    login(account: string, opts?: { openUrl?: (url: string) => void; log?: (message: string) => void; timeoutMs?: number }): Promise<GoogleTokens>;
+    login(account: string, opts?: GoogleSignInOptions & { openUrl?: (url: string) => void; log?: (message: string) => void }): Promise<GoogleTokens>;
+    /**
+     * The same sign-in, started: returns at once with the consent URL to open. `done` settles when it ends
+     * (the stored tokens, or an error whose code is SIGN_IN_TIMEOUT, SIGN_IN_CANCELLED, SIGN_IN_REFUSED or SIGN_IN_FAILED).
+     */
+    beginLogin(account: string, opts?: GoogleSignInOptions): Promise<GoogleSignIn>;
     signedIn(account: string): Promise<boolean>;
+    /** What is known of the account's sign-in, without a secret (null: not signed in). */
+    tokens(account: string): Promise<{ scopes: string[]; signedInAt?: string; /** Google refused its renewal (invalid_grant) since */ refusedAt?: string } | null>;
     /** What a Google auth error of this account tells the user to do. */
     signInHint(account: string): string;
   };
@@ -786,7 +818,12 @@ export function htmlToText(html: string): string;
 /** A text part as text (one that is really HTML is read as HTML). */
 export function plainText(text: string): string;
 
+/** The calendar scopes: what a Google sign-in asks for by default. */
 export const GOOGLE_SCOPES: string[];
+/** Reading contacts (People API): contacts.readonly and contacts.other.readonly. */
+export const GOOGLE_CONTACTS_SCOPES: string[];
+/** The scopes stored tokens were granted (their `scope`), as a list; [] when unknown. */
+export function grantedScopes(tokens: GoogleTokens | null | undefined): string[];
 export function jsonFileStore<T = Record<string, unknown>>(file: string, fallback?: () => T): StateStore<T>;
 
 /** What an Authentication-Results too long to keep is kept as: a value that parses as nothing. */
