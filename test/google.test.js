@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { createMailcore, GOOGLE_SCOPES, GOOGLE_CONTACTS_SCOPES, grantedScopes } from '../src/index.js';
+import { createMailcore, GOOGLE_SCOPES, GOOGLE_CONTACTS_SCOPES, grantedScopes, googleAccountAddress } from '../src/index.js';
 
 const noCreds = (tokens) => ({ getPassword: async () => ({ password: 'x' }), google: { get: async (a) => tokens[a] ?? null, set: async (a, t) => { tokens[a] = t; } } });
 
@@ -14,6 +14,7 @@ function withFetch(answer) {
   globalThis.fetch = async (url, init = {}) => { asked.push({ url: String(url), body: init.body ? String(init.body) : '' }); return answer(String(url), init); };
   return { asked, restore: () => { globalThis.fetch = real; } };
 }
+const realFetch = globalThis.fetch;
 const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 
 test('the OAuth client is asked for each time one is needed, not once', async (t) => {
@@ -160,10 +161,10 @@ test('a sign-in left alone times out, and a cancelled one ends at once; both clo
   await assert.rejects(slow.done, (e) => e.code === 'SIGN_IN_TIMEOUT');
   await assert.rejects(visit(slow.redirectUri), /ECONNREFUSED|ECONNRESET/);
   const gone = await core.google.beginLogin('g');
-  gone.cancel();
+  assert.equal(gone.cancel(), true);
   await assert.rejects(gone.done, (e) => e.code === 'SIGN_IN_CANCELLED');
   await assert.rejects(visit(back(gone, { state: new URL(gone.url).searchParams.get('state'), code: 'c' })), /ECONNREFUSED|ECONNRESET/);
-  gone.cancel(); // twice: nothing more
+  assert.equal(gone.cancel(), false, 'twice: nothing more');
 });
 
 test('a renewal Google refuses is noted with the tokens (until the next sign-in); one that works clears it and keeps the scopes Google names', async (t) => {
@@ -184,4 +185,82 @@ test('a renewal Google refuses is noted with the tokens (until the next sign-in)
   assert.equal(tokens.g.refused_at, undefined);
   assert.deepEqual(grantedScopes(tokens.g), [...GOOGLE_SCOPES, ...GOOGLE_CONTACTS_SCOPES]);
   assert.equal(await core.google.tokens('none'), null);
+});
+
+test('accept: a string stores nothing and tells the tab why; an object is kept beside the tokens, never over them', async (t) => {
+  const tokens = { g: { refresh_token: 'old' } };
+  const core = signer(tokens);
+  withFetch(() => json(200, { access_token: 'at', refresh_token: 'new', expires_in: 3600, scope: GOOGLE_SCOPES.join(' ') }));
+  t.after(() => { globalThis.fetch = realFetch; });
+  const seen = [];
+  const no = await core.google.beginLogin('g', { appName: 'Mail Watcher', accept: async (tk) => { seen.push(tk.access_token); return 'You signed in to Google as b@x.example; this account is a@x.example. Sign in with a@x.example.'; } });
+  const page = await visit(back(no, { state: new URL(no.url).searchParams.get('state'), code: 'c' }));
+  assert.equal(page.status, 400);
+  assert.match(page.body, /You signed in to Google as b@x\.example; this account is a@x\.example\. Sign in with a@x\.example\. You can close this tab/);
+  await assert.rejects(no.done, (e) => e.code === 'SIGN_IN_REJECTED' && /as b@x\.example/.test(e.message));
+  assert.deepEqual(seen, ['at']);
+  assert.equal(tokens.g.refresh_token, 'old', 'nothing stored');
+
+  const yes = await core.google.beginLogin('g', { accept: async () => ({ email: 'a@x.example', refresh_token: 'forged' }) });
+  await visit(back(yes, { state: new URL(yes.url).searchParams.get('state'), code: 'c' }));
+  await yes.done;
+  assert.equal(tokens.g.refresh_token, 'new');
+  assert.equal(tokens.g.email, 'a@x.example');
+});
+test('cancel while the code is exchanged aborts it: nothing stored; once storing, cancel says no and the outcome lands', async (t) => {
+  const tokens = { g: { refresh_token: 'old' } };
+  let release;
+  const store = { get: async (a) => tokens[a] ?? null, set: async (a, v) => { await new Promise((r) => { release = r; }); tokens[a] = v; } };
+  const core = createMailcore({ accounts: { g: { provider: 'google' } }, credentials: { getPassword: async () => ({ password: 'x' }), google: store }, google: { clientId: 'cid' } });
+  let aborted = false;
+  globalThis.fetch = (url, init) => new Promise((resolve, reject) => {
+    init.signal.addEventListener('abort', () => { aborted = true; reject(init.signal.reason); });
+    setTimeout(() => resolve(json(200, { access_token: 'at', refresh_token: 'new', expires_in: 3600 })), 200);
+  });
+  t.after(() => { globalThis.fetch = realFetch; });
+  const flow = await core.google.beginLogin('g');
+  const visited = visit(back(flow, { state: new URL(flow.url).searchParams.get('state'), code: 'c' }));
+  await new Promise((r) => setTimeout(r, 30)); // the callback is in, the exchange under way
+  assert.equal(flow.cancel(), true);
+  await assert.rejects(flow.done, (e) => e.code === 'SIGN_IN_CANCELLED');
+  assert.ok(aborted, 'the token request was aborted');
+  assert.match((await visited).body, /cancelled/);
+  assert.equal(tokens.g.refresh_token, 'old');
+
+  globalThis.fetch = async () => json(200, { access_token: 'at', refresh_token: 'new', expires_in: 3600 });
+  const late = await core.google.beginLogin('g');
+  const v2 = visit(back(late, { state: new URL(late.url).searchParams.get('state'), code: 'c' }));
+  while (!release) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(late.cancel(), false, 'being stored: no longer stopped');
+  release();
+  assert.equal((await late.done).refresh_token, 'new');
+  assert.equal((await v2).status, 200);
+  assert.equal(late.cancel(), false);
+});
+
+test('a renewal never writes over a newer sign-in', async (t) => {
+  const tokens = { g: { refresh_token: 'r1', access_token: 'old', expires_at: 0 } };
+  const core = signer(tokens);
+  // the refresh answers after a new sign-in replaced the tokens
+  globalThis.fetch = async () => { tokens.g = { refresh_token: 'r2', access_token: 'newer', expires_at: Date.now() + 3600e3 }; return json(200, { access_token: 'from-r1', expires_in: 3600 }); };
+  t.after(() => { globalThis.fetch = realFetch; });
+  assert.equal(await core.google.accessToken('g'), 'from-r1');
+  assert.deepEqual([tokens.g.refresh_token, tokens.g.access_token], ['r2', 'newer']);
+  // refused, but a new sign-in came meanwhile: not marked refused, and the new one's token is used
+  tokens.g = { refresh_token: 'r1', access_token: 'old', expires_at: 0 };
+  globalThis.fetch = async () => { tokens.g = { refresh_token: 'r3', access_token: 'fresh3', expires_at: Date.now() + 3600e3 }; return json(400, { error: 'invalid_grant' }); };
+  assert.equal(await core.google.accessToken('g'), 'fresh3');
+  assert.equal(tokens.g.refused_at, undefined);
+});
+
+test('the Google address of a token: its primary calendar\'s id, or null', async (t) => {
+  const asked = [];
+  globalThis.fetch = async (url, init) => { asked.push([String(url), init.headers.authorization]); return json(200, { id: 'Me@Gmail.example', summary: 'Me' }); };
+  t.after(() => { globalThis.fetch = realFetch; });
+  assert.equal(await googleAccountAddress('tok'), 'Me@Gmail.example');
+  assert.deepEqual(asked, [['https://www.googleapis.com/calendar/v3/calendars/primary', 'Bearer tok']]);
+  globalThis.fetch = async () => json(403, { error: { message: 'insufficient' } });
+  assert.equal(await googleAccountAddress('tok'), null);
+  globalThis.fetch = async () => json(200, { id: 'not an address' });
+  assert.equal(await googleAccountAddress('tok'), null);
 });

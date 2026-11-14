@@ -100,6 +100,11 @@ export interface GoogleSignInOptions {
   timeoutMs?: number;
   /** what the page shown at the end tells to return to */
   appName?: string;
+  /**
+   * Called after the code was exchanged, before anything is stored: true stores the tokens; a string (why not)
+   * stores nothing and ends the sign-in (SIGN_IN_REJECTED); an object adds its fields beside the tokens.
+   */
+  accept?: (tokens: GoogleTokens, ctx: { signal: AbortSignal }) => Promise<true | string | Record<string, unknown>> | true | string | Record<string, unknown>;
 }
 
 export interface GoogleSignIn {
@@ -108,7 +113,8 @@ export interface GoogleSignIn {
   redirectUri: string;
   scopes: string[];
   done: Promise<GoogleTokens>;
-  cancel(): void;
+  /** Ends it: true when it did (nothing stored); false once the tokens are being stored, or it ended (done says how). */
+  cancel(): boolean;
 }
 
 export interface CredentialsProvider {
@@ -824,6 +830,8 @@ export const GOOGLE_SCOPES: string[];
 export const GOOGLE_CONTACTS_SCOPES: string[];
 /** The scopes stored tokens were granted (their `scope`), as a list; [] when unknown. */
 export function grantedScopes(tokens: GoogleTokens | null | undefined): string[];
+/** The address of the Google account an access token is for (its primary calendar's id); null when Google does not say. */
+export function googleAccountAddress(accessToken: string, opts?: { signal?: AbortSignal }): Promise<string | null>;
 export function jsonFileStore<T = Record<string, unknown>>(file: string, fallback?: () => T): StateStore<T>;
 
 /** What an Authentication-Results too long to keep is kept as: a value that parses as nothing. */

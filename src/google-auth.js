@@ -26,6 +26,7 @@ export const GOOGLE_CONTACTS_SCOPES = [
   'https://www.googleapis.com/auth/contacts.other.readonly'
 ];
 const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+const PRIMARY_URL = 'https://www.googleapis.com/calendar/v3/calendars/primary';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const SCOPE = /^https:\/\/www\.googleapis\.com\/auth\/[\w.-]+$|^(openid|email|profile)$/;
 
@@ -38,6 +39,23 @@ function signInError(message, code) {
   const e = new Error(message);
   e.code = code;
   return e;
+}
+
+/**
+ * The address of the Google account an access token is for: its primary
+ * calendar's id (calendars.get, which calendar.calendars.readonly allows).
+ * null when Google does not say (that scope not granted, an error).
+ */
+export async function googleAccountAddress(accessToken, { signal } = {}) {
+  try {
+    const res = await fetch(PRIMARY_URL, { headers: { authorization: `Bearer ${accessToken}` }, signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(20000) });
+    if (!res.ok) return null;
+    const id = (await res.json().catch(() => ({})))?.id;
+    return typeof id === 'string' && /^[^\s@<>"]{1,64}@[^\s@<>"]{1,253}$/.test(id) ? id : null;
+  } catch (e) {
+    if (signal?.aborted) throw e;
+    return null;
+  }
 }
 
 /** What a Google auth error tells the user to do, by default. */
@@ -112,8 +130,12 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
    * { url, redirectUri, scopes, done, cancel }: `url` is the consent page to
    * open; `done` settles once the sign-in ended — with the stored tokens, or an
    * error whose code says why (SIGN_IN_TIMEOUT, SIGN_IN_CANCELLED,
-   * SIGN_IN_REFUSED: Google or the person said no, SIGN_IN_FAILED: the code
-   * could not be exchanged). `cancel()` ends it.
+   * SIGN_IN_REFUSED: Google or the person said no, SIGN_IN_REJECTED: `accept`
+   * said no, SIGN_IN_FAILED: the code could not be exchanged). `cancel()` ends
+   * it and says whether it did: true while Google has not answered, or while
+   * the code is being exchanged and checked (that is aborted, nothing is
+   * stored); false once the tokens are being stored (or it ended already) —
+   * `done` then gives the real outcome.
    *
    * Only one request is answered as the sign-in: a GET of "/" with the Host
    * the redirect names and the state sent to Google. Anything else (another
@@ -123,9 +145,12 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
    *
    * opts: scopes (default GOOGLE_SCOPES), extraScopes, loginHint (the address
    * to sign in as, preselected), timeoutMs (default 10 minutes), appName (what
-   * the page shown at the end tells to go back to).
+   * the page shown at the end tells to go back to), accept(tokens, { signal })
+   * (called after the exchange, before anything is stored: true to store them,
+   * a string — why not — to store nothing, or an object of fields to keep with
+   * them, such as the Google address; `signal` aborts with a cancel).
    */
-  async function beginLogin(account, { scopes, extraScopes, loginHint, timeoutMs = 10 * 60e3, appName = 'the app' } = {}) {
+  async function beginLogin(account, { scopes, extraScopes, loginHint, timeoutMs = 10 * 60e3, appName = 'the app', accept } = {}) {
     const { clientId, clientSecret } = client();
     const store = tokenStore();
     const asked = scopesOf({ scopes, extraScopes });
@@ -142,8 +167,10 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
       .forEach(([k, v]) => url.searchParams.set(k, v));
 
     let settled = false;
+    let phase = 'waiting'; // → 'checking' (the code being exchanged and checked: abortable) → 'storing' → 'ended'
+    const abort = new AbortController();
     let finish;
-    const done = new Promise((resolve, reject) => { finish = (err, value) => (err ? reject(err) : resolve(value)); });
+    const done = new Promise((resolve, reject) => { finish = (err, value) => { phase = 'ended'; if (err) reject(err); else resolve(value); }; });
     done.catch(() => {}); // a caller that only polls is not an unhandled rejection
     const shut = () => { server.close(); server.closeAllConnections?.(); };
     const end = (err, value) => {
@@ -169,6 +196,7 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
       if (q.searchParams.get('state') !== state) return refuse(400, 'wrong state');
       // the one answer: whatever follows is refused
       settled = true;
+      phase = 'checking';
       clearTimeout(timer);
       const page = (ok, text) => res.writeHead(ok ? 200 : 400, { 'content-type': 'text/html; charset=utf-8', connection: 'close', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }).end(endPage(ok, text));
       const error = q.searchParams.get('error');
@@ -178,22 +206,39 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
         shut();
         return finish(signInError(`Google refused: ${error || 'no code was sent'}`, 'SIGN_IN_REFUSED'));
       }
+      const cancelled = () => signInError('sign-in cancelled', 'SIGN_IN_CANCELLED');
       try {
-        const t = await tokenRequest({ client_id: clientId, client_secret: clientSecret, code, code_verifier: verifier, grant_type: 'authorization_code', redirect_uri: redirect });
+        const t = await tokenRequest({ client_id: clientId, client_secret: clientSecret, code, code_verifier: verifier, grant_type: 'authorization_code', redirect_uri: redirect }, abort.signal);
+        if (abort.signal.aborted) throw cancelled();
         if (!t.refresh_token) throw signInError('Google did not return a refresh token — remove the app at myaccount.google.com/connections and sign in again', 'SIGN_IN_FAILED');
-        const stored = { refresh_token: t.refresh_token, access_token: t.access_token, expires_at: Date.now() + (t.expires_in || 3600) * 1000, ...(t.scope ? { scope: t.scope } : {}), signed_in_at: new Date().toISOString() };
+        let stored = { refresh_token: t.refresh_token, access_token: t.access_token, expires_at: Date.now() + (t.expires_in || 3600) * 1000, ...(t.scope ? { scope: t.scope } : {}), signed_in_at: new Date().toISOString() };
+        if (accept) {
+          const verdict = await accept({ ...stored }, { signal: abort.signal });
+          if (abort.signal.aborted) throw cancelled();
+          if (typeof verdict === 'string') throw signInError(verdict, 'SIGN_IN_REJECTED');
+          if (verdict !== true && !(verdict && typeof verdict === 'object')) throw signInError('the sign-in was not accepted', 'SIGN_IN_REJECTED');
+          if (typeof verdict === 'object') stored = { ...verdict, ...stored }; // kept beside the tokens, never over them
+        }
+        // from here it can no longer be cancelled: the outcome is what is stored
+        phase = 'storing';
         await store.set(account, stored);
         page(true, `Signed in to Google. ${back}`);
         shut();
         finish(null, stored);
       } catch (e) {
-        page(false, `The sign-in could not be completed. ${back}`);
+        const err = abort.signal.aborted ? cancelled() : e.code ? e : signInError(e.message, 'SIGN_IN_FAILED');
+        page(false, err.code === 'SIGN_IN_REJECTED' ? `${err.message} ${back}` : err.code === 'SIGN_IN_CANCELLED' ? `The sign-in was cancelled. ${back}` : `The sign-in could not be completed. ${back}`);
         shut();
-        finish(e.code ? e : signInError(e.message, 'SIGN_IN_FAILED'));
+        finish(err);
       }
     });
 
-    return { url: url.toString(), redirectUri: redirect, scopes: asked, done, cancel: () => end(signInError('sign-in cancelled', 'SIGN_IN_CANCELLED')) };
+    const cancel = () => {
+      if (phase === 'waiting') { end(signInError('sign-in cancelled', 'SIGN_IN_CANCELLED')); return true; }
+      if (phase === 'checking') { abort.abort(); return true; }
+      return false; // being stored, or ended: `done` says how
+    };
+    return { url: url.toString(), redirectUri: redirect, scopes: asked, done, cancel };
   }
 
   /**
@@ -219,13 +264,19 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
       fresh = await tokenRequest({ client_id: clientId, client_secret: clientSecret, refresh_token: t.refresh_token, grant_type: 'refresh_token' });
     } catch (err) {
       if (/invalid_grant/.test(err.message)) {
+        // a sign-in since replaced the tokens that were refused: those are the account's now
+        const now = await load(account);
+        if (now?.refresh_token && now.refresh_token !== t.refresh_token) return accessToken(account, { force: false });
         // noted once, with the tokens: what the account's status shows ("sign-in expired") until it signs in again
-        if (!t.refused_at) { try { await tokenStore().set(account, { ...t, refused_at: new Date().toISOString() }); } catch { /* the error below says it */ } }
+        if (now && !now.refused_at) { try { await tokenStore().set(account, { ...now, refused_at: new Date().toISOString() }); } catch { /* the error below says it */ } }
         throw authError(`Google no longer accepts the sign-in for "${account}" — ${hint(account)}`);
       }
       throw err;
     }
-    const { refused_at: _r, ...kept } = t;
+    // written over what is stored now, and only if it is still the sign-in renewed: never over a newer one
+    const now = await load(account);
+    if (now?.refresh_token !== t.refresh_token) return fresh.access_token;
+    const { refused_at: _r, ...kept } = now;
     await tokenStore().set(account, { ...kept, access_token: fresh.access_token, expires_at: Date.now() + (fresh.expires_in || 3600) * 1000, ...(fresh.scope ? { scope: fresh.scope } : {}) });
     return fresh.access_token;
   }
@@ -233,8 +284,8 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
   return { accessToken, login, beginLogin, signedIn, tokens, signInHint: hint };
 }
 
-async function tokenRequest(params) {
-  const res = await fetch(TOKEN_URL, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(params).toString(), signal: AbortSignal.timeout(20000) });
+async function tokenRequest(params, signal) {
+  const res = await fetch(TOKEN_URL, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(params).toString(), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(20000)]) : AbortSignal.timeout(20000) });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(`Google token endpoint answered ${res.status}: ${data.error || ''} ${data.error_description || ''}`.trim());
   return data;

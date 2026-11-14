@@ -86,6 +86,11 @@ helpers (`parseWhen`, `parseDuration`, `dayStart`), body helpers (`prepareBody`,
   (`GOOGLE_CONTACTS_SCOPES` for contacts), `loginHint`, `timeoutMs`, `appName` (named on the page the browser tab
   shows at the end). Its loopback server answers one request, a GET of `/` with Host `127.0.0.1:<port>` and the
   state sent; another path, Host or state is refused without ending it.
+  `accept(tokens, { signal })` is asked after the code exchange and before anything is stored (true, a reason to
+  refuse, or fields to keep beside the tokens — `googleAccountAddress(accessToken)` says which Google account
+  signed in). `cancel()` returns whether it ended the sign-in: during the exchange and `accept` it aborts them and
+  nothing is stored; once storing has begun it returns false and `done` gives the outcome. A renewal writes only
+  over the sign-in it renewed, never over a newer one.
 - `google` is the OAuth client, `{ clientId, clientSecret, signInHint? }`, or a function returning it (asked each
   time one is needed, so a changed setting is seen). `signInHint(account)` is what a Google auth error tells the
   user to do (default "sign in to Google again").
