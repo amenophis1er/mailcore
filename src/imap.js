@@ -679,6 +679,7 @@ function shaped(item, parsed, bodyType = 'Text') {
     to: addrs(parsed.to),
     cc: addrs(parsed.cc),
     bcc: addrs(parsed.bcc),
+    replyTo: addrs(parsed.replyTo), // where a reply goes, when not to the sender
     references: Array.isArray(parsed.references) ? parsed.references.join(' ') : parsed.references || '',
     isBulk: isBulkHeaders(parsed.headers),
     authHeaders: authHeadersOfParsed(parsed),

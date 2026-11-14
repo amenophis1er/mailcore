@@ -271,6 +271,7 @@ export class EwsClient {
             <t:FieldURI FieldURI="message:ToRecipients"/>
             <t:FieldURI FieldURI="message:CcRecipients"/>
             <t:FieldURI FieldURI="message:BccRecipients"/>
+            <t:FieldURI FieldURI="message:ReplyTo"/>
             <t:FieldURI FieldURI="message:IsRead"/>
             <t:FieldURI FieldURI="item:Flag"/>
             <t:FieldURI FieldURI="item:DateTimeReceived"/>
@@ -315,6 +316,7 @@ export class EwsClient {
       to: toArray(dig(msg, 'ToRecipients.Mailbox')).map(parseMailbox),
       cc: toArray(dig(msg, 'CcRecipients.Mailbox')).map(parseMailbox),
       bcc: toArray(dig(msg, 'BccRecipients.Mailbox')).map(parseMailbox), // only on a draft or a sent copy of one's own
+      replyTo: toArray(dig(msg, 'ReplyTo.Mailbox')).map(parseMailbox), // where a reply goes, when not to the sender
       references: textOf(msg.References),
       isBulk: isBulkHeaders(headers),
       attachments,

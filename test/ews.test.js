@@ -87,3 +87,24 @@ test('an Exchange sign-in that is sent elsewhere is not followed', async () => {
   const same = await new Promise((resolve) => httpntlm.post(options, (e) => resolve(e)));
   assert.notEqual(same?.code, 'EWS_REDIRECT');
 }, { timeout: 30_000 });
+
+test('getMessage asks for Reply-To and hands it out', async () => {
+  const c = stubbed(`<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+<m:GetItemResponse xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+<m:ResponseMessages><m:GetItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items>
+<t:Message>
+  <t:ItemId Id="AAMkAD1" ChangeKey="CQAAAB"/>
+  <t:Subject>Lunch</t:Subject>
+  <t:Body BodyType="Text">Friday?</t:Body>
+  <t:DateTimeReceived>2026-10-24T08:30:00Z</t:DateTimeReceived>
+  <t:From><t:Mailbox><t:Name>Ann</t:Name><t:EmailAddress>ann@x.org</t:EmailAddress></t:Mailbox></t:From>
+  <t:ToRecipients><t:Mailbox><t:Name>Me</t:Name><t:EmailAddress>me@x.org</t:EmailAddress></t:Mailbox></t:ToRecipients>
+  <t:ReplyTo><t:Mailbox><t:Name>Ann at home</t:Name><t:EmailAddress>ann@home.example</t:EmailAddress></t:Mailbox></t:ReplyTo>
+</t:Message>
+</m:Items></m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse></s:Body></s:Envelope>`);
+  const m = await c.getMessage('AAMkAD1');
+  assert.match(c.sent[0], /FieldURI="message:ReplyTo"/);
+  assert.deepEqual(m.replyTo.map((p) => p.email), ['ann@home.example']);
+  assert.equal(m.replyTo[0].name, 'Ann at home');
+});

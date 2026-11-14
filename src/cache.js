@@ -116,7 +116,7 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     `);
     // columns added after 1.0: thread identity, the bulk flag, the follow-up flag
     const cols = new Set(d.prepare('PRAGMA table_info(messages)').all().map((c) => c.name));
-    for (const [name, type] of [['conversation_id', 'TEXT'], ['message_id', 'TEXT'], ['in_reply_to', 'TEXT'], ['is_bulk', 'INTEGER'], ['is_flagged', 'INTEGER']]) {
+    for (const [name, type] of [['conversation_id', 'TEXT'], ['message_id', 'TEXT'], ['in_reply_to', 'TEXT'], ['is_bulk', 'INTEGER'], ['is_flagged', 'INTEGER'], ['reply_to_json', 'TEXT']]) {
       // a watcher and other readers can all open an older database in the same instant: the first one adds the column
       if (!cols.has(name)) try { d.exec(`ALTER TABLE messages ADD COLUMN ${name} ${type}`); } catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
     }
@@ -248,10 +248,10 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     // Only messages a watcher listed in the inbox have a row. A message read from
     // Sent, Drafts or anywhere else must not get one: every row is an inbox row.
     if (!exists) return;
-    d.prepare(`UPDATE messages SET to_json = ?, cc_json = ?, attachments_json = ?,
+    d.prepare(`UPDATE messages SET to_json = ?, cc_json = ?, reply_to_json = ?, attachments_json = ?,
         body_text = COALESCE(?, body_text), body_html = COALESCE(?, body_html), body_at = ?,
         is_bulk = ?, conversation_id = COALESCE(NULLIF(?, ''), conversation_id), message_id = COALESCE(NULLIF(?, ''), message_id), in_reply_to = COALESCE(NULLIF(?, ''), in_reply_to) WHERE id = ?`)
-      .run(JSON.stringify(msg.to || []), JSON.stringify(msg.cc || []), JSON.stringify(msg.attachments || []),
+      .run(JSON.stringify(msg.to || []), JSON.stringify(msg.cc || []), JSON.stringify(msg.replyTo || []), JSON.stringify(msg.attachments || []),
         text ?? null, html ?? null, Date.now(),
         msg.isBulk == null ? null : msg.isBulk ? 1 : 0, msg.conversationId || '', msg.messageId || '', msg.inReplyTo || '', msg.id);
   }
@@ -485,10 +485,13 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     if (bodyType === 'HTML' && r.body_html == null) return null;
     const wantHtml = bodyType === 'HTML' && r.body_html;
     if (bodyType !== 'HTML' && r.body_text == null) return null;
+    // stored before Reply-To was kept: read again (and stored with it) rather than say it has none
+    if (r.reply_to_json == null) return null;
     return {
       ...toItem(r),
       to: JSON.parse(r.to_json || '[]'),
       cc: JSON.parse(r.cc_json || '[]'),
+      replyTo: JSON.parse(r.reply_to_json),
       attachments: JSON.parse(r.attachments_json || '[]'),
       bodyType: wantHtml ? 'HTML' : 'Text',
       body: wantHtml ? r.body_html : r.body_text ?? '',

@@ -218,6 +218,10 @@ export interface AttachmentInfo { id: string; name: string; size: number; conten
 export interface Message extends ListItem {
   to: Mailbox[];
   cc: Mailbox[];
+  /** Only on a draft or a sent copy of one's own. */
+  bcc?: Mailbox[];
+  /** Where a reply goes when not to the sender (empty: to the sender). */
+  replyTo?: Mailbox[];
   attachments: AttachmentInfo[];
   bodyType: BodyType;
   body: string;

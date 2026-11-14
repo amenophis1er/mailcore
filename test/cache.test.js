@@ -113,3 +113,13 @@ test('snippets and people come from what is cached', (t) => {
   assert.deepEqual(people.map((p) => p.email), ['ann@example.com', 'bob@example.com']);
   assert.deepEqual(mc.people('bo').map((p) => p.email), ['bob@example.com']);
 });
+
+test('Reply-To is kept with the body, an empty one too', (t) => {
+  const { cache, mail } = cacheFor(t);
+  const m = mail();
+  cache.upsertBody('home', { ...m, to: [], cc: [], replyTo: [{ name: 'Ann at home', email: 'ann@home.example' }] }, { text: 'hi', html: '' });
+  assert.deepEqual(cache.getCached(m.id).replyTo, [{ name: 'Ann at home', email: 'ann@home.example' }]);
+  const none = mail();
+  cache.upsertBody('home', { ...none, to: [], cc: [] }, { text: 'hi', html: '' });
+  assert.deepEqual(cache.getCached(none.id).replyTo, []);
+});
