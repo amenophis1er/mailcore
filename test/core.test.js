@@ -233,3 +233,13 @@ test('moveItems: unprefixed ids go to the default account; moving nothing is an 
   await assert.rejects(mc.moveItems(['work:REFUSED'], 'archive'), /none of these messages could be moved/);
   assert.deepEqual(errors, []);
 });
+
+test('calendar: a Google calendar one may only read (holidays, subscriptions) is not offered for new events', async () => {
+  const mc = createMailcore({ accounts: { work: ACCOUNTS.work }, credentials: noCreds });
+  mc.withClient = async (id, fn) => fn({
+    findCalendars: async () => [{ id: 'work:H', name: 'Holidays', writable: false }, { id: 'work:F', name: 'Family', writable: true }],
+    findEvents: async () => []
+  });
+  const r = await mc.calendar.listAllEvents({ start: new Date(), end: new Date() });
+  assert.deepEqual(r.calendars.map((c) => [c.name, c.writable]), [['Calendar', true], ['Holidays', false], ['Family', true]]);
+});

@@ -113,7 +113,7 @@ export function calendarApi(core) {
       }
       const read = await Promise.all(list.map(async (k) => {
         const shared = !!(k.shared && k.mailbox);
-        const info = { key: `${n}|${k.isDefault ? 'default' : shared ? 'mailbox:' + String(k.mailbox).toLowerCase() : k.id}`, name: k.name || (shared ? k.mailbox : 'Calendar'), account: n, isDefault: !!k.isDefault, shared, writable: !k.readOnly };
+        const info = { key: `${n}|${k.isDefault ? 'default' : shared ? 'mailbox:' + String(k.mailbox).toLowerCase() : k.id}`, name: k.name || (shared ? k.mailbox : 'Calendar'), account: n, isDefault: !!k.isDefault, shared, writable: !k.readOnly && k.writable !== false };
         try {
           const events = await c.findEvents({ start, end, limit, ...(k.isDefault ? {} : shared ? { mailbox: k.mailbox } : { calendar: k.id }) });
           return { info, events: events.map((e) => ({ ...e, calendarKey: info.key, calendarName: info.name, shared })) };
