@@ -577,7 +577,7 @@ export interface MailCache {
   /** id → the start of the cached text body, as stored. */
   texts(ids: string[], length?: number): Map<string, string>;
   /** People of the cached mail (senders and fellow recipients; newsletters and robots out), most frequent first. */
-  people(q?: string, opts?: { accounts?: string[]; limit?: number }): Array<Person & { n: number }>;
+  people(q?: string, opts?: { accounts?: string[]; limit?: number }): Array<Person & { n: number; /** when they last wrote, or were written to (ISO) */ last?: string }>;
   lastSync(account: string): number | null;
   /** Drop rows older than each account's cache.days and rows of accounts no longer cached; returns rows removed. */
   prune(): number;
@@ -758,7 +758,7 @@ export class Mailcore {
   moveItems(ids: string[], folder: Folder, opts?: { onError?: OnAccountError }): Promise<Map<string, string | null>>;
   send(id: string, changeKey?: string | null): Promise<boolean>;
   /** People of the cached mail (see MailCache.people); [] without a cache. */
-  people(q?: string, opts?: { accounts?: string[]; limit?: number }): Array<Person & { n: number }>;
+  people(q?: string, opts?: { accounts?: string[]; limit?: number }): Array<Person & { n: number; /** when they last wrote, or were written to (ISO) */ last?: string }>;
   noteRead(id: string, isRead?: boolean): void;
   noteFlagged(id: string, isFlagged?: boolean): void;
   noteRemoved(id: string): void;

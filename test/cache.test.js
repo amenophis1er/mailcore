@@ -112,6 +112,8 @@ test('snippets and people come from what is cached', (t) => {
   const people = mc.people('');
   assert.deepEqual(people.map((p) => p.email), ['ann@example.com', 'bob@example.com']);
   assert.deepEqual(mc.people('bo').map((p) => p.email), ['bob@example.com']);
+  assert.equal(people[0].last, a.received, 'when they last wrote');
+  assert.equal(people[1].last, a.received, 'when they were last written to');
 });
 
 test('Reply-To is kept with the body, an empty one too', (t) => {

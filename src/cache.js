@@ -512,33 +512,33 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     if (!d) return [];
     const scope = accounts?.length ? `account IN (${accounts.map(() => '?').join(',')}) AND` : '';
     const args = accounts?.length ? accounts : [];
-    const found = new Map(); // email → { name, email, n }
-    const add = (name, email, n) => {
+    const found = new Map(); // email → { name, email, n, last }
+    const add = (name, email, n, last) => {
       email = String(email || '').trim();
       name = String(name || '').trim();
       const key = email.toLowerCase();
       if (!key.includes('@') || ROBOT.test(key)) return;
       if (!key.includes(needle) && !name.toLowerCase().includes(needle)) return;
       const cur = found.get(key);
-      if (cur) { cur.n += n; if (!cur.name && name && name.toLowerCase() !== key) cur.name = name; }
-      else found.set(key, { name: name.toLowerCase() === key ? '' : name, email, n });
+      if (cur) { cur.n += n; if (last && (!cur.last || last > cur.last)) cur.last = last; if (!cur.name && name && name.toLowerCase() !== key) cur.name = name; }
+      else found.set(key, { name: name.toLowerCase() === key ? '' : name, email, n, ...(last ? { last } : {}) });
     };
     const p = like(needle);
-    for (const r of d.prepare(`SELECT from_name AS name, from_email AS email, SUM(COALESCE(is_bulk, 0) = 0) AS n FROM messages
+    for (const r of d.prepare(`SELECT from_name AS name, from_email AS email, SUM(COALESCE(is_bulk, 0) = 0) AS n, MAX(received) AS last FROM messages
         WHERE ${scope} (from_email LIKE ? ESCAPE '\\' OR from_name LIKE ? ESCAPE '\\')
         GROUP BY lower(from_email)
         -- a sender whose mail is mostly bulk, or mostly says how to unsubscribe, is a newsletter, not someone I write with
         -- (a strict majority: one forwarded newsletter beside one mail of their own does not make someone a newsletter)
         HAVING SUM(CASE WHEN is_bulk = 1 OR body_text LIKE '%unsubscribe%' OR body_text LIKE '%opt out%' OR body_text LIKE '%sabonner%' OR body_text LIKE '%manage your preferences%' THEN 1 ELSE 0 END) * 2 <= COUNT(*)
           AND n > 0
-        ORDER BY n DESC LIMIT 200`).all(...args, p, p)) add(r.name, r.email, r.n * 2); // someone who writes to me counts double
-    for (const r of d.prepare(`SELECT to_json, cc_json FROM messages
+        ORDER BY n DESC LIMIT 200`).all(...args, p, p)) add(r.name, r.email, r.n * 2, r.last); // someone who writes to me counts double
+    for (const r of d.prepare(`SELECT to_json, cc_json, received FROM messages
         WHERE ${scope} (to_json LIKE ? ESCAPE '\\' OR cc_json LIKE ? ESCAPE '\\') AND COALESCE(is_bulk, 0) = 0
         ORDER BY received DESC LIMIT 400`).all(...args, p, p)) {
       for (const json of [r.to_json, r.cc_json]) {
         let list = [];
         try { list = JSON.parse(json || '[]'); } catch { /* an odd row: skip it */ }
-        for (const who of list) add(who?.name, who?.email, 1);
+        for (const who of list) add(who?.name, who?.email, 1, r.received);
       }
     }
     return [...found.values()].sort((a, b) => b.n - a.n).slice(0, limit);
