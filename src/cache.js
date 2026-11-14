@@ -475,7 +475,7 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
   }
 
   /** Full cached message or null (null also when the body was never stored). */
-  function getCached(id, { bodyType = 'Text' } = {}) {
+  function getCached(id, { bodyType = 'Text', stale = false } = {}) {
     const d = openCache();
     if (!d) return null;
     const r = d.prepare('SELECT * FROM messages WHERE id = ?').get(id);
@@ -485,13 +485,14 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     if (bodyType === 'HTML' && r.body_html == null) return null;
     const wantHtml = bodyType === 'HTML' && r.body_html;
     if (bodyType !== 'HTML' && r.body_text == null) return null;
-    // stored before Reply-To was kept: read again (and stored with it) rather than say it has none
-    if (r.reply_to_json == null) return null;
+    // stored before Reply-To was kept: read again (and stored with it) rather than say it has none; `stale` takes
+    // it as it is (the server cannot be reached), saying nothing of Reply-To
+    if (r.reply_to_json == null && !stale) return null;
     return {
       ...toItem(r),
       to: JSON.parse(r.to_json || '[]'),
       cc: JSON.parse(r.cc_json || '[]'),
-      replyTo: JSON.parse(r.reply_to_json),
+      ...(r.reply_to_json != null ? { replyTo: JSON.parse(r.reply_to_json) } : {}),
       attachments: JSON.parse(r.attachments_json || '[]'),
       bodyType: wantHtml ? 'HTML' : 'Text',
       body: wantHtml ? r.body_html : r.body_text ?? '',

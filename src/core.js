@@ -217,7 +217,16 @@ export class Mailcore {
         if (hit) return hit;
       } catch {}
     }
-    const msg = await this.withClient(id, (c) => c.getMessage(id, opts));
+    let msg;
+    try {
+      msg = await this.withClient(id, (c) => c.getMessage(id, opts));
+    } catch (e) {
+      // the server out of reach: a copy stored before Reply-To was kept is still the mail
+      let old = null;
+      if (!opts.live && cached()) try { old = this.cache.getCached(id, { ...opts, stale: true }); } catch {}
+      if (old) return old;
+      throw e;
+    }
     if (cached()) {
       try {
         // asked for HTML and given text: this mail has no HTML ('' says so). Asked for text: whether it has any is not known (null)

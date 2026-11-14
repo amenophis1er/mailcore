@@ -122,4 +122,5 @@ test('Reply-To is kept with the body, an empty one too', (t) => {
   const none = mail();
   cache.upsertBody('home', { ...none, to: [], cc: [] }, { text: 'hi', html: '' });
   assert.deepEqual(cache.getCached(none.id).replyTo, []);
+  assert.equal(cache.getCached(none.id, { stale: true }).body, 'hi');
 });

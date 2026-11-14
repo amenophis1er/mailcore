@@ -548,7 +548,8 @@ export interface MailCache {
   cacheUsable(accounts: string[], opts?: FindOptions): boolean;
   /** fromMe here is the address itself (the caller resolves it). */
   findCached(accounts: string[], opts?: Omit<FindOptions, 'fromMe'> & { fromMe?: string }): ListItem[];
-  getCached(id: string, opts?: { bodyType?: BodyType }): Message | null;
+  /** `stale`: a copy stored before Reply-To was kept is taken too (the server out of reach). */
+  getCached(id: string, opts?: { bodyType?: BodyType; stale?: boolean }): Message | null;
   cachedSince(account: string, sinceIso: string, opts?: { limit?: number }): Array<ListItem & { to: Mailbox[] | null; cc: Mailbox[] | null; isBulk: boolean | null; bodyText: string | null; hasBody: boolean }>;
   /** Returns the ids not seen before; `report.changed`: rows already held whose read or flag state changed. */
   upsertItems(account: string, items: Partial<ListItem>[], report?: { changed?: number } | null): string[];
