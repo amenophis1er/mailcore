@@ -707,6 +707,8 @@ export class Mailcore {
     tokens(account: string): Promise<{ scopes: string[]; signedInAt?: string; /** Google refused its renewal (invalid_grant) since */ refusedAt?: string } | null>;
     /** What a Google auth error of this account tells the user to do. */
     signInHint(account: string): string;
+    /** The account's Google contacts (People API: its own, and its "other contacts"), over its tokens. See googleContacts. */
+    contacts(account: string, opts?: Omit<GoogleContactsOptions, 'accessToken'> & { accessToken?: GoogleContactsOptions['accessToken'] }): Promise<GoogleContactsResult>;
   };
 
   accountNames(): string[];
@@ -832,6 +834,55 @@ export const GOOGLE_CONTACTS_SCOPES: string[];
 export function grantedScopes(tokens: GoogleTokens | null | undefined): string[];
 /** The address of the Google account an access token is for (its primary calendar's id); null when Google does not say. */
 export function googleAccountAddress(accessToken: string, opts?: { signal?: AbortSignal }): Promise<string | null>;
+
+/** A contact of a Google account with at least one email address. */
+export interface GoogleContact {
+  /** '' when Google has none (or only the address) */
+  name: string;
+  /** the primary address */
+  email: string;
+  /** every address, the primary first */
+  emails: string[];
+  /** 'saved': one of the account's own contacts; 'other': an "other contact" (someone it wrote with) */
+  kind: 'saved' | 'other';
+  /** the https address of a picture someone chose (never Google's placeholder) */
+  photo?: string;
+  company?: string;
+  title?: string;
+}
+export type GoogleContactsErrorCode = 'GOOGLE_SCOPE' | 'GOOGLE_API_DISABLED' | 'GOOGLE_RATE' | 'GOOGLE_API';
+export interface GoogleContactsResult {
+  /** the account's own contacts; null when they could not be read (see errors) */
+  saved: GoogleContact[] | null;
+  /** its "other contacts"; null when they could not be read (see errors) */
+  other: GoogleContact[] | null;
+  errors: { list: 'saved' | 'other'; code: GoogleContactsErrorCode | string; status?: number; message: string }[];
+}
+export interface GoogleContactsOptions {
+  /** a valid access token for the account (force: renew it) — Mailcore's google.accessToken */
+  accessToken: (account: string, opts: { force: boolean }) => Promise<string>;
+  /** what an auth error tells the user to do */
+  signInHint?: (account: string) => string;
+  /** which lists to read (default both) */
+  lists?: ('saved' | 'other')[];
+  /** per request, at most 1000 (the default) */
+  pageSize?: number;
+  /** pages read at most per list (default 25) */
+  maxPages?: number;
+  signal?: AbortSignal;
+  /** a stand-in for fetch (tests) */
+  fetch?: typeof fetch;
+}
+/**
+ * The contacts of a Google account over the People API (people/me/connections and otherContacts), paged. A list
+ * Google refuses is null with its error in `errors` (code GOOGLE_SCOPE: contacts not allowed by the sign-in;
+ * GOOGLE_API_DISABLED: the People API is off in the OAuth client's project; GOOGLE_RATE; GOOGLE_API). Throws on an
+ * auth failure (code MAIL_AUTH, after one forced renewal) and when every list asked for failed (the first error,
+ * with `errors`). Nothing is kept.
+ */
+export function googleContacts(account: string, opts: GoogleContactsOptions): Promise<GoogleContactsResult>;
+/** One person of the People API as a GoogleContact (null without an email address). */
+export function googleContactOf(person: unknown, kind: 'saved' | 'other'): GoogleContact | null;
 export function jsonFileStore<T = Record<string, unknown>>(file: string, fallback?: () => T): StateStore<T>;
 
 /** What an Authentication-Results too long to keep is kept as: a value that parses as nothing. */

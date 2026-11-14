@@ -69,6 +69,7 @@ Ids are `"<account>:<id>"` everywhere, so any id routes back to its account.
 | `stream(name, hooks)` | the raw push stream of one account |
 | `cache.*` | `cachedAccounts cacheUsable findCached getCached cacheStats prune clearCache`, and for a watcher of its own `upsertItems dropUnlisted reconcile noteSent applyChanges getMeta setMeta idsOf threadCounts snippets texts people …` |
 | `google.login(account, { openUrl })`, `google.beginLogin(account)`, `google.signedIn(account)`, `google.tokens(account)` | Google sign-in (PKCE, loopback): blocking, or started and settled later (`{ url, done, cancel }`); what was granted |
+| `google.contacts(account, { lists })` | a Google account's contacts (People API, read only, paged): `{ saved, other, errors }`, nothing kept |
 
 Also exported: `EventLog` (a cursor-backed, bounded, optionally persisted event queue with long-poll `wait()` and
 an async iterator `events()`), rule matching (`ruleMatches`, `matchRule`, `accountOk`, `inQuietHours`), date
@@ -91,6 +92,12 @@ helpers (`parseWhen`, `parseDuration`, `dayStart`), body helpers (`prepareBody`,
   signed in). `cancel()` returns whether it ended the sign-in: during the exchange and `accept` it aborts them and
   nothing is stored; once storing has begun it returns false and `done` gives the outcome. A renewal writes only
   over the sign-in it renewed, never over a newer one.
+- `google.contacts(account)` (also `googleContacts(account, { accessToken })`) reads the People API with the
+  `GOOGLE_CONTACTS_SCOPES`: `saved` (people/me/connections) and `other` (otherContacts), each a list of
+  `{ name, email, emails, kind, photo?, company?, title? }` (only contacts with an address; `photo` only when it is
+  not Google's placeholder), or null when Google refused that list, its reason in `errors` (`GOOGLE_SCOPE`,
+  `GOOGLE_API_DISABLED`, `GOOGLE_RATE`, `GOOGLE_API`). A 401 is retried once with a renewed token, then throws
+  `MAIL_AUTH`; every list failing throws. Nothing is kept: where contacts go is the caller's choice.
 - `google` is the OAuth client, `{ clientId, clientSecret, signInHint? }`, or a function returning it (asked each
   time one is needed, so a changed setting is seen). `signInHint(account)` is what a Google auth error tells the
   user to do (default "sign in to Google again").

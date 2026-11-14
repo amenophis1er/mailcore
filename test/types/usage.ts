@@ -1,6 +1,6 @@
 // Compiled (not run) by `npm run typecheck`: the public API as a strict
 // NodeNext TypeScript consumer sees it.
-import { createMailcore, EventLog, matchRule, parseWhen, type Mailcore, type ListItem, type CredentialsProvider } from 'mailcore';
+import { createMailcore, EventLog, matchRule, parseWhen, googleContacts, googleContactOf, type Mailcore, type ListItem, type CredentialsProvider, type GoogleContact, type GoogleContactsResult } from 'mailcore';
 
 const credentials: CredentialsProvider = {
   async getPassword(account, { refresh }) {
@@ -58,6 +58,10 @@ async function main(): Promise<void> {
   await mc.watch({ authGate: () => gate });
   await mc.stream('work', { onNewMail: (how) => console.log(how), onDraftsChange: () => {}, authGate: gate });
   console.log(moved.size, them.threads[0]?.to, all.calendars[0]?.writable, counts.size, people[0]?.n, changes?.reset);
+  const g: GoogleContactsResult = await mc.google.contacts('g', { lists: ['saved'] });
+  const first: GoogleContact | undefined = g.saved?.[0];
+  const direct = await googleContacts('g', { accessToken: mc.google.accessToken, maxPages: 2 });
+  console.log(first?.photo, first?.kind === 'saved', direct.errors[0]?.code, googleContactOf({}, 'other'));
 }
 void main;
 
