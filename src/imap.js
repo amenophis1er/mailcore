@@ -168,7 +168,9 @@ export class ImapClient {
       if (opts.toContains) query.or = [{ to: opts.toContains }, { cc: opts.toContains }];
       const texts = Array.isArray(opts.text) ? opts.text : opts.text ? [opts.text] : [];
       if (texts.length === 1) query.text = texts[0];
-      else if (texts.length > 1) query.and = texts.map((t) => ({ text: t }));
+      // every term: IMAP's criteria are ANDed but a key holds one value, and imapflow has no AND to nest,
+      // so NOT (NOT a OR NOT b …), which is a AND b …
+      else if (texts.length > 1) query.not = { or: texts.map((t) => ({ not: { text: t } })) };
 
       let range;
       let byUid = true;

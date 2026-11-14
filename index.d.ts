@@ -506,7 +506,7 @@ export class AccountClient {
   /** The mailbox's own contacts (Exchange); [] elsewhere. */
   contacts(opts?: { limit?: number }): Promise<Contact[]>;
   updateDraft(opts: UpdateDraftOptions): Promise<DraftResult>;
-  addAttachment(id: string, changeKey: string | null | undefined, attachment: NewAttachment): Promise<{ attachmentId: string | null; changeKey: string | null }>;
+  addAttachment(id: string, changeKey: string | null | undefined, attachment: NewAttachment): Promise<{ attachmentId: string | null; changeKey: string | null; /** IMAP: the draft, written again under a new id */ draftId?: string }>;
   sendItem(id: string, changeKey?: string | null): Promise<boolean>;
   deleteItem(id: string, changeKey?: string | null): Promise<boolean>;
   /** Map old id → new id, or → null for a message no longer there; ids missing were not moved. */
@@ -746,7 +746,7 @@ export class Mailcore {
   forward(id: string, body: string, opts?: { to?: string[]; cc?: string[]; bcc?: string[]; changeKey?: string; bodyType?: BodyType }): Promise<DraftResult>;
   compose(opts: ComposeOptions): Promise<SendResult>;
   updateDraft(opts: UpdateDraftOptions): Promise<DraftResult>;
-  addAttachment(id: string, changeKey: string | null | undefined, attachment: NewAttachment): Promise<{ attachmentId: string | null; changeKey: string | null }>;
+  addAttachment(id: string, changeKey: string | null | undefined, attachment: NewAttachment): Promise<{ attachmentId: string | null; changeKey: string | null; /** IMAP: the draft, written again under a new id */ draftId?: string }>;
   removeAttachment(id: string, changeKey: string | null | undefined, attachmentId: string): Promise<{ changeKey: string | null }>;
   deleteItem(id: string, changeKey?: string | null): Promise<boolean>;
   markRead(id: string, isRead?: boolean, changeKey?: string | null): Promise<boolean>;

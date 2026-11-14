@@ -187,10 +187,11 @@ export class Mailcore {
       else if (!quiet) throw e;
       return [];
     });
-    const newest = (lists) => {
+    const limit = opts.limit;
+    const newest = (lists, cap = limit) => {
       const seen = new Set();
       const items = lists.flat().filter((i) => !seen.has(i.id) && seen.add(i.id)).sort((a, b) => new Date(b.received) - new Date(a.received));
-      return opts && opts.limit ? items.slice(0, opts.limit) : items;
+      return cap ? items.slice(0, cap) : items;
     };
     if (this.cache.cacheUsable(names, opts)) {
       try {
@@ -200,15 +201,13 @@ export class Mailcore {
           hits = this.cache.findCached(names, { ...opts, fromMe: me });
         } else if (!opts.fromMe) hits = this.cache.findCached(names, opts);
         if (hits) {
-          // a search: the cache holds the last weeks only. Short of a full page, the servers are asked for what is older.
-          if (!opts.text?.length || hits.length >= (opts.limit || 25)) return hits;
-          const older = await Promise.all(names.map((n) => {
-            const start = this.cache.windowStart(n);
-            if (opts.sinceIso && new Date(opts.sinceIso) >= start) return [];
-            const until = opts.untilIso && new Date(opts.untilIso) < start ? opts.untilIso : start.toISOString();
-            return ask(n, { ...opts, untilIso: until, offset: undefined }, true);
-          }));
-          return newest([hits, ...older]);
+          // A search the cache cannot fill a page of: it holds some weeks only, and not every mail of them (headers
+          // first, not each body). The servers are asked too, over the same span, and what both found is merged.
+          // (A page by offset stays the cache's: two sources do not share one.)
+          const page = opts.limit || 25;
+          if (!opts.text?.length || opts.offset || hits.length >= page) return hits;
+          const live = await Promise.all(names.map((n) => ask(n, opts, true)));
+          return newest([hits, ...live], page);
         }
       } catch (e) {
         if (onError) onError('cache', e);

@@ -319,12 +319,6 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     if (d) d.prepare('DELETE FROM messages WHERE id = ?').run(id);
   }
 
-  /** Where an account's cached inbox begins (it holds the last cache.days days). */
-  function windowStart(account) {
-    const days = Number(accounts()[account]?.cache?.days || 30);
-    return new Date(Date.now() - days * 86400e3);
-  }
-
   /** Drop rows older than each account's cache.days, and rows of accounts no longer cached. */
   function prune(config = { accounts: accounts() }) {
     const d = openCache();
@@ -576,7 +570,7 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     cachedAccounts, cacheKeyExists, openCache, closeCache,
     upsertItems, dropUnlisted, reconcile, noteSent, upsertBody, setBulk, setRead, setFlagged, removeMessage,
     getMeta, setMeta, idsOf, applyChanges, prune, clearCache,
-    cacheUsable, lastSync, windowStart, findCached, cachedSince, threadCounts, snippets, texts, getCached, people, cacheStats
+    cacheUsable, lastSync, findCached, cachedSince, threadCounts, snippets, texts, getCached, people, cacheStats
   };
 }
 
