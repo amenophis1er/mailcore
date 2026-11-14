@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { MAIL_PROVIDERS } from './accounts.js';
-import { plainText } from './text.js';
+import { previewText } from './text.js';
 
 /**
  * createCache({ dir, key, accounts, state, pollSeconds, fresh })
@@ -458,8 +458,7 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     const out = new Map();
     // more than the line needs: a text part that is really a page of HTML starts with its head and styles
     for (const [id, text] of texts(ids, 8000)) {
-      // text bodies of HTML mail carry link and image targets in brackets: not worth a preview line
-      const t = plainText(text).replace(/\[(cid:|https?:\/\/|mailto:)[^\]]*\]|<https?:\/\/[^>\s]*>/gi, ' ').replace(/\s+/g, ' ').trim().slice(0, length);
+      const t = previewText(text, length);
       if (t) out.set(id, t);
     }
     return out;

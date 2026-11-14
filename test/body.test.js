@@ -33,3 +33,14 @@ test('htmlToText drops tags and decodes entities once', () => {
   assert.equal(htmlToText('<head><title>t</title></head><p>Hello &amp; welcome</p><br><div>x</div>'), 'Hello & welcome\n\nx');
   assert.equal(htmlToText('<style>p{}</style>a&amp;lt;b'), 'a&lt;b');
 });
+
+test('previewText reads entities written in a text part and drops invisible preheader padding', async () => {
+  const { previewText } = await import('../src/text.js');
+  const uber = 'Plus, get $0 Delivery Fee on eligible orders. &#847; &#8204; &#847; &#8204; &#847;&zwnj; Order now [https://click.example/x]';
+  assert.equal(previewText(uber), 'Plus, get $0 Delivery Fee on eligible orders. Order now');
+  assert.equal(previewText('<p>Caf&eacute; &amp; more&#x200B;</p>\n<p>͏­ ok</p>'), 'Caf&eacute; & more ok');
+  assert.equal(previewText('Tom &amp; Jerry'), 'Tom & Jerry');
+  assert.equal(previewText('<p>Use &amp;lt;b&amp;gt; for bold</p>'), 'Use &lt;b&gt; for bold', 'decoded once');
+  assert.equal(previewText('Engineer \u{1F469}\u200d\u{1F4BB} available, \u0645\u06cc\u200c\u0631\u0648\u0645'), 'Engineer \u{1F469}\u200d\u{1F4BB} available, \u0645\u06cc\u200c\u0631\u0648\u0645', 'joiners inside words stay');
+  assert.equal(previewText('x'.repeat(300)).length, 180);
+});
