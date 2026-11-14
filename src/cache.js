@@ -319,6 +319,12 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     if (d) d.prepare('DELETE FROM messages WHERE id = ?').run(id);
   }
 
+  /** Where an account's cached inbox begins (it holds the last cache.days days). */
+  function windowStart(account) {
+    const days = Number(accounts()[account]?.cache?.days || 30);
+    return new Date(Date.now() - days * 86400e3);
+  }
+
   /** Drop rows older than each account's cache.days, and rows of accounts no longer cached. */
   function prune(config = { accounts: accounts() }) {
     const d = openCache();
@@ -396,7 +402,8 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     if (texts.length) {
       join = 'JOIN messages_fts f ON f.rowid = m.rowid';
       where.push('messages_fts MATCH ?');
-      params.push(texts.map((t) => '"' + String(t).replace(/"/g, '""') + '"').join(' AND '));
+      // each term a word start: "kete" finds KETEKRE, and an address's parts are words ("landry.ketekre@…")
+      params.push(texts.map((t) => '"' + String(t).replace(/"/g, '""') + '"*').join(' AND '));
     }
     params.push(Math.min(opts.limit || 25, 100), Math.max(0, Number(opts.offset) || 0));
     const rows = d.prepare(`SELECT m.* FROM messages m ${join} WHERE ${where.join(' AND ')} ORDER BY m.received DESC LIMIT ? OFFSET ?`).all(...params);
@@ -569,7 +576,7 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     cachedAccounts, cacheKeyExists, openCache, closeCache,
     upsertItems, dropUnlisted, reconcile, noteSent, upsertBody, setBulk, setRead, setFlagged, removeMessage,
     getMeta, setMeta, idsOf, applyChanges, prune, clearCache,
-    cacheUsable, lastSync, findCached, cachedSince, threadCounts, snippets, texts, getCached, people, cacheStats
+    cacheUsable, lastSync, windowStart, findCached, cachedSince, threadCounts, snippets, texts, getCached, people, cacheStats
   };
 }
 

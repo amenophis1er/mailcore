@@ -117,6 +117,10 @@ test('the encrypted cache serves listings and bodies while a watcher is alive', 
   assert.deepEqual(unread.map((i) => i.id), ['work:A']);
   assert.ok(unread[0].cached);
   assert.deepEqual((await mc.find('work', { text: 'pay' })).map((i) => i.id), ['work:A']);
+  assert.deepEqual((await mc.find('work', { text: 'pa' })).map((i) => i.id), ['work:A'], 'a word start');
+  assert.deepEqual((await mc.find('work', { text: 'ann invo' })).map((i) => i.id), ['work:A'], 'each word, anywhere');
+  assert.deepEqual((await mc.find('work', { text: 'ann lunch' })).map((i) => i.id), [], 'every word');
+  assert.deepEqual((await mc.find('work', { text: '"pay the"' })).map((i) => i.id), ['work:A'], 'a quoted phrase');
   const msg = await mc.read('work:A');
   assert.equal(msg.body, 'Please pay the invoice');
   assert.equal((await mc.read('work:A', { bodyType: 'HTML' })).body, '<p>Please pay</p>');
@@ -242,4 +246,11 @@ test('calendar: a Google calendar one may only read (holidays, subscriptions) is
   });
   const r = await mc.calendar.listAllEvents({ start: new Date(), end: new Date() });
   assert.deepEqual(r.calendars.map((c) => [c.name, c.writable]), [['Calendar', true], ['Holidays', false], ['Family', true]]);
+});
+
+test('searchTerms: the words of a search box, a quoted phrase as one', async () => {
+  const { searchTerms } = await import('../src/core.js');
+  assert.deepEqual(searchTerms('landry  kete'), ['landry', 'kete']);
+  assert.deepEqual(searchTerms('"due date" invoice'), ['due date', 'invoice']);
+  assert.equal(searchTerms('   '), undefined);
 });

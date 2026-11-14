@@ -12,7 +12,7 @@
 //   createMessage({ to, cc, subject, body, bodyType, send }) → { sent, draftId, changeKey }
 //   updateDraft({ id, changeKey, subject, body, bodyType, to, cc, keepQuoted }) → { draftId, changeKey }
 //     keepQuoted: only the text above the quoted thread is replaced (reply/forward drafts)
-//   addAttachment(id, changeKey, { name, contentBase64, contentType, inline, contentId }) → { attachmentId, changeKey }
+//   addAttachment(id, changeKey, { name, contentBase64, contentType, inline, contentId }) → { attachmentId, changeKey, draftId? (IMAP: the draft's new id) }
 //   bodyType is 'Text' (default) or 'HTML' — see body.js (prepareBody) for Markdown.
 //   sendItem(id, changeKey)             → true
 //   deleteItem(id, changeKey)           → true   (move to trash)

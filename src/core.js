@@ -178,29 +178,43 @@ export class Mailcore {
    * servers. Cached items carry `cached: true`.
    */
   async find(account, opts = {}, onError) {
+    // words typed in a search box: each must be there, anywhere (a "quoted phrase" stays one)
+    if (typeof opts.text === 'string') opts = { ...opts, text: searchTerms(opts.text) };
     const names = this.selectAccounts(account);
+    // `quiet`: what the cache found stands even when a server cannot be asked
+    const ask = (n, o, quiet = false) => this.withClient(n, (c) => c.findInbox(o)).catch((e) => {
+      if (onError) onError(n, e);
+      else if (!quiet) throw e;
+      return [];
+    });
+    const newest = (lists) => {
+      const seen = new Set();
+      const items = lists.flat().filter((i) => !seen.has(i.id) && seen.add(i.id)).sort((a, b) => new Date(b.received) - new Date(a.received));
+      return opts && opts.limit ? items.slice(0, opts.limit) : items;
+    };
     if (this.cache.cacheUsable(names, opts)) {
       try {
+        let hits = null;
         if (opts.fromMe && names.length === 1) {
           const me = await this.withClient(names[0], (c) => c.selfEmail());
-          return this.cache.findCached(names, { ...opts, fromMe: me });
+          hits = this.cache.findCached(names, { ...opts, fromMe: me });
+        } else if (!opts.fromMe) hits = this.cache.findCached(names, opts);
+        if (hits) {
+          // a search: the cache holds the last weeks only. Short of a full page, the servers are asked for what is older.
+          if (!opts.text?.length || hits.length >= (opts.limit || 25)) return hits;
+          const older = await Promise.all(names.map((n) => {
+            const start = this.cache.windowStart(n);
+            if (opts.sinceIso && new Date(opts.sinceIso) >= start) return [];
+            const until = opts.untilIso && new Date(opts.untilIso) < start ? opts.untilIso : start.toISOString();
+            return ask(n, { ...opts, untilIso: until, offset: undefined }, true);
+          }));
+          return newest([hits, ...older]);
         }
-        if (!opts.fromMe) return this.cache.findCached(names, opts);
       } catch (e) {
         if (onError) onError('cache', e);
       }
     }
-    const lists = await Promise.all(
-      names.map((n) =>
-        this.withClient(n, (c) => c.findInbox(opts)).catch((e) => {
-          if (onError) onError(n, e);
-          else throw e;
-          return [];
-        })
-      )
-    );
-    const items = lists.flat().sort((a, b) => new Date(b.received) - new Date(a.received));
-    return opts && opts.limit ? items.slice(0, opts.limit) : items;
+    return newest(await Promise.all(names.map((n) => ask(n, opts))));
   }
 
   /**
@@ -367,6 +381,16 @@ export class Mailcore {
  * "DOMAIN\user" carries its own domain: split it, or NTLM gets the domain twice
  * (user "DOMAIN\user" in domain "DOMAIN") and Exchange answers 401.
  */
+/** The terms of a search: its words, a "quoted phrase" as one; none when there is nothing but spaces. */
+export function searchTerms(text) {
+  const terms = [];
+  for (const m of String(text || '').matchAll(/"([^"]*)"|(\S+)/g)) {
+    const t = (m[1] ?? m[2]).trim();
+    if (t) terms.push(t);
+  }
+  return terms.length ? terms : undefined;
+}
+
 function splitDomain(creds) {
   const u = String(creds.username || '');
   if (u.includes('\\')) [creds.domain, creds.username] = u.split('\\');

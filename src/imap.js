@@ -407,7 +407,8 @@ export class ImapClient {
         ...(inline ? { cid: contentId || name, contentDisposition: 'inline' } : {})
       });
     });
-    return { attachmentId: name, changeKey: draftId };
+    // the draft was written again under a new id: say so, or the old one (gone) is the one asked for next
+    return { attachmentId: name, draftId, changeKey: draftId };
   }
 
   /** Remove one attachment (id from getMessage().attachments, or its file name) from a draft. */
