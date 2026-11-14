@@ -253,4 +253,6 @@ test('searchTerms: the words of a search box, a quoted phrase as one', async () 
   assert.deepEqual(searchTerms('landry  kete'), ['landry', 'kete']);
   assert.deepEqual(searchTerms('"due date" invoice'), ['due date', 'invoice']);
   assert.equal(searchTerms('   '), undefined);
+  assert.deepEqual(searchTerms('Smith & Co - march'), ['Smith', 'Co', 'march']);
+  assert.equal(searchTerms('- " 🙂'), undefined);
 });

@@ -206,7 +206,8 @@ export class Mailcore {
           // (A page by offset stays the cache's: two sources do not share one.)
           const page = opts.limit || 25;
           if (!opts.text?.length || opts.offset || hits.length >= page) return hits;
-          const live = await Promise.all(names.map((n) => ask(n, opts, true)));
+          // a server slow to answer does not hold back what the cache found: past a few seconds it counts as none
+          const live = await Promise.all(names.map((n) => within(SEARCH_WAIT_MS, ask(n, opts, true), [])));
           return newest([hits, ...live], page);
         }
       } catch (e) {
@@ -380,12 +381,21 @@ export class Mailcore {
  * "DOMAIN\user" carries its own domain: split it, or NTLM gets the domain twice
  * (user "DOMAIN\user" in domain "DOMAIN") and Exchange answers 401.
  */
-/** The terms of a search: its words, a "quoted phrase" as one; none when there is nothing but spaces. */
+const SEARCH_WAIT_MS = 4000;
+
+/** What `promise` gives within `ms`, else `fallback`. */
+function within(ms, promise, fallback) {
+  let timer;
+  return Promise.race([promise, new Promise((resolve) => { timer = setTimeout(() => resolve(fallback), ms); })]).finally(() => clearTimeout(timer));
+}
+
+/** The terms of a search: its words, a "quoted phrase" as one; none when there is no letter or digit in it. */
 export function searchTerms(text) {
   const terms = [];
   for (const m of String(text || '').matchAll(/"([^"]*)"|(\S+)/g)) {
     const t = (m[1] ?? m[2]).trim();
-    if (t) terms.push(t);
+    // "&", "-", an emoji alone: no word to look for (and an index of words cannot find them)
+    if (/[\p{L}\p{N}]/u.test(t)) terms.push(t);
   }
   return terms.length ? terms : undefined;
 }
