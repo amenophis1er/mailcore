@@ -767,7 +767,8 @@ function hasAttachment(node) {
 
 function addrs(list) {
   const values = Array.isArray(list) ? list.flatMap((l) => l.value || []) : list?.value || [];
-  return values.map((a) => ({ name: a.name || '', email: a.address || '' }));
+  // a group ("Team: Ann <ann@x>, Bob <bob@x>;") is its members
+  return values.flatMap((a) => (Array.isArray(a.group) ? a.group : [a])).map((a) => ({ name: a.name || '', email: a.address || '' }));
 }
 
 function uniq(list) {
