@@ -8,6 +8,7 @@
 // Drafts are immutable in IMAP: an edit appends a new message and deletes
 // the old one, so updateDraft/addAttachment return the NEW id as changeKey.
 
+import { randomUUID } from 'node:crypto';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
@@ -429,8 +430,12 @@ export class ImapClient {
     const to = [...addrs(parsed.to), ...addrs(parsed.cc), ...addrs(parsed.bcc)].map((a) => a.email).filter(Boolean);
     if (to.length === 0) throw new Error('sendItem: the draft has no recipients');
     const from = addrs(parsed.from)[0]?.email || this.self;
-    await this.#smtpSend(withoutBcc(source), { from, to }); // Bcc is in the envelope, never in what the others receive
-    await this.#append(await this.#folder('sent'), source, ['\\Seen']);
+    // It leaves under a Message-ID of its own, not its draft's. Gmail takes a mail sent under the id of a draft it
+    // holds for that draft being sent: the sent message is then the draft's successor, under another number in
+    // Drafts, and what removes the draft below finds nothing; the mail stays in Drafts for good, marked sent as well.
+    const mail = withMessageId(source, newMessageId(from));
+    await this.#smtpSend(withoutBcc(mail), { from, to }); // Bcc is in the envelope, never in what the others receive
+    await this.#append(await this.#folder('sent'), mail, ['\\Seen']);
     await this.#delete(path, uid);
     return true;
   }
@@ -807,6 +812,29 @@ export function withoutBcc(raw) {
   if (end < 0) return buf;
   const head = buf.subarray(0, end).toString('latin1').replace(/^bcc:[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*(?:\r?\n|$)/gim, '').replace(/\r?\n$/, '');
   return Buffer.concat([Buffer.from(head, 'latin1'), buf.subarray(end)]);
+}
+
+/** The end of a raw message's headers (where the blank line starts), or -1. */
+function headEnd(buf) {
+  const crlf = buf.indexOf('\r\n\r\n');
+  const lf = buf.indexOf('\n\n');
+  return crlf >= 0 && (lf < 0 || crlf < lf) ? crlf : lf;
+}
+
+/** A Message-ID for mail from `from`: random, at the sender's domain. */
+export function newMessageId(from) {
+  const domain = /@([a-z0-9.-]+)$/i.exec(String(from || '').trim())?.[1] || 'localhost';
+  return `<${randomUUID()}@${domain.toLowerCase()}>`;
+}
+
+/** A raw message under another Message-ID (its own, folded lines included, is replaced; one is added where there was none); the rest is untouched. */
+export function withMessageId(raw, id) {
+  const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+  const end = headEnd(buf);
+  if (end < 0) return buf;
+  const nl = buf[end] === 0x0d ? '\r\n' : '\n';
+  const lines = buf.subarray(0, end).toString('latin1').replace(/^message-id:[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*(?:\r?\n|$)/gim, '').replace(/\r?\n$/, '');
+  return Buffer.concat([Buffer.from(`${lines}${nl}Message-ID: ${id}`, 'latin1'), buf.subarray(end)]);
 }
 
 function readAll(stream) {

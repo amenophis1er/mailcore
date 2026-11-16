@@ -3,7 +3,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ImapClient } from '../src/imap.js';
+import net from 'node:net';
+import { Readable } from 'node:stream';
+import { ImapClient, withMessageId, newMessageId } from '../src/imap.js';
 import { ImapStream } from '../src/imap-stream.js';
 
 const ACCT = { name: 'home', provider: 'imap', email: 'me@home.invalid', imap: { host: '127.0.0.1' } };
@@ -87,4 +89,94 @@ test('the IDLE loop waits while the auth gate is blocked, then signs in with fre
     await new Promise((r) => realSetTimeout(r, 30));
   } finally { globalThis.setTimeout = realSetTimeout; }
   assert.deepEqual(heard, ['ok', 'failed:MAIL_AUTH']);
+});
+
+// --- a draft is sent under a Message-ID of its own -----------------------------------------------------------------
+
+/** A mail server on this machine that takes one mail and keeps what it was given (no network beyond 127.0.0.1). */
+function smtpStandIn() {
+  const got = { from: '', to: [], data: '' };
+  const server = net.createServer((sock) => {
+    let inData = false;
+    let buf = '';
+    sock.write('220 stand-in ESMTP\r\n');
+    sock.on('data', (chunk) => {
+      buf += chunk.toString('latin1');
+      for (;;) {
+        if (inData) {
+          const end = buf.indexOf('\r\n.\r\n');
+          if (end < 0) return;
+          got.data = buf.slice(0, end + 2);
+          buf = buf.slice(end + 5);
+          inData = false;
+          sock.write('250 kept\r\n');
+          continue;
+        }
+        const nl = buf.indexOf('\r\n');
+        if (nl < 0) return;
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 2);
+        if (/^EHLO|^HELO/i.test(line)) sock.write('250-stand-in\r\n250 AUTH PLAIN LOGIN\r\n');
+        else if (/^AUTH/i.test(line)) sock.write('235 in\r\n');
+        else if (/^MAIL FROM:/i.test(line)) { got.from = /<([^>]*)>/.exec(line)?.[1] || ''; sock.write('250 ok\r\n'); }
+        else if (/^RCPT TO:/i.test(line)) { got.to.push(/<([^>]*)>/.exec(line)?.[1] || ''); sock.write('250 ok\r\n'); }
+        else if (/^DATA/i.test(line)) { inData = true; sock.write('354 go\r\n'); }
+        else if (/^QUIT/i.test(line)) { sock.write('221 bye\r\n'); sock.end(); }
+        else sock.write('250 ok\r\n');
+      }
+    });
+    sock.on('error', () => {});
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ got, port: server.address().port, close: () => new Promise((r) => server.close(r)) })));
+}
+
+const DRAFT = [
+  'From: Me <me@home.invalid>', 'To: you@example.invalid', 'Bcc: quiet@example.invalid', 'Subject: Fwd: an order',
+  'Message-ID: <the-drafts-own-id-which-is-long-enough-to-be-folded-by-a-composer',
+  ' @home.invalid>', 'Date: Mon, 16 Nov 2026 00:13:02 +0000', 'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', '',
+  'Here it is.', 'Message-ID: <not-a-header@home.invalid> stays in the text', ''
+].join('\r\n');
+
+test('sendItem: the mail leaves, and is kept in Sent, under a Message-ID of its own; the draft is then removed', async () => {
+  const smtp = await smtpStandIn();
+  try {
+    const c = new ImapClient({ ...ACCT, smtp: { host: '127.0.0.1', port: smtp.port } }, { username: 'me', password: 'x' });
+    const done = [];
+    c.client = {
+      usable: true,
+      mailbox: null,
+      async getMailboxLock(path) { this.mailbox = { path, uidValidity: 7n }; return { release: () => {} }; },
+      async fetchOne() { return { uid: 9, flags: new Set(['\\Draft']), internalDate: new Date('2026-11-16T00:13:02Z'), envelope: { subject: 'Fwd: an order', from: [{ name: 'Me', address: 'me@home.invalid' }], to: [{ address: 'you@example.invalid' }] } }; },
+      async download() { return { content: Readable.from([Buffer.from(DRAFT)]) }; },
+      async append(path, raw, flags) { done.push(['append', path, flags, Buffer.from(raw).toString('latin1')]); return { uid: 40, uidValidity: 4n }; },
+      async messageDelete(uid) { done.push(['delete', this.mailbox.path, uid]); return true; }
+    };
+    c.folderMap = { inbox: 'INBOX', archive: 'Archive', junk: 'Spam', sent: 'Sent', drafts: 'Drafts', trash: 'Trash' };
+    assert.equal(await c.sendItem('Drafts/7/9'), true);
+
+    const idOf = (raw) => /^Message-ID: (<[^>]+>)\r$/m.exec(raw.slice(0, raw.indexOf('\r\n\r\n') + 2))?.[1];
+    const sent = idOf(smtp.got.data);
+    assert.match(sent, /^<[0-9a-f-]{36}@home\.invalid>$/); // its own, at the sender's domain
+    assert.equal(/the-drafts-own-id/.test(smtp.got.data), false); // the draft's is nowhere in what left
+    assert.equal(/^Bcc:/im.test(smtp.got.data), false);
+    assert.deepEqual([smtp.got.from, smtp.got.to], ['me@home.invalid', ['you@example.invalid', 'quiet@example.invalid']]);
+    assert.match(smtp.got.data, /Here it is\.\r\nMessage-ID: <not-a-header@home\.invalid> stays in the text/); // the text is untouched
+
+    // the copy kept in Sent is the mail as sent (the same id: a server that keeps sent mail itself has one, not two), Bcc remembered
+    assert.deepEqual(done.map((d) => d.slice(0, 3)), [['append', 'Sent', ['\\Seen']], ['delete', 'Drafts', 9]]);
+    assert.equal(idOf(done[0][3]), sent);
+    assert.match(done[0][3], /^Bcc: quiet@example\.invalid\r$/m);
+  } finally {
+    await smtp.close();
+  }
+});
+
+test('withMessageId: one Message-ID, in the headers only, whatever the line ends; newMessageId is random at the domain', () => {
+  const lf = withMessageId('Subject: a\nmessage-id: <old@x>\nMessage-Id: <older@x>\nTo: b@x\n\nbody\nMessage-ID: <text@x>\n', '<new@x>').toString();
+  assert.equal(lf, 'Subject: a\nTo: b@x\nMessage-ID: <new@x>\n\nbody\nMessage-ID: <text@x>\n');
+  assert.equal(withMessageId('Subject: a\r\n\r\nbody', '<new@x>').toString(), 'Subject: a\r\nMessage-ID: <new@x>\r\n\r\nbody'); // none before: one is added
+  assert.equal(withMessageId('no headers end here', '<new@x>').toString(), 'no headers end here');
+  assert.notEqual(newMessageId('me@Home.Invalid'), newMessageId('me@Home.Invalid'));
+  assert.match(newMessageId('me@Home.Invalid'), /^<[0-9a-f-]{36}@home\.invalid>$/);
+  assert.match(newMessageId(''), /@localhost>$/);
 });
