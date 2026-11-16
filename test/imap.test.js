@@ -159,6 +159,9 @@ test('sendItem: the mail leaves, and is kept in Sent, under a Message-ID of its 
     const sent = idOf(smtp.got.data);
     assert.match(sent, /^<[0-9a-f-]{36}@home\.invalid>$/); // its own, at the sender's domain
     assert.equal(/the-drafts-own-id/.test(smtp.got.data), false); // the draft's is nowhere in what left
+    const headers = smtp.got.data.slice(0, smtp.got.data.indexOf('\r\n\r\n'));
+    assert.equal(headers.match(/^message-id/gim).length, 1);
+    assert.equal(/^[ \t]/m.test(headers), false); // nor the second line of its folded id, which would have joined the header above
     assert.equal(/^Bcc:/im.test(smtp.got.data), false);
     assert.deepEqual([smtp.got.from, smtp.got.to], ['me@home.invalid', ['you@example.invalid', 'quiet@example.invalid']]);
     assert.match(smtp.got.data, /Here it is\.\r\nMessage-ID: <not-a-header@home\.invalid> stays in the text/); // the text is untouched
@@ -201,6 +204,12 @@ test('sendItem: once the mail has left, a mailbox that fails does not make it a 
     assert.equal(await always.c.sendItem('Drafts/7/9'), true);
     assert.deepEqual(always.done, []);
     assert.equal(smtp.got.mails, 2);
+    // an account with no Sent folder sends nothing
+    const none = client(0);
+    none.c.folderMap = { inbox: 'INBOX', drafts: 'Drafts' };
+    none.c.client.list = async () => [{ path: 'INBOX', flags: new Set() }, { path: 'Drafts', specialUse: '\\Drafts', flags: new Set() }];
+    await assert.rejects(none.c.sendItem('Drafts/7/9'));
+    assert.equal(smtp.got.mails, 2);
   } finally {
     await smtp.close();
   }
@@ -211,6 +220,9 @@ test('withMessageId: one Message-ID, in the headers only, whatever the line ends
   assert.equal(lf, 'Subject: a\nTo: b@x\nMessage-ID: <new@x>\n\nbody\nMessage-ID: <text@x>\n');
   assert.equal(withMessageId('Subject: a\r\n\r\nbody', '<new@x>').toString(), 'Subject: a\r\nMessage-ID: <new@x>\r\n\r\nbody'); // none before: one is added
   assert.equal(withMessageId('no headers end here', '<new@x>').toString(), 'no headers end here');
+  assert.equal(withMessageId('Message-ID :\r\n <folded@x>\r\nSubject: a\r\n\r\nbody', '<new@x>').toString(), 'Subject: a\r\nMessage-ID: <new@x>\r\n\r\nbody');
+  assert.match(newMessageId('me@münchen.de'), /@xn--mnchen-3ya\.de>$/);
+  assert.match(newMessageId('me@[127.0.0.1]'), /@localhost>$/);
   assert.notEqual(newMessageId('me@Home.Invalid'), newMessageId('me@Home.Invalid'));
   assert.match(newMessageId('me@Home.Invalid'), /^<[0-9a-f-]{36}@home\.invalid>$/);
   assert.match(newMessageId(''), /@localhost>$/);

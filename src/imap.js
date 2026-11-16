@@ -9,6 +9,7 @@
 // the old one, so updateDraft/addAttachment return the NEW id as changeKey.
 
 import { randomUUID } from 'node:crypto';
+import { domainToASCII } from 'node:url';
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
@@ -381,8 +382,12 @@ export class ImapClient {
       return { sent: false, draftId, changeKey: draftId };
     }
     const raw = await compose(mail);
+    const sent = await this.#folder('sent'); // (before anything leaves)
     await this.#smtpSend(raw, { from: this.self, to: [...to, ...cc, ...bcc] });
-    const sentId = await this.#append(await this.#folder('sent'), raw, ['\\Seen']);
+    // It has left: a copy in Sent that fails is tried again, and never makes this a send that failed (as in sendItem).
+    let sentId = null;
+    const keep = async () => { sentId = await this.#append(sent, raw, ['\\Seen']); };
+    try { await keep(); } catch { try { await keep(); } catch {} }
     return { sent: true, draftId: sentId, changeKey: sentId };
   }
 
@@ -430,6 +435,7 @@ export class ImapClient {
     const to = [...addrs(parsed.to), ...addrs(parsed.cc), ...addrs(parsed.bcc)].map((a) => a.email).filter(Boolean);
     if (to.length === 0) throw new Error('sendItem: the draft has no recipients');
     const from = addrs(parsed.from)[0]?.email || this.self;
+    const sent = await this.#folder('sent'); // (before anything leaves: an account with no Sent folder sends nothing)
     // It leaves under a Message-ID of its own, not its draft's. On Gmail a mail sent from a draft has been found
     // afterwards as one message marked both sent and draft, under another number in Drafts (what removes the draft
     // below then finds nothing): as read here, Gmail takes a mail submitted under the id of a draft it holds for
@@ -443,10 +449,10 @@ export class ImapClient {
     const tidy = async () => {
       if (!kept) {
         const c = await this.#conn();
-        await c.append(await this.#folder('sent'), mail, ['\\Seen']); // (no number asked of the server: kept is kept)
+        if (!await c.append(sent, mail, ['\\Seen'])) throw new Error('not kept in Sent'); // (no number asked of the server: kept is kept)
         kept = true;
       }
-      await this.#delete(path, uid);
+      if (!await this.#delete(path, uid)) throw new Error('the draft was not removed');
     };
     try { await tidy(); } catch { try { await tidy(); } catch {} }
     return true;
@@ -658,7 +664,7 @@ export class ImapClient {
   }
 
   async #delete(path, uid) {
-    await this.#inMailbox(path, (c) => c.messageDelete(uid, { uid: true }));
+    return this.#inMailbox(path, (c) => c.messageDelete(uid, { uid: true }));
   }
 
   async #smtpSend(raw, envelope) {
@@ -835,8 +841,9 @@ function headEnd(buf) {
 
 /** A Message-ID for mail from `from`: random, at the sender's domain. */
 export function newMessageId(from) {
-  const domain = /@([a-z0-9.-]+)$/i.exec(String(from || '').trim())?.[1] || 'localhost';
-  return `<${randomUUID()}@${domain.toLowerCase()}>`;
+  const named = /@([^@\s<>]+?)\.?$/.exec(String(from || '').trim())?.[1] || '';
+  const domain = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(domainToASCII(named)) ? domainToASCII(named) : 'localhost'; // (a name in other letters in its ASCII form)
+  return `<${randomUUID()}@${domain}>`;
 }
 
 /** A raw message under another Message-ID (its own, folded lines included, is replaced; one is added where there was none); the rest is untouched. */
@@ -845,7 +852,7 @@ export function withMessageId(raw, id) {
   const end = headEnd(buf);
   if (end < 0) return buf;
   const nl = buf[end] === 0x0d ? '\r\n' : '\n';
-  const lines = buf.subarray(0, end).toString('latin1').replace(/^message-id:[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*(?:\r?\n|$)/gim, '').replace(/\r?\n$/, '');
+  const lines = buf.subarray(0, end).toString('latin1').replace(/^message-id[ \t]*:[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*(?:\r?\n|$)/gim, '').replace(/\r?\n$/, '');
   return Buffer.concat([Buffer.from(`${lines}${nl}Message-ID: ${id}`, 'latin1'), buf.subarray(end)]);
 }
 
