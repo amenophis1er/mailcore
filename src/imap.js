@@ -430,13 +430,25 @@ export class ImapClient {
     const to = [...addrs(parsed.to), ...addrs(parsed.cc), ...addrs(parsed.bcc)].map((a) => a.email).filter(Boolean);
     if (to.length === 0) throw new Error('sendItem: the draft has no recipients');
     const from = addrs(parsed.from)[0]?.email || this.self;
-    // It leaves under a Message-ID of its own, not its draft's. Gmail takes a mail sent under the id of a draft it
-    // holds for that draft being sent: the sent message is then the draft's successor, under another number in
-    // Drafts, and what removes the draft below finds nothing; the mail stays in Drafts for good, marked sent as well.
+    // It leaves under a Message-ID of its own, not its draft's. On Gmail a mail sent from a draft has been found
+    // afterwards as one message marked both sent and draft, under another number in Drafts (what removes the draft
+    // below then finds nothing): as read here, Gmail takes a mail submitted under the id of a draft it holds for
+    // that draft. Under an id of its own the mail and its draft are two things for the server.
     const mail = withMessageId(source, newMessageId(from));
     await this.#smtpSend(withoutBcc(mail), { from, to }); // Bcc is in the envelope, never in what the others receive
-    await this.#append(await this.#folder('sent'), mail, ['\\Seen']);
-    await this.#delete(path, uid);
+    // It has left. Nothing below makes this a send that failed: whoever tries again (the caller on an error, the
+    // retry around a client call when signing in again fails) would send it a second time. The copy in Sent and
+    // the draft's removal are tried twice; a draft is only removed once its mail is kept.
+    let kept = false;
+    const tidy = async () => {
+      if (!kept) {
+        const c = await this.#conn();
+        await c.append(await this.#folder('sent'), mail, ['\\Seen']); // (no number asked of the server: kept is kept)
+        kept = true;
+      }
+      await this.#delete(path, uid);
+    };
+    try { await tidy(); } catch { try { await tidy(); } catch {} }
     return true;
   }
 

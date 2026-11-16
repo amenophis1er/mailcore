@@ -95,7 +95,7 @@ test('the IDLE loop waits while the auth gate is blocked, then signs in with fre
 
 /** A mail server on this machine that takes one mail and keeps what it was given (no network beyond 127.0.0.1). */
 function smtpStandIn() {
-  const got = { from: '', to: [], data: '' };
+  const got = { from: '', to: [], data: '', mails: 0 };
   const server = net.createServer((sock) => {
     let inData = false;
     let buf = '';
@@ -107,6 +107,7 @@ function smtpStandIn() {
           const end = buf.indexOf('\r\n.\r\n');
           if (end < 0) return;
           got.data = buf.slice(0, end + 2);
+          got.mails++;
           buf = buf.slice(end + 5);
           inData = false;
           sock.write('250 kept\r\n');
@@ -162,10 +163,44 @@ test('sendItem: the mail leaves, and is kept in Sent, under a Message-ID of its 
     assert.deepEqual([smtp.got.from, smtp.got.to], ['me@home.invalid', ['you@example.invalid', 'quiet@example.invalid']]);
     assert.match(smtp.got.data, /Here it is\.\r\nMessage-ID: <not-a-header@home\.invalid> stays in the text/); // the text is untouched
 
-    // the copy kept in Sent is the mail as sent (the same id: a server that keeps sent mail itself has one, not two), Bcc remembered
+    // the copy kept in Sent is the mail as sent (the same id), Bcc remembered
     assert.deepEqual(done.map((d) => d.slice(0, 3)), [['append', 'Sent', ['\\Seen']], ['delete', 'Drafts', 9]]);
     assert.equal(idOf(done[0][3]), sent);
     assert.match(done[0][3], /^Bcc: quiet@example\.invalid\r$/m);
+  } finally {
+    await smtp.close();
+  }
+});
+
+test('sendItem: once the mail has left, a mailbox that fails does not make it a send that failed (it would be sent again)', async () => {
+  const smtp = await smtpStandIn();
+  try {
+    const client = (failures) => {
+      const c = new ImapClient({ ...ACCT, smtp: { host: '127.0.0.1', port: smtp.port } }, { username: 'me', password: 'x' });
+      const done = [];
+      let fails = failures;
+      c.client = {
+        usable: true,
+        mailbox: null,
+        async getMailboxLock(path) { this.mailbox = { path, uidValidity: 7n }; return { release: () => {} }; },
+        async fetchOne() { return { uid: 9, flags: new Set(['\\Draft']), internalDate: new Date('2026-11-16T00:13:02Z'), envelope: { subject: 'Fwd: an order', from: [{ address: 'me@home.invalid' }], to: [{ address: 'you@example.invalid' }] } }; },
+        async download() { return { content: Readable.from([Buffer.from(DRAFT)]) }; },
+        async append(path) { if (fails-- > 0) throw Object.assign(new Error('signing in failed'), { code: 'MAIL_AUTH' }); done.push(['append', path]); return {}; }, // (and no number given back)
+        async messageDelete(uid) { done.push(['delete', this.mailbox.path, uid]); return true; }
+      };
+      c.folderMap = { inbox: 'INBOX', archive: 'Archive', junk: 'Spam', sent: 'Sent', drafts: 'Drafts', trash: 'Trash' };
+      return { c, done };
+    };
+    // the copy in Sent fails once: tried again, kept once, the draft removed; one mail left
+    const once = client(1);
+    assert.equal(await once.c.sendItem('Drafts/7/9'), true);
+    assert.deepEqual(once.done, [['append', 'Sent'], ['delete', 'Drafts', 9]]);
+    assert.equal(smtp.got.mails, 1);
+    // it keeps failing: the mail is sent all the same, and its draft is left where it is (nothing else holds the mail)
+    const always = client(9);
+    assert.equal(await always.c.sendItem('Drafts/7/9'), true);
+    assert.deepEqual(always.done, []);
+    assert.equal(smtp.got.mails, 2);
   } finally {
     await smtp.close();
   }
