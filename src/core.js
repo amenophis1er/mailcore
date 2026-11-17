@@ -3,6 +3,7 @@
 // config file, a keychain or the environment — all of it is handed in.
 
 import fs from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
 import { normalizeAccounts, calendarProvider, hasMail, MAIL_PROVIDERS } from './accounts.js';
 import { AccountClient, splitId, isAuthError, makeBackend, makeCalendarBackend, makeStream } from './client.js';
@@ -47,7 +48,8 @@ export class Mailcore {
    * @param {Function} [o.cacheFresh]  (accounts) => boolean, replaces the "watcher polled recently" test
    * @param {Function} [o.log]
    */
-  constructor({ accounts, defaultAccount, credentials, dataDir = null, cacheKey = null, state, timeZone = null, pollSeconds = 30, google = {}, cacheFresh, log } = {}) {
+  constructor({ accounts, defaultAccount, credentials, dataDir = null, cacheKey = null, state, timeZone = null, pollSeconds = 30, google = {}, cacheFresh, log, turnWaitMs = TURN_WAIT_MS } = {}) {
+    this._turnWait = turnWaitMs; // (how long a use waits its turn at an IMAP account before it is refused as busy: a test's is short)
     if (!credentials || typeof credentials.getPassword !== 'function') {
       throw new TypeError('createMailcore: credentials.getPassword(account, { refresh }) is required');
     }
@@ -153,7 +155,10 @@ export class Mailcore {
     const attempt = async (refresh) => {
       // One IMAP account takes only so many connections at once (Gmail: fifteen, every app and device counted): a
       // process holds a few at a time, and what else it has to ask waits its turn.
-      const release = await this.#turn(name);
+      const turn = await this.#turn(name);
+      const release = turn.release;
+      // (what fn asks of the same account meanwhile is part of this use: it has its turn)
+      const inside = (work) => (turn.name ? this.#inUse.run(new Set([...(this.#inUse.getStore() ?? []), turn.name]), work) : work());
       try {
         for (let tries = 0; ; tries++) {
           // (a client kept from a use a moment ago, where clients are kept: its connection is there already)
@@ -165,7 +170,7 @@ export class Mailcore {
           lease ??= { c, born: Date.now() };
           let done = false;
           try {
-            const out = await fn(c);
+            const out = await inside(() => fn(c));
             done = true;
             return out;
           } catch (e) {
@@ -204,33 +209,43 @@ export class Mailcore {
   // --- a few at a time ------------------------------------------------------------------
 
   #turns = new Map(); // account name → { busy, waiting: [fn] }
+  #inUse = new AsyncLocalStorage(); // the accounts whose turn the work under way already has (a use inside a use)
 
   /**
-   * A turn at an IMAP account's connections (MAX_AT_ONCE of them at a time in this process); settles with what gives
-   * it back. A turn not had within TURN_WAIT_MS is taken all the same: a use that waits for another use of the same
-   * account, itself waiting, must not wait for ever.
+   * A turn at an IMAP account's connections (MAX_AT_ONCE of them at a time in this process); settles with
+   * { release, name }: what gives it back, and the account it is of (null: none was needed). A use made inside a
+   * use of the same account has its turn already (it would wait for itself). A turn not had within TURN_WAIT_MS is
+   * not taken: the use is refused as busy (MAIL_BUSY: said, or waited for and asked again by whoever asked), so
+   * that never more than MAX_AT_ONCE are at an account at once, however many wait.
    */
   async #turn(name) {
     let acct = null;
     try { acct = this.account(name); } catch { /* said where the client is made */ }
-    if (acct?.provider !== 'imap') return () => {};
+    if (acct?.provider !== 'imap' || this.#inUse.getStore()?.has(acct.name)) return { release: () => {}, name: null };
     const t = this.#turns.get(acct.name) ?? { busy: 0, waiting: [] };
     this.#turns.set(acct.name, t);
     if (t.busy >= MAX_AT_ONCE) {
-      await new Promise((go) => {
-        const timer = setTimeout(() => { const at = t.waiting.indexOf(mine); if (at >= 0) t.waiting.splice(at, 1); go(); }, TURN_WAIT_MS);
+      // (handed over by the one that ends: its place is this one's, never free in between)
+      await new Promise((go, no) => {
+        const timer = setTimeout(() => {
+          const at = t.waiting.indexOf(mine);
+          if (at >= 0) t.waiting.splice(at, 1);
+          no(Object.assign(new Error(`${acct.name}: too much is being asked of this mail account at once; try again in a moment`), { code: 'MAIL_BUSY' }));
+        }, this._turnWait);
         timer.unref?.();
         const mine = () => { clearTimeout(timer); go(); };
         t.waiting.push(mine);
       });
-    }
-    t.busy++;
+    } else t.busy++;
     let given = false;
-    return () => {
-      if (given) return;
-      given = true;
-      t.busy--;
-      t.waiting.shift()?.();
+    return {
+      name: acct.name,
+      release: () => {
+        if (given) return;
+        given = true;
+        const next = t.waiting.shift();
+        if (next) next(); else t.busy--;
+      }
     };
   }
 

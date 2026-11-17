@@ -162,6 +162,8 @@ export interface MailcoreOptions {
   google?: Lazy<{ clientId?: string; clientSecret?: string; signInHint?: (account: string) => string }>;
   /** Replaces the default "a watcher polled within 3× pollSeconds" test for serving from the cache. */
   cacheFresh?: (accounts: string[]) => boolean;
+  /** how long a use waits its turn at an IMAP account (a few at a time) before it is refused as busy, MAIL_BUSY (ms; default 20000) */
+  turnWaitMs?: number;
   log?: (message: string) => void;
 }
 

@@ -388,15 +388,17 @@ export function createCache({ dir, key, accounts = () => ({}), state = () => ({}
     if (opts.sinceIso) { where.push('m.received >= ?'); params.push(new Date(opts.sinceIso).toISOString()); }
     if (opts.untilIso) { where.push('m.received <= ?'); params.push(new Date(opts.untilIso).toISOString()); }
     if (opts.fromMe) { where.push('lower(m.from_email) = ?'); params.push(String(opts.fromMe).toLowerCase()); } // the caller resolves fromMe to the address
-    if (opts.toContains) { where.push('(m.display_to LIKE ? OR m.to_json LIKE ? OR m.cc_json LIKE ?)'); params.push(like(opts.toContains), like(opts.toContains), like(opts.toContains)); }
-    if (opts.senderContains) { where.push('(m.from_name LIKE ? OR m.from_email LIKE ?)'); params.push(like(opts.senderContains), like(opts.senderContains)); }
+    // (like() escapes %, _ and \ with a backslash: said to SQLite, which has no escape character unless told)
+    const LIKE = "LIKE ? ESCAPE '\\'";
+    if (opts.toContains) { where.push(`(m.display_to ${LIKE} OR m.to_json ${LIKE} OR m.cc_json ${LIKE})`); params.push(like(opts.toContains), like(opts.toContains), like(opts.toContains)); }
+    if (opts.senderContains) { where.push(`(m.from_name ${LIKE} OR m.from_email ${LIKE})`); params.push(like(opts.senderContains), like(opts.senderContains)); }
     // with any of these addresses: who wrote it, whom it was written to, or who was in copy
     const withAny = (Array.isArray(opts.withAny) ? opts.withAny : opts.withAny ? [opts.withAny] : []).filter((a) => typeof a === 'string' && a);
     if (withAny.length) {
-      where.push(`(${withAny.map(() => '(m.from_email LIKE ? OR m.display_to LIKE ? OR m.to_json LIKE ? OR m.cc_json LIKE ?)').join(' OR ')})`);
+      where.push(`(${withAny.map(() => `(m.from_email ${LIKE} OR m.display_to ${LIKE} OR m.to_json ${LIKE} OR m.cc_json ${LIKE})`).join(' OR ')})`);
       for (const a of withAny) params.push(like(a), like(a), like(a), like(a));
     }
-    if (opts.subjectContains) { where.push('m.subject LIKE ?'); params.push(like(opts.subjectContains)); }
+    if (opts.subjectContains) { where.push(`m.subject ${LIKE}`); params.push(like(opts.subjectContains)); }
     const texts = Array.isArray(opts.text) ? opts.text : opts.text ? [opts.text] : [];
     let join = '';
     if (texts.length) {

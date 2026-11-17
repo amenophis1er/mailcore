@@ -27,21 +27,37 @@ export function parseEws(xml) {
 
 /** A mail attached to a mail, named as a file: its subject, and .eml. */
 const mailName = (name) => { const n = String(name || '').trim() || 'Attached mail'; return /\.eml$/i.test(n) ? n : `${n}.eml`; };
+/**
+ * What an attached item is, as a file: a mail (.eml), or what Exchange writes out of an event (.ics) or a contact
+ * (.vcf). By how what it hands out starts when that is known (`content`), else by the type it lists it with.
+ */
+function itemFile(name, listedType, content) {
+  const head = content ? content.subarray(0, 64).toString('latin1').replace(/^\uFEFF|^\xEF\xBB\xBF/, '').trimStart().toUpperCase() : '';
+  const type = String(listedType || '').toLowerCase();
+  const as = (ext, contentType) => { const n = String(name || '').trim() || 'Attached item'; return { name: new RegExp(`\\.${ext}$`, 'i').test(n) ? n : `${n}.${ext}`, contentType }; };
+  if (head.startsWith('BEGIN:VCALENDAR') || (!head && /calendar/.test(type))) return as('ics', 'text/calendar');
+  if (head.startsWith('BEGIN:VCARD') || (!head && /vcard/.test(type))) return as('vcf', 'text/vcard');
+  return { name: mailName(name), contentType: 'message/rfc822', mail: true };
+}
 
 /**
  * The attachments of an item as read from GetItem: files as they are, and the mails attached to it (items, to
  * Exchange) as .eml files of type message/rfc822 (`mail: true`; getAttachment hands each out as a mail of its own).
  */
 function attachmentsIn(item) {
-  return ['FileAttachment', 'ItemAttachment'].flatMap((kind) => toArray(dig(item, 'Attachments.' + kind)).map((a) => ({
-    id: a.AttachmentId?.['@Id'] || '',
-    name: kind === 'ItemAttachment' ? mailName(textOf(a.Name)) : textOf(a.Name),
-    size: Number(a.Size) || 0,
-    contentType: kind === 'ItemAttachment' ? 'message/rfc822' : textOf(a.ContentType),
-    contentId: textOf(a.ContentId) || undefined,
-    inline: String(a.IsInline) === 'true',
-    ...(kind === 'ItemAttachment' ? { mail: true } : {})
-  })));
+  return ['FileAttachment', 'ItemAttachment'].flatMap((kind) => toArray(dig(item, 'Attachments.' + kind)).map((a) => {
+    // (an attached item is a mail unless Exchange lists it as something else: an event, a contact)
+    const as = kind === 'ItemAttachment' ? itemFile(textOf(a.Name), textOf(a.ContentType)) : null;
+    return {
+      id: a.AttachmentId?.['@Id'] || '',
+      name: as ? as.name : textOf(a.Name),
+      size: Number(a.Size) || 0,
+      contentType: as ? as.contentType : textOf(a.ContentType),
+      contentId: textOf(a.ContentId) || undefined,
+      inline: String(a.IsInline) === 'true',
+      ...(as?.mail ? { mail: true } : {})
+    };
+  }));
 }
 
 export class EwsClient {
@@ -774,7 +790,9 @@ export class EwsClient {
       const inside = item && Object.values(item).find((v) => v && typeof v === 'object' && v.MimeContent !== undefined);
       const mime = inside ? String(textOf(inside.MimeContent) || '') : '';
       if (!mime) throw new Error('this attached item cannot be downloaded: Exchange does not hand it out as a file');
-      return { name: mailName(textOf(item.Name)), contentType: 'message/rfc822', contentId: undefined, content: Buffer.from(mime, 'base64') };
+      const content = Buffer.from(mime, 'base64');
+      const as = itemFile(textOf(item.Name), '', content); // (an event comes out as iCalendar, a contact as a vCard: named as what they are)
+      return { name: as.name, contentType: as.contentType, contentId: undefined, content };
     }
     return {
       name: textOf(file.Name) || 'attachment',

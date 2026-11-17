@@ -88,23 +88,27 @@ export class ImapClient {
 
   async #conn() {
     if (this.client && this.client.usable) return this.client;
-    const c = new ImapFlow(imapOptions(this.acct, this.creds));
-    c.on('error', () => {}); // surfaced through the awaiting command instead
-    try {
-      await c.connect();
-    } catch (e) {
-      const said = tagAuth(e);
-      // (refused before anything was asked on this client: whoever holds it may wait and ask again from the start)
-      if (said.code === 'MAIL_BUSY' && !this.connected) said.unstarted = true;
-      throw said;
-    }
-    this.connected = true;
-    this.client = c;
-    return c;
+    // (one connection, however many ask for it at once as it is being made)
+    this.connecting ??= (async () => {
+      const c = new ImapFlow(imapOptions(this.acct, this.creds));
+      c.on('error', () => {}); // surfaced through the awaiting command instead
+      try {
+        await c.connect();
+      } catch (e) {
+        const said = tagAuth(e);
+        // (refused before anything was asked on this client: whoever holds it may wait and ask again from the start)
+        if (said.code === 'MAIL_BUSY' && !this.connected) said.unstarted = true;
+        throw said;
+      }
+      this.connected = true;
+      this.client = c;
+      return c;
+    })().finally(() => { this.connecting = null; });
+    return this.connecting;
   }
 
   /** Kept from a use before, and taken for another (Mailcore.keepClients): the folder its connection has selected is selected anew at its first use (#inMailbox). */
-  again() { this.resync = true; }
+  again() { this.use = (this.use || 0) + 1; }
 
   /**
    * Whether the connection kept still answers: a NOOP, waited for `ms` (a connection the network dropped looks
@@ -159,24 +163,29 @@ export class ImapClient {
       if (c.mailbox && c.mailbox.readOnly && Date.now() - (this.openedAt || 0) > 1500) await c.mailboxClose();
       if (!c.mailbox) this.openedAt = Date.now();
     }
-    // Taken again after a use before (again()), with this very folder still selected: the session sees the folder as
-    // it was until told otherwise, and the lock alone selects nothing when the folder is the one selected. Selecting
-    // it anew costs (a second and more for a large inbox at Gmail), so: at once when it must be sure, or when it was
-    // selected more than RESELECT_MS ago; else only if a message turns out not to be found (one that arrived since:
-    // selected anew then, and asked once more, nothing having been done). Any other folder is selected now anyway.
-    const kept = !this.watcher && this.resync === true && !!c.mailbox && c.mailbox.path === path;
-    this.resync = false;
-    const before = !!c.mailbox && c.mailbox.path === path;
     const lock = await c.getMailboxLock(path, this.watcher ? { readOnly: true } : undefined);
     try {
-      if (!before) this.selectedAt = Date.now();
-      const anew = async () => { await c.mailboxOpen(path); this.selectedAt = Date.now(); };
-      const now = kept && (sure || Date.now() - (this.selectedAt || 0) > RESELECT_MS);
+      // (selected by this lock, or the one it had selected: by the mailbox it holds, which is another once selected anew)
+      // (when, in which use of this client, and after how many changes made from here: counted, not timed, so that two things of the same instant are told apart)
+      const selected = () => { this.box = c.mailbox; this.selectedAt = Date.now(); this.selectedIn = this.use || 0; this.selectedAfter = changedHere.get(this.#account()) || 0; };
+      if (c.mailbox !== this.box) selected();
+      const anew = async () => { await c.mailboxOpen(path); selected(); };
+      // A folder this connection had selected before this use began (a client kept from a use before, taken again:
+      // again()): the session sees the folder as it was until told otherwise, and the lock selects nothing when the
+      // folder is the one selected. Selecting it anew costs (a second and more for a large inbox at Gmail), so: at
+      // once when it must be sure (what moves or deletes by a number, what lists by the folder's count), when it was
+      // selected more than RESELECT_MS ago, or when mail was put in, moved or removed from here since (changedHere:
+      // by any connection of this process to the account); else only if a message turns out not to be found (one
+      // that arrived since: selected anew then, and asked once more, nothing having been done). Once selected anew
+      // in a use, it is fresh for the rest of that use; any other folder is selected by the lock anyway.
+      const kept = !this.watcher && (this.selectedIn || 0) < (this.use || 0);
+      const now = kept && (sure || Date.now() - (this.selectedAt || 0) > RESELECT_MS || (this.selectedAfter || 0) < (changedHere.get(this.#account()) || 0));
       if (now) await anew();
       try {
         return await fn(c, c.mailbox);
       } catch (e) {
-        if (!(kept && !now && /not found|no longer in that folder/i.test(String(e?.message)))) throw e;
+        // (a message that is not there: not an attachment of one that is)
+        if (!(kept && !now && /message not found|no longer in that folder/i.test(String(e?.message)))) throw e;
         await anew();
         return await fn(c, c.mailbox);
       }
@@ -184,6 +193,11 @@ export class ImapClient {
       lock.release();
     }
   }
+
+  /** The account, as what was changed in it from here is told of (changedHere). */
+  #account() { return `${this.acct?.imap?.host || ''}|${this.creds?.username || this.acct?.email || this.acct?.name || ''}`; }
+  /** Mail was put in, moved or removed by this process: every connection to the account kept from before sees its folders anew. */
+  #changed() { changedHere.set(this.#account(), (changedHere.get(this.#account()) || 0) + 1); }
 
   async #folder(key) {
     const k = String(key || 'inbox').toLowerCase();
@@ -211,6 +225,9 @@ export class ImapClient {
   async findInbox(opts = {}) {
     const path = await this.#folder(opts.folder);
     const max = Math.min(opts.limit || 25, 100);
+    // (with nothing to search for, the newest are listed by the folder's count: that count has to be the server's now)
+    const some = (v) => (Array.isArray(v) ? v.length > 0 : !!v);
+    const byCount = ![opts.unreadOnly, opts.flaggedOnly, opts.senderContains, opts.subjectContains, opts.threadId, opts.sinceIso, opts.untilIso, opts.fromMe, opts.toContains, opts.withAny, opts.text].some(some);
     return this.#inMailbox(path, async (c, mailbox) => {
       const uv = String(mailbox.uidValidity);
       const query = {};
@@ -225,7 +242,10 @@ export class ImapClient {
       // with any of these addresses: who wrote it, whom it was written to, or who was in copy (one search for all of a
       // person's mail in a folder, where from, to and cc were three)
       const withAny = (Array.isArray(opts.withAny) ? opts.withAny : opts.withAny ? [opts.withAny] : []).filter((a) => typeof a === 'string' && a);
-      if (withAny.length) query.or = withAny.flatMap((a) => [{ from: a }, { to: a }, { cc: a }]);
+      const any = withAny.flatMap((a) => [{ from: a }, { to: a }, { cc: a }]);
+      // (both: to or cc that one, AND with any of these: a key holds one OR, so the second is inside each side of the first)
+      if (withAny.length && opts.toContains) query.or = [{ to: opts.toContains, or: any }, { cc: opts.toContains, or: any }];
+      else if (withAny.length) query.or = any;
       else if (opts.toContains) query.or = [{ to: opts.toContains }, { cc: opts.toContains }];
       const texts = Array.isArray(opts.text) ? opts.text : opts.text ? [opts.text] : [];
       if (texts.length === 1) query.text = texts[0];
@@ -269,7 +289,7 @@ export class ImapClient {
       items.sort((a, b) => new Date(b.received) - new Date(a.received));
       const filtered = opts.hasAttachments ? items.filter((i) => i.hasAttachments) : items;
       return filtered.slice(0, max);
-    });
+    }, { sure: byCount });
   }
 
   /**
@@ -525,6 +545,7 @@ export class ImapClient {
       if (!kept) {
         const c = await this.#conn();
         if (!await c.append(sent, mail, ['\\Seen'])) throw new Error('not kept in Sent'); // (no number asked of the server: kept is kept)
+        this.#changed();
         kept = true;
       }
       if (!await this.#delete(path, uid)) throw new Error('the draft was not removed');
@@ -548,12 +569,15 @@ export class ImapClient {
   }
 
   async deleteItem(id, changeKey) {
-    const { path, uid } = parseId(changeKey || id);
+    const { path, uidValidity, uid } = parseId(changeKey || id);
     const trash = await this.#folder('trash');
-    await this.#inMailbox(path, async (c) => {
+    await this.#inMailbox(path, async (c, mailbox) => {
+      // (an id of an earlier generation of the mailbox names a message that is gone: its number may now be another's)
+      if (String(mailbox.uidValidity) !== uidValidity) throw new Error(`message not found: ${id}`);
       if (path === trash) await c.messageDelete(uid, { uid: true });
       else await c.messageMove(uid, trash, { uid: true });
     }, { sure: true });
+    this.#changed();
     return true;
   }
 
@@ -575,6 +599,7 @@ export class ImapClient {
           for (const x of list) { if (String(mailbox.uidValidity) === x.uidValidity) live.push(x); else out.set(x.id, null); }
           if (!live.length) return;
           const r = await c.messageMove(live.map((x) => x.uid).join(','), dest, { uid: true });
+          this.#changed();
           if (!r) throw new Error(`the mail server did not move the messages out of ${path}`);
           for (const x of live) {
             const uid = r.uidMap?.get(x.uid);
@@ -761,6 +786,7 @@ export class ImapClient {
   async #append(path, raw, flags) {
     const c = await this.#conn();
     const r = await c.append(path, raw, flags);
+    this.#changed();
     if (!r || !r.uid) throw new Error('append failed: the server did not return the new uid');
     return makeId(path, String(r.uidValidity), r.uid);
   }
@@ -804,7 +830,9 @@ export class ImapClient {
   }
 
   async #delete(path, uid) {
-    return this.#inMailbox(path, (c) => c.messageDelete(uid, { uid: true }), { sure: true });
+    const out = await this.#inMailbox(path, (c) => c.messageDelete(uid, { uid: true }), { sure: true });
+    this.#changed();
+    return out;
   }
 
   async #smtpSend(raw, envelope) {
@@ -1087,6 +1115,8 @@ export function withMessageId(raw, id) {
 }
 
 /** A folder kept selected from a use before is selected anew when it was selected longer ago than this (see #inMailbox). */
-const RESELECT_MS = 30_000;
+const RESELECT_MS = 15_000;
+/** How many times mail was put in, moved or removed from this process, by account: a connection that selected its folder before the last of them sees it anew. */
+const changedHere = new Map();
 /** A message bigger than this is read without the bytes of its attachments (they are fetched when asked for). */
 const LIGHT_OVER = 512 * 1024;

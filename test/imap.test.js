@@ -343,7 +343,7 @@ test('a large text body is read whatever its size; a forwarded message as the wh
 
 
 test('a client taken again after a use before: its folder is selected anew when that was long ago, when mail is moved, or when a message is not found', async () => {
-  const c = new ImapClient(ACCT, { username: 'me', password: 'x' });
+  const c = new ImapClient(ACCT, { username: 'kept-again', password: 'x' }); // (an account of its own: what other tests move is not its mail)
   const did = [];
   let known = true; // whether the session knows message 7
   const conn = {
@@ -403,5 +403,60 @@ test('findInbox withAny: one search for mail from, to or in copy to any of a per
   const got = await c.findInbox({ withAny: ['a@x.example', 'a@work.example'], limit: 10 });
   assert.deepEqual(asked[0], { or: [{ from: 'a@x.example' }, { to: 'a@x.example' }, { cc: 'a@x.example' }, { from: 'a@work.example' }, { to: 'a@work.example' }, { cc: 'a@work.example' }] });
   assert.equal(got.length, 1);
+});
+
+test('findInbox withAny and toContains together: both hold (to or cc that one, and with any of these)', async () => {
+  const c = new ImapClient(ACCT, { username: 'me', password: 'x' });
+  const asked = [];
+  const conn = {
+    usable: true, mailbox: null,
+    async getMailboxLock(path) { conn.mailbox = { path, uidValidity: 999n, exists: 5 }; return { release() {} }; },
+    async search(query) { asked.push(query); return []; }
+  };
+  c.client = conn;
+  c.folderMap = { inbox: 'INBOX' };
+  await c.findInbox({ withAny: ['a@x.example'], toContains: 'b@y.example' });
+  const any = [{ from: 'a@x.example' }, { to: 'a@x.example' }, { cc: 'a@x.example' }];
+  assert.deepEqual(asked[0], { or: [{ to: 'b@y.example', or: any }, { cc: 'b@y.example', or: any }] });
+});
+
+test('a kept folder is selected anew before the newest are listed by its count, and after mail was moved from here on another connection', async () => {
+  const make = () => {
+    const c = new ImapClient(ACCT, { username: 'kept-count', password: 'x' });
+    const did = [];
+    const conn = {
+      usable: true, mailbox: null,
+      async getMailboxLock(path) { if (conn.mailbox?.path !== path) { did.push(`select ${path}`); conn.mailbox = { path, uidValidity: 999n, exists: 0 }; } return { release() {} }; },
+      async mailboxOpen(path) { did.push(`select ${path}`); conn.mailbox = { path, uidValidity: 999n, exists: 0 }; },
+      async search() { did.push('search'); return []; },
+      async fetchOne() { did.push('fetch'); return { uid: 7 }; },
+      async messageFlagsAdd() { did.push('store'); return true; },
+      async messageMove() { did.push('move'); return { uidValidity: 5n, uidMap: new Map([[7, 70]]) }; }
+    };
+    c.client = conn;
+    c.folderMap = { inbox: 'INBOX', sent: 'Sent', trash: 'Trash', archive: 'Archive' };
+    return { c, did };
+  };
+  const a = make();
+  await a.c.findInbox({ limit: 5 });
+  assert.deepEqual(a.did, ['select INBOX']);
+  // taken again a moment later: a search goes on what it has selected, a listing by the count selects anew first
+  a.did.length = 0; a.c.again();
+  await a.c.findInbox({ senderContains: 'x', limit: 5 });
+  assert.deepEqual(a.did, ['search']);
+  a.did.length = 0; a.c.again();
+  await a.c.findInbox({ limit: 5 });
+  assert.deepEqual(a.did, ['select INBOX']);
+  // mail moved by another connection of this process to the same account: this one's folder is selected anew, once
+  const b = make();
+  await new Promise((r) => setTimeout(r, 3));
+  await b.c.deleteItem('INBOX/999/7');
+  a.did.length = 0; a.c.again();
+  await a.c.markRead('INBOX/999/7');
+  assert.deepEqual(a.did, ['select INBOX', 'fetch', 'store']);
+  await a.c.markRead('INBOX/999/7'); // (the same use going on: fresh)
+  assert.deepEqual(a.did, ['select INBOX', 'fetch', 'store', 'fetch', 'store']);
+  // an id of another generation of the mailbox is not deleted in its place
+  await assert.rejects(b.c.deleteItem('INBOX/111/7'), /not found/);
 });
 

@@ -126,3 +126,21 @@ test('Reply-To is kept with the body, an empty one too', (t) => {
   assert.deepEqual(cache.getCached(none.id).replyTo, []);
   assert.equal(cache.getCached(none.id, { stale: true }).body, 'hi');
 });
+
+test('findCached withAny: mail from, to or copied to any of the addresses; an underscore or a percent in an address is itself', (t) => {
+  const { cache, mail } = cacheFor(t);
+  const from = mail({ fromEmail: 'first_last@example.org', fromName: 'First Last' });
+  const near = mail({ fromEmail: 'firstXlast@example.org', fromName: 'Near Miss' }); // (what "_" would also match, were it a wildcard)
+  const to = mail({ fromEmail: 'boss@example.org', displayTo: 'first_last@example.org' });
+  const cc = mail({ fromEmail: '100%real@example.org' });
+  mail({ fromEmail: 'someone@else.example' });
+  const ids = (opts) => cache.findCached(['home'], opts).map((i) => i.id).sort();
+  assert.deepEqual(ids({ withAny: ['first_last@example.org'] }), [from.id, to.id].sort());
+  assert.deepEqual(ids({ withAny: ['first_last@example.org', '100%real@example.org'] }), [from.id, to.id, cc.id].sort());
+  assert.deepEqual(ids({ senderContains: 'first_last' }), [from.id]);
+  assert.deepEqual(ids({ senderContains: 'firstXlast' }), [near.id]);
+  assert.deepEqual(ids({ withAny: [] }).length, 5);
+  // with toContains too: both hold
+  assert.deepEqual(ids({ withAny: ['boss@example.org'], toContains: 'first_last@example.org' }), [to.id]);
+});
+

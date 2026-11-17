@@ -150,3 +150,14 @@ test('findInbox withAny goes through the content index: from, to or cc, any of t
   assert.match(c.sent[0], /<m:QueryString>\(from:&quot;a@x\.org&quot; OR to:&quot;a@x\.org&quot; OR cc:&quot;a@x\.org&quot; OR from:&quot;b@y\.org&quot; OR to:&quot;b@y\.org&quot; OR cc:&quot;b@y\.org&quot;\)<\/m:QueryString>/);
 });
 
+test('an attached item is named as what Exchange hands out: an event as .ics, a contact as .vcf, anything else as a mail', async () => {
+  const one = (name, inner) => soap(`<m:GetAttachmentResponse ${NS}><m:ResponseMessages><m:GetAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments><t:ItemAttachment><t:AttachmentId Id="I9"/><t:Name>${name}</t:Name>${inner}</t:ItemAttachment></m:Attachments></m:GetAttachmentResponseMessage></m:ResponseMessages></m:GetAttachmentResponse>`);
+  const mime = (text) => `<t:MimeContent CharacterSet="UTF-8">${Buffer.from(text).toString('base64')}</t:MimeContent>`;
+  const ics = await stubbed(one('Budget review', `<t:CalendarItem>${mime('BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n')}</t:CalendarItem>`)).getAttachment('I9');
+  assert.deepEqual([ics.name, ics.contentType], ['Budget review.ics', 'text/calendar']);
+  const vcf = await stubbed(one('Someone', `<t:Contact>${mime('BEGIN:VCARD\r\nFN:Someone\r\nEND:VCARD\r\n')}</t:Contact>`)).getAttachment('I9');
+  assert.deepEqual([vcf.name, vcf.contentType], ['Someone.vcf', 'text/vcard']);
+  const eml = await stubbed(one('RE: The lease', `<t:Message>${mime('From: a@x.org\r\nSubject: RE: The lease\r\n\r\nHello\r\n')}</t:Message>`)).getAttachment('I9');
+  assert.deepEqual([eml.name, eml.contentType], ['RE: The lease.eml', 'message/rfc822']);
+});
+

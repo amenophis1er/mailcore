@@ -358,6 +358,26 @@ test('an IMAP account is asked by a few at a time: what else there is to ask wai
   assert.equal(most, 7);
 });
 
+test('never more at an IMAP account than a few, however long the rest wait: one that waited too long is refused as busy; a use inside a use has its turn', async () => {
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: noCreds, turnWaitMs: 40 });
+  mc.client = async () => ({ close: async () => {} });
+  let now = 0;
+  let most = 0;
+  const slow = () => mc.withClient('home', async () => { most = Math.max(most, ++now); await new Promise((r) => setTimeout(r, 400)); now--; return 'done'; });
+  const all = await Promise.allSettled(Array.from({ length: 9 }, slow));
+  assert.equal(most, 4, 'the ones that waited did not go ahead beside the four');
+  assert.equal(all.filter((r) => r.status === 'fulfilled').length, 4);
+  assert.ok(all.filter((r) => r.status === 'rejected').every((r) => r.reason.code === 'MAIL_BUSY' && /too much is being asked/.test(r.reason.message)));
+  // the place of one that ends is the next one's: never five
+  now = 0; most = 0;
+  const quick = () => mc.withClient('home', async () => { most = Math.max(most, ++now); await new Promise((r) => setTimeout(r, 5)); now--; });
+  await Promise.all(Array.from({ length: 14 }, quick));
+  assert.equal(most, 4);
+  // four uses that each ask the same account again while they hold their turn: not waiting for themselves
+  const nested = () => mc.withClient('home', async () => { await new Promise((r) => setTimeout(r, 5)); return mc.withClient('home', async () => 'inner'); });
+  assert.deepEqual(await Promise.all(Array.from({ length: 4 }, nested)), ['inner', 'inner', 'inner', 'inner']);
+});
+
 test('a server that takes no more connections is waited for and asked again, when nothing was asked yet; it is no wrong password', async () => {
   const { busyError, authError } = await import('../src/imap.js');
   const full = Object.assign(new Error('Command failed'), { authenticationFailed: true, responseText: 'Too many simultaneous connections. (Failure)' });
