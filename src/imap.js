@@ -215,7 +215,7 @@ export class ImapClient {
 
   async getMessage(id, { bodyType = 'Text' } = {}) {
     const { path, uid } = parseId(id);
-    const { item, parsed } = await this.#fetchParsed(path, uid);
+    const { item, parsed } = await this.#read(path, uid);
     return shaped(item, parsed, bodyType);
   }
 
@@ -320,7 +320,8 @@ export class ImapClient {
 
   async draftReplyAll(id, _changeKey, newBodyText, { all = true, bodyType = 'Text' } = {}) {
     const { path, uid } = parseId(id);
-    const { parsed } = await this.#fetchParsed(path, uid);
+    // (a reply carries none of the attachments: a large message is read without them, but with the pictures its quote shows)
+    const { parsed } = await this.#read(path, uid, { pictures: bodyType === 'HTML' });
     const from = addrs(parsed.from)[0] || {};
     const replyTo = addrs(parsed.replyTo);
     const recipients = (replyTo.length ? replyTo : [from]).concat(all ? addrs(parsed.to) : []).map((a) => a.email).filter(Boolean);
@@ -423,7 +424,7 @@ export class ImapClient {
   async removeAttachment(id, changeKey, attId) {
     const { path, uid } = parseId(changeKey || id);
     const { parsed } = await this.#fetchParsed(path, uid);
-    const at = (parsed.attachments || []).findIndex((x, i) => attachmentId(x, i) === attId || x.filename === attId);
+    const at = (parsed.attachments || []).findIndex((x, i) => isAttachment(x, i, attId) || x.filename === attId);
     if (at < 0) throw new Error(`attachment "${attId}" not found on this draft`);
     const draftId = await this.#rewriteDraft(changeKey || id, (mail) => { mail.attachments.splice(at, 1); });
     return { draftId, changeKey: draftId };
@@ -462,9 +463,12 @@ export class ImapClient {
   async getAttachment(attId, messageId) {
     if (!messageId) throw new Error('getAttachment: the message id is required for IMAP');
     const { path, uid } = parseId(messageId);
+    // one listed by its part (a large message, read part by part): that part alone
+    const byPart = /^p(\d+(?:\.\d+)*)$/.exec(String(attId));
+    if (byPart) return this.#fetchPart(path, uid, byPart[1]);
     const { parsed } = await this.#fetchParsed(path, uid);
     const list = parsed.attachments || [];
-    const a = list.find((x, i) => attachmentId(x, i) === attId) || list.find((x) => x.filename === attId);
+    const a = list.find((x, i) => isAttachment(x, i, attId)) || list.find((x) => x.filename === attId);
     if (!a) throw new Error(`attachment "${attId}" not found on this message`);
     return { name: a.filename || 'attachment', contentType: a.contentType || 'application/octet-stream', contentId: a.cid || undefined, content: a.content };
   }
@@ -536,13 +540,75 @@ export class ImapClient {
 
   // --- internals ------------------------------------------------------------
 
+  /**
+   * A message as #fetchParsed gives it (its list item, and mailparser's reading of it), in one look at the
+   * mailbox. One over LIGHT_OVER is read without the bytes of its attachments: its structure, every part's own
+   * headers and the bodies of its texts are put back together as the message with those bodies left empty, and
+   * that is parsed as the whole would be (the same texts, in the same order; the attachments listed, by part, with
+   * the sizes the server gives; their bytes are #fetchPart's, when asked for). `pictures`: with the bodies of its
+   * inline pictures too, taken into the HTML as the whole parse takes them (a reply's quote).
+   */
+  async #read(path, uid, { pictures = false } = {}) {
+    return this.#inMailbox(path, async (c, mailbox) => {
+      const meta = await c.fetchOne(uid, { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true, threadId: true, size: true, headers: true }, { uid: true });
+      if (!meta) throw new Error('message not found (it may have been moved or deleted)');
+      const item = listItem(path, String(mailbox.uidValidity), meta);
+      // (a part the server would not give: the message is read whole instead)
+      const skeleton = (meta.size || 0) > LIGHT_OVER && Buffer.isBuffer(meta.headers) ? await skeletonOf(c, uid, meta, { pictures }).catch(() => null) : null;
+      if (skeleton) {
+        const parsed = await simpleParser(skeleton.source, { keepCidLinks: !pictures });
+        const single = onePart(meta.bodyStructure);
+        for (const at of parsed.attachments || []) {
+          if (!at.partId && single) at.partId = '1'; // a message that is one attachment
+          const node = skeleton.leaves.get(at.partId);
+          // (what the server gives is the size as sent: base64 is a third more, with a line break every 76 characters)
+          if (node && !skeleton.fetched.has(at.partId)) at.size = node.encoding === 'base64' ? Math.floor(node.size * 3 / 4 * 76 / 78) : node.size;
+        }
+        return { item, parsed };
+      }
+      const whole = await c.fetchOne(uid, { uid: true, source: true }, { uid: true });
+      if (!whole?.source) throw new Error('message not found (it may have been moved or deleted)');
+      const parsed = await simpleParser(whole.source);
+      if (meta.bodyStructure && onePart(meta.bodyStructure)) for (const at of parsed.attachments || []) at.partId ||= '1';
+      return { item, parsed };
+    });
+  }
+
+  /** One part of a message (its number as mailparser gives it), decoded as the whole parse decodes it: { name, contentType, contentId, content }. */
+  async #fetchPart(path, uid, part) {
+    return this.#inMailbox(path, async (c) => {
+      const meta = await c.fetchOne(uid, { uid: true, bodyStructure: true, headers: true }, { uid: true });
+      if (!meta) throw new Error('message not found (it may have been moved or deleted)');
+      const leaves = leavesOf(meta.bodyStructure);
+      if (!meta.bodyStructure || !leaves.has(part)) throw new Error(`attachment "p${part}" not found on this message`);
+      const single = onePart(meta.bodyStructure);
+      const got = await c.fetchOne(uid, { uid: true, bodyParts: single ? [part] : [`${part}.MIME`, part] }, { uid: true });
+      const bodies = partsMap(got);
+      const head = single ? meta.headers : bodies.get(`${part}.mime`);
+      const body = bodies.get(part);
+      if (!Buffer.isBuffer(head) || !Buffer.isBuffer(body)) throw new Error(`attachment "p${part}" not found on this message`);
+      const parsed = await simpleParser(Buffer.concat([withoutEnd(head), Buffer.from('\r\n\r\n'), body]), { keepCidLinks: true });
+      const a = parsed.attachments?.[0];
+      if (a) return { name: a.filename || 'attachment', contentType: a.contentType || 'application/octet-stream', contentId: a.cid || undefined, content: a.content };
+      // a text the parse took for one (named, not said to be an attachment): its text, as shown
+      const node = leaves.get(part);
+      const html = node.type === 'text/html';
+      return { name: node.filename || (html ? 'part.html' : 'part.txt'), contentType: html ? 'text/html' : 'text/plain', contentId: undefined, content: Buffer.from(String((html ? parsed.html : parsed.text) || ''), 'utf8') };
+    });
+  }
+
   async #fetchParsed(path, uid, withSource = false) {
     return this.#inMailbox(path, async (c, mailbox) => {
       const meta = await c.fetchOne(uid, { uid: true, envelope: true, flags: true, bodyStructure: true, internalDate: true, threadId: true }, { uid: true });
       if (!meta) throw new Error('message not found (it may have been moved or deleted)');
-      const { content } = await c.download(uid, undefined, { uid: true });
-      const source = await readAll(content);
+      // whole, in one FETCH: download() asks for it 64 KB a command (a mail with an 8 MB attachment was some 170
+      // round trips, a minute and more, with what else the connection had to do waiting behind it), and with larger
+      // windows it takes a server's shorter answer for the end
+      const whole = await c.fetchOne(uid, { uid: true, source: true }, { uid: true });
+      if (!whole?.source) throw new Error('message not found (it may have been moved or deleted)');
+      const source = whole.source;
       const parsed = await simpleParser(source);
+      if (meta.bodyStructure && onePart(meta.bodyStructure)) for (const at of parsed.attachments || []) at.partId ||= '1'; // (as #read names it)
       const item = listItem(path, String(mailbox.uidValidity), meta);
       return withSource ? { item, parsed, source } : { item, parsed };
     });
@@ -739,8 +805,98 @@ function parseId(id) {
 }
 
 function attachmentId(a, i) {
-  // stable across re-parses of the same source: content checksum, else position
+  // by its part (the same whether the message was read whole or without its attachments); else, stable across
+  // re-parses of the same source: content checksum, else position
+  if (a.partId) return `p${a.partId}`;
   return `${i + 1}-${a.checksum || 'x'}`;
+}
+
+/** Whether an attachment is the one an id names: as attachmentId names it now, or as it named it before (by checksum). */
+function isAttachment(a, i, id) {
+  return attachmentId(a, i) === id || `${i + 1}-${a.checksum || 'x'}` === id;
+}
+
+/** Whether a message is of one part (its root is no multipart: a forwarded message, nested or not, is one). */
+const onePart = (root) => !String(root?.type || 'text/plain').toLowerCase().startsWith('multipart/');
+
+/** The parts of a FETCH's answer by name, in lower case (a server says 1.MIME or 1.mime). */
+function partsMap(got) {
+  const out = new Map();
+  for (const [k, v] of got?.bodyParts || []) out.set(String(k).toLowerCase(), v);
+  return out;
+}
+
+/** A header block without its closing blank line. */
+function withoutEnd(head) {
+  let end = head.length;
+  while (end > 0 && (head[end - 1] === 0x0a || head[end - 1] === 0x0d)) end--;
+  return head.subarray(0, end);
+}
+
+/** A message's leaves (imapflow's bodyStructure), by part: { part, type, size, filename, id }. A forwarded message is one leaf. */
+export function leavesOf(root) {
+  const out = new Map();
+  const walk = (node) => {
+    const type = String(node?.type || 'text/plain').toLowerCase();
+    if (type.startsWith('multipart/') && Array.isArray(node.childNodes)) { for (const child of node.childNodes) walk(child); return; }
+    out.set(node.part || '1', { part: node.part || '1', type, size: Number(node.size) || 0, encoding: String(node.encoding || '').toLowerCase(), filename: node.dispositionParameters?.filename || node.parameters?.name || '', id: typeof node.id === 'string' ? node.id : '' });
+  };
+  if (root) walk(root);
+  return out;
+}
+
+/** The leaves whose bodies a read without attachments still fetches, whatever their size: texts (and the reports a bounce carries); with `pictures`, inline pictures. */
+const keepsBody = (leaf, pictures) => leaf.type.startsWith('text/') || /^message\/(delivery-status|disposition-notification|feedback-report)$/.test(leaf.type)
+  || (pictures && leaf.id && leaf.type.startsWith('image/'));
+
+/**
+ * A message put back together without the bodies of its attachments: its headers, its structure's boundaries,
+ * every part's own headers, the bodies of its texts. { source, leaves, fetched } (fetched: the parts whose
+ * bodies are in), or null when the structure cannot be rebuilt (then it is read whole).
+ */
+export async function skeletonOf(c, uid, meta, { pictures = false } = {}) {
+  const root = meta.bodyStructure;
+  if (!root) return null;
+  const leaves = leavesOf(root);
+  const single = onePart(root);
+  const fetched = new Set([...leaves.values()].filter((l) => keepsBody(l, pictures)).map((l) => l.part));
+  const heads = [];
+  const walk = (node, top) => {
+    const type = String(node?.type || 'text/plain').toLowerCase();
+    if (!top) heads.push(`${node.part}.MIME`);
+    if (type.startsWith('multipart/') && Array.isArray(node.childNodes)) for (const child of node.childNodes) walk(child, false);
+  };
+  if (!single) walk(root, true);
+  const got = await c.fetchOne(uid, { uid: true, bodyParts: [...heads, ...fetched] }, { uid: true });
+  const parts = partsMap(got);
+  const CRLF = Buffer.from('\r\n');
+  const chunks = [];
+  let broken = false;
+  const render = (node, head) => {
+    const type = String(node?.type || 'text/plain').toLowerCase();
+    if (!Buffer.isBuffer(head)) { broken = true; return; }
+    chunks.push(withoutEnd(head), CRLF, CRLF);
+    if (type.startsWith('multipart/') && Array.isArray(node.childNodes)) {
+      const boundary = node.parameters?.boundary;
+      if (!boundary) { broken = true; return; }
+      for (const child of node.childNodes) {
+        chunks.push(Buffer.from(`--${boundary}\r\n`));
+        render(child, parts.get(`${child.part}.mime`));
+        chunks.push(CRLF);
+      }
+      chunks.push(Buffer.from(`--${boundary}--\r\n`));
+      return;
+    }
+    const part = node.part || '1';
+    if (fetched.has(part)) {
+      const body = parts.get(part);
+      if (!Buffer.isBuffer(body)) { broken = true; return; } // a text the structure has and the server did not give
+      chunks.push(body);
+    }
+  };
+  render(root, meta.headers);
+  if (broken) throw new Error('the mail server did not give every part of that message');
+  return { source: Buffer.concat(chunks), leaves, fetched };
 }
 
 function leaf(box) {
@@ -856,11 +1012,5 @@ export function withMessageId(raw, id) {
   return Buffer.concat([Buffer.from(`${lines}${nl}Message-ID: ${id}`, 'latin1'), buf.subarray(end)]);
 }
 
-function readAll(stream) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    stream.on('data', (c) => chunks.push(c));
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-    stream.on('error', reject);
-  });
-}
+/** A message bigger than this is read without the bytes of its attachments (they are fetched when asked for). */
+const LIGHT_OVER = 512 * 1024;
