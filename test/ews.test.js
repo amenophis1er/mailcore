@@ -108,3 +108,39 @@ test('getMessage asks for Reply-To and hands it out', async () => {
   assert.deepEqual(m.replyTo.map((p) => p.email), ['ann@home.example']);
   assert.equal(m.replyTo[0].name, 'Ann at home');
 });
+
+const NS = 'xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"';
+const soap = (inner) => `<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>${inner}</s:Body></s:Envelope>`;
+
+test('a mail attached to a mail is listed as an .eml, and downloaded as a mail of its own; a file as it is', async () => {
+  const listed = stubbed(soap(`<m:GetItemResponse ${NS}><m:ResponseMessages><m:GetItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message>
+    <t:ItemId Id="AAMk1" ChangeKey="CK"/><t:Subject>Run this</t:Subject>
+    <t:Attachments>
+      <t:FileAttachment><t:AttachmentId Id="F1"/><t:Name>results.txt</t:Name><t:ContentType>text/plain</t:ContentType><t:Size>10</t:Size><t:IsInline>false</t:IsInline></t:FileAttachment>
+      <t:ItemAttachment><t:AttachmentId Id="I1"/><t:Name>RE: Buyout_Rates_Update.xlsx</t:Name><t:Size>43000</t:Size><t:IsInline>false</t:IsInline></t:ItemAttachment>
+    </t:Attachments></t:Message></m:Items></m:GetItemResponseMessage></m:ResponseMessages></m:GetItemResponse>`));
+  const got = await listed.attachmentsOf(['AAMk1']);
+  assert.deepEqual(got.get('AAMk1').map((a) => [a.id, a.name, a.contentType, a.mail === true]), [['F1', 'results.txt', 'text/plain', false], ['I1', 'RE: Buyout_Rates_Update.xlsx.eml', 'message/rfc822', true]]);
+
+  const eml = 'From: a@x.org\r\nSubject: RE: Buyout\r\n\r\nSee attached.';
+  const mail = stubbed(soap(`<m:GetAttachmentResponse ${NS}><m:ResponseMessages><m:GetAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments>
+    <t:ItemAttachment><t:AttachmentId Id="I1"/><t:Name>RE: Buyout_Rates_Update.xlsx</t:Name><t:Message><t:MimeContent CharacterSet="UTF-8">${Buffer.from(eml).toString('base64')}</t:MimeContent><t:Subject>RE: Buyout</t:Subject></t:Message></t:ItemAttachment>
+  </m:Attachments></m:GetAttachmentResponseMessage></m:ResponseMessages></m:GetAttachmentResponse>`));
+  const file = await mail.getAttachment('I1');
+  assert.match(mail.sent[0], /<m:AttachmentShape><t:IncludeMimeContent>true<\/t:IncludeMimeContent><\/m:AttachmentShape>\s*<m:AttachmentIds>/);
+  assert.equal(file.name, 'RE: Buyout_Rates_Update.xlsx.eml');
+  assert.equal(file.contentType, 'message/rfc822');
+  assert.equal(file.content.toString(), eml);
+
+  const plain = stubbed(soap(`<m:GetAttachmentResponse ${NS}><m:ResponseMessages><m:GetAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments>
+    <t:FileAttachment><t:AttachmentId Id="F1"/><t:Name>results.txt</t:Name><t:ContentType>text/plain</t:ContentType><t:Content>${Buffer.from('ten bytes!').toString('base64')}</t:Content></t:FileAttachment>
+  </m:Attachments></m:GetAttachmentResponseMessage></m:ResponseMessages></m:GetAttachmentResponse>`));
+  assert.equal((await plain.getAttachment('F1')).content.toString(), 'ten bytes!');
+
+  // an item Exchange does not write out as a mail: said plainly
+  const contact = stubbed(soap(`<m:GetAttachmentResponse ${NS}><m:ResponseMessages><m:GetAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments>
+    <t:ItemAttachment><t:AttachmentId Id="I2"/><t:Name>Someone</t:Name><t:Contact><t:DisplayName>Someone</t:DisplayName></t:Contact></t:ItemAttachment>
+  </m:Attachments></m:GetAttachmentResponseMessage></m:ResponseMessages></m:GetAttachmentResponse>`));
+  await assert.rejects(contact.getAttachment('I2'), /cannot be downloaded/);
+});
+

@@ -25,6 +25,25 @@ export function parseEws(xml) {
   return parser.parse(xml);
 }
 
+/** A mail attached to a mail, named as a file: its subject, and .eml. */
+const mailName = (name) => { const n = String(name || '').trim() || 'Attached mail'; return /\.eml$/i.test(n) ? n : `${n}.eml`; };
+
+/**
+ * The attachments of an item as read from GetItem: files as they are, and the mails attached to it (items, to
+ * Exchange) as .eml files of type message/rfc822 (`mail: true`; getAttachment hands each out as a mail of its own).
+ */
+function attachmentsIn(item) {
+  return ['FileAttachment', 'ItemAttachment'].flatMap((kind) => toArray(dig(item, 'Attachments.' + kind)).map((a) => ({
+    id: a.AttachmentId?.['@Id'] || '',
+    name: kind === 'ItemAttachment' ? mailName(textOf(a.Name)) : textOf(a.Name),
+    size: Number(a.Size) || 0,
+    contentType: kind === 'ItemAttachment' ? 'message/rfc822' : textOf(a.ContentType),
+    contentId: textOf(a.ContentId) || undefined,
+    inline: String(a.IsInline) === 'true',
+    ...(kind === 'ItemAttachment' ? { mail: true } : {})
+  })));
+}
+
 export class EwsClient {
   constructor({ host, username, password, domain = '', email = '' }) {
     this.url = host.replace(/\/$/, '') + '/EWS/Exchange.asmx';
@@ -312,16 +331,7 @@ export class EwsClient {
     const msg = dig(rm, 'Items.Message');
     if (!msg) throw new Error('GetItem: message not found');
     const base = parseListItem(msg);
-    const attachments = ['FileAttachment', 'ItemAttachment']
-      .flatMap((kind) => toArray(dig(msg, 'Attachments.' + kind)))
-      .map((a) => ({
-        id: a.AttachmentId?.['@Id'] || '',
-        name: textOf(a.Name),
-        size: Number(a.Size) || 0,
-        contentType: textOf(a.ContentType),
-        contentId: textOf(a.ContentId) || undefined,
-        inline: String(a.IsInline) === 'true'
-      }));
+    const attachments = attachmentsIn(msg);
     const headers = {};
     const pairs = [];
     for (const h of toArray(dig(msg, 'InternetMessageHeaders.InternetMessageHeader'))) {
@@ -734,33 +744,35 @@ export class EwsClient {
       rms.forEach((rm, k) => {
         if (rm?.['@ResponseClass'] !== 'Success') return;
         const it = dig(rm, 'Items.Message') || dig(rm, 'Items.MeetingRequest') || dig(rm, 'Items.Item') || Object.values(rm?.Items || {})[0];
-        const list = ['FileAttachment', 'ItemAttachment']
-          .flatMap((kind) => toArray(dig(it, 'Attachments.' + kind)))
-          .map((a) => ({
-            id: a.AttachmentId?.['@Id'] || '',
-            name: textOf(a.Name),
-            size: Number(a.Size) || 0,
-            contentType: textOf(a.ContentType),
-            contentId: textOf(a.ContentId) || undefined,
-            inline: String(a.IsInline) === 'true'
-          }));
-        out.set(batch[k], list);
+        out.set(batch[k], attachmentsIn(it));
       });
     }
     return out;
   }
 
-  /** Download one file attachment (id from getMessage().attachments). */
+  /**
+   * Download one attachment (id from getMessage().attachments): a file as it is; a mail attached to the mail (an
+   * item, to Exchange) as a mail of its own, an .eml any mail program opens (its MIME content, asked for with it).
+   */
   async getAttachment(attachmentId) {
     const body = `
       <m:GetAttachment>
+        <m:AttachmentShape><t:IncludeMimeContent>true</t:IncludeMimeContent></m:AttachmentShape>
         <m:AttachmentIds><t:AttachmentId Id="${esc(attachmentId)}"/></m:AttachmentIds>
       </m:GetAttachment>`;
     const json = await this.post(envelope(body));
     const rm = dig(json, 'Envelope.Body.GetAttachmentResponse.ResponseMessages.GetAttachmentResponseMessage');
+    // (an item Exchange cannot write out as a mail: a contact, a task)
+    if (/MimeContentConversionFailed|MimeContentInvalid/i.test(textOf(rm?.ResponseCode))) throw new Error('this attached item cannot be downloaded: Exchange does not hand it out as a file');
     assertSuccess(rm, 'GetAttachment');
     const file = dig(rm, 'Attachments.FileAttachment');
-    if (!file) throw new Error('GetAttachment: not a file attachment (attached mails cannot be downloaded)');
+    if (!file) {
+      const item = dig(rm, 'Attachments.ItemAttachment');
+      const inside = item && Object.values(item).find((v) => v && typeof v === 'object' && v.MimeContent !== undefined);
+      const mime = inside ? String(textOf(inside.MimeContent) || '') : '';
+      if (!mime) throw new Error('this attached item cannot be downloaded: Exchange does not hand it out as a file');
+      return { name: mailName(textOf(item.Name)), contentType: 'message/rfc822', contentId: undefined, content: Buffer.from(mime, 'base64') };
+    }
     return {
       name: textOf(file.Name) || 'attachment',
       contentType: textOf(file.ContentType) || 'application/octet-stream',
