@@ -323,7 +323,7 @@ export interface AwaitingOptions {
 }
 
 export interface Person { name: string; email: string }
-export interface Contact extends Person { emails: string[]; company: string; title: string; phones: string[] }
+export interface Contact extends Person { emails: string[]; company: string; title: string; phones: { kind: string; number: string }[]; id?: string; department?: string; nickname?: string; addresses?: { kind: string; text: string }[]; birthday?: string }
 
 /** What changed in an IMAP folder since `mark` (see ImapClient.changesIn); null where the backend cannot say. */
 export interface FolderMark { path: string; validity: string; next: number; exists: number; modseq: string | null }
@@ -504,7 +504,8 @@ export class AccountClient {
   /** Directory and contacts matching `query` (Exchange); [] elsewhere. */
   resolveNames(query: string): Promise<Person[]>;
   /** The mailbox's own contacts (Exchange); [] elsewhere. */
-  contacts(opts?: { limit?: number }): Promise<Contact[]>;
+  /** `all`: those without an address too (with a name or a phone; `email` '') */
+  contacts(opts?: { limit?: number; all?: boolean }): Promise<Contact[]>;
   updateDraft(opts: UpdateDraftOptions): Promise<DraftResult>;
   addAttachment(id: string, changeKey: string | null | undefined, attachment: NewAttachment): Promise<{ attachmentId: string | null; changeKey: string | null; /** IMAP: the draft, written again under a new id */ draftId?: string }>;
   sendItem(id: string, changeKey?: string | null): Promise<boolean>;
@@ -854,6 +855,22 @@ export interface GoogleContact {
   photo?: string;
   company?: string;
   title?: string;
+  /** the People API's resource name (people/…) */
+  id?: string;
+  /** a saved contact's (never an other contact's): */
+  department?: string;
+  nickname?: string;
+  phones?: { kind: string; number: string }[];
+  addresses?: { kind: string; text: string }[];
+  /** 'YYYY-MM-DD', or '--MM-DD' when the year is not known */
+  birthday?: string;
+  note?: string;
+  urls?: { kind: string; url: string }[];
+  relations?: { kind: string; name: string }[];
+  dates?: { kind: string; date: string }[];
+  /** the account's own groups it is in (contactGroups/…: their names in GoogleContactsResult.groups) */
+  groups?: string[];
+  starred?: true;
 }
 export type GoogleContactsErrorCode = 'GOOGLE_SCOPE' | 'GOOGLE_API_DISABLED' | 'GOOGLE_RATE' | 'GOOGLE_API';
 export interface GoogleContactsResult {
@@ -861,6 +878,8 @@ export interface GoogleContactsResult {
   saved: GoogleContact[] | null;
   /** its "other contacts"; null when they could not be read (see errors) */
   other: GoogleContact[] | null;
+  /** the names of the account's own contact groups, by resource name ({} when none was needed; null when they could not be read) */
+  groups: Record<string, string> | null;
   errors: { list: 'saved' | 'other'; code: GoogleContactsErrorCode | string; status?: number; message: string }[];
 }
 export interface GoogleContactsOptions {
@@ -886,7 +905,7 @@ export interface GoogleContactsOptions {
  * with `errors`). Nothing is kept.
  */
 export function googleContacts(account: string, opts: GoogleContactsOptions): Promise<GoogleContactsResult>;
-/** One person of the People API as a GoogleContact (null without an email address). */
+/** One person of the People API as a GoogleContact (null: an other contact without an email address, a saved one with neither address, name nor phone). */
 export function googleContactOf(person: unknown, kind: 'saved' | 'other'): GoogleContact | null;
 export function jsonFileStore<T = Record<string, unknown>>(file: string, fallback?: () => T): StateStore<T>;
 

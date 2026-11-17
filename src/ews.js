@@ -61,9 +61,11 @@ export class EwsClient {
 
   /**
    * The people of the mailbox's own Contacts folder: [{ name, email, emails, company, title, phones }], at most
-   * `limit` (the folder's first ones, by name). Those with no address are left out.
+   * `limit` (the folder's first ones, by name), with id, department, nickname, addresses [{ kind, text }] and
+   * birthday ('YYYY-MM-DD') when it has them. Those with no address are left out, but with `all` (then kept with a
+   * name or a phone).
    */
-  async contacts({ limit = 500 } = {}) {
+  async contacts({ limit = 500, all: keepAll = false } = {}) {
     // by name, a page at a time, up to `limit`
     const all = [];
     for (let offset = 0; offset < limit; offset += 500) {
@@ -83,8 +85,24 @@ export class EwsClient {
     return all.map((c) => {
       const emails = toArray(c?.EmailAddresses?.Entry).map((e) => textOf(e)).filter((e) => e.includes('@') && !/^\/o=/i.test(e));
       const phones = toArray(c?.PhoneNumbers?.Entry).map((p) => ({ kind: String(p?.['@Key'] || ''), number: textOf(p) })).filter((p) => p.number);
-      return { name: textOf(c?.DisplayName) || textOf(c?.CompleteName?.FullName), email: emails[0] || '', emails, company: textOf(c?.CompanyName), title: textOf(c?.JobTitle), phones };
-    }).filter((c) => c.email);
+      const out = { name: textOf(c?.DisplayName) || textOf(c?.CompleteName?.FullName), email: emails[0] || '', emails, company: textOf(c?.CompanyName), title: textOf(c?.JobTitle), phones };
+      const id = c?.ItemId?.['@Id'];
+      if (typeof id === 'string' && id) out.id = id;
+      if (textOf(c?.Department)) out.department = textOf(c.Department);
+      if (textOf(c?.Nickname)) out.nickname = textOf(c.Nickname);
+      const addresses = toArray(c?.PhysicalAddresses?.Entry).map((a) => ({
+        kind: String(a?.['@Key'] || ''),
+        text: [textOf(a?.Street), [textOf(a?.PostalCode), textOf(a?.City)].filter(Boolean).join(' '), textOf(a?.State), textOf(a?.CountryOrRegion)].filter(Boolean).join('\n')
+      })).filter((a) => a.text);
+      if (addresses.length) out.addresses = addresses;
+      // a day kept as the mailbox's midnight, in UTC: the nearest midnight is that day (east of UTC it reads as the evening before)
+      const at = Date.parse(textOf(c?.Birthday));
+      if (Number.isFinite(at)) {
+        const day = new Date(Math.round(at / 86400e3) * 86400e3).toISOString().slice(0, 10);
+        if (!/^(1601|4501)-/.test(day)) out.birthday = day;
+      }
+      return out;
+    }).filter((c) => c.email || (keepAll && (c.name || c.phones.length)));
   }
 
   post(xml) {

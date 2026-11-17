@@ -48,7 +48,7 @@ test('both lists are read, every page, with the fields asked for and the account
   assert.deepEqual(r.other, [{ name: '', email: 'carol@c.example', emails: ['carol@c.example'], kind: 'other' }]);
   const saved = api.asked.filter((a) => a.url.pathname.endsWith('/connections'));
   assert.equal(saved.length, 2);
-  assert.equal(saved[0].url.searchParams.get('personFields'), 'names,emailAddresses,photos,organizations');
+  assert.equal(saved[0].url.searchParams.get('personFields'), 'names,nicknames,emailAddresses,phoneNumbers,addresses,organizations,biographies,birthdays,urls,relations,events,memberships,photos');
   assert.equal(saved[0].url.searchParams.get('pageSize'), '1000');
   assert.equal(saved[1].url.searchParams.get('pageToken'), '1');
   const other = api.asked.find((a) => a.url.pathname === '/v1/otherContacts');
@@ -67,7 +67,37 @@ test('a photo someone chose is kept; Google\'s placeholder and a non-https addre
   assert.equal(googleContactOf(p, 'saved').photo, 'https://lh3.googleusercontent.com/a/real');
   // a name that is only the address is no name
   assert.equal(googleContactOf(person('a@x.example', ['a@x.example']), 'saved').name, '');
-  assert.equal(googleContactOf({ names: [{ displayName: 'X' }] }, 'saved'), null);
+  // without an address: an other contact is nobody; a saved one is kept for its name or its phone
+  assert.equal(googleContactOf({ names: [{ displayName: 'X' }] }, 'other'), null);
+  assert.equal(googleContactOf({}, 'saved'), null);
+  assert.deepEqual(googleContactOf({ phoneNumbers: [{ value: '+1 555 0100' }] }, 'saved'), { name: '', email: '', emails: [], kind: 'saved', phones: [{ kind: '', number: '+1 555 0100' }] });
+});
+
+test('a saved contact comes with what Google has of it: phones, addresses, birthday, note, links, relations, dates, groups, a star', () => {
+  const c = googleContactOf({
+    resourceName: 'people/c42',
+    names: [{ displayName: 'Jo Doe' }], nicknames: [{ value: 'Jojo' }],
+    emailAddresses: [{ value: 'jo@x.example' }],
+    phoneNumbers: [{ value: '+1 555 0100', formattedType: 'Mobile' }, { value: '' }],
+    addresses: [{ formattedValue: '1 Main St\r\nTown', formattedType: 'Home' }, { streetAddress: '2 Side Rd', city: 'Lomé', postalCode: 'BP 1', country: 'Togo', type: 'work' }],
+    organizations: [{ name: 'Acme', title: 'CTO', department: 'R&D' }],
+    birthdays: [{ date: { year: 1990, month: 2, day: 9 } }],
+    biographies: [{ value: 'Met in Accra.\r\nLikes tea.' }],
+    urls: [{ value: 'https://jo.example', type: 'homePage' }, { value: 'javascript:alert(1)' }],
+    relations: [{ person: 'Sam', formattedType: 'Spouse' }],
+    events: [{ date: { month: 6, day: 1 }, formattedType: 'Anniversary' }, { date: { month: 13, day: 1 } }],
+    memberships: [{ contactGroupMembership: { contactGroupResourceName: 'contactGroups/starred' } }, { contactGroupMembership: { contactGroupResourceName: 'contactGroups/myContacts' } }, { contactGroupMembership: { contactGroupResourceName: 'contactGroups/1a2b' } }]
+  }, 'saved');
+  assert.deepEqual(c, {
+    name: 'Jo Doe', email: 'jo@x.example', emails: ['jo@x.example'], kind: 'saved', id: 'people/c42', company: 'Acme', title: 'CTO', department: 'R&D', nickname: 'Jojo',
+    phones: [{ kind: 'Mobile', number: '+1 555 0100' }],
+    addresses: [{ kind: 'Home', text: '1 Main St\nTown' }, { kind: 'work', text: '2 Side Rd\nBP 1 Lomé\nTogo' }],
+    birthday: '1990-02-09', note: 'Met in Accra.\nLikes tea.', urls: [{ kind: 'homePage', url: 'https://jo.example' }],
+    relations: [{ kind: 'Spouse', name: 'Sam' }], dates: [{ kind: 'Anniversary', date: '--06-01' }],
+    starred: true, groups: ['contactGroups/1a2b']
+  });
+  // an other contact: what it is, never more
+  assert.deepEqual(Object.keys(googleContactOf({ emailAddresses: [{ value: 'o@x.example' }], phoneNumbers: [{ value: '1' }] }, 'other')).sort(), ['email', 'emails', 'kind', 'name']);
 });
 
 test('a list Google refuses is null with its reason; the other one is still read', async () => {
@@ -127,3 +157,24 @@ test('the instance reads them over its own tokens (renewed when near expiry, as 
   assert.deepEqual(r.other, []);
   assert.deepEqual(auth, ['Bearer stored', 'Bearer stored']);
 });
+
+test('the groups\' names come after the contacts, every page of them; failing, they are null (the caller keeps its own), the sign-in refused, it throws', async () => {
+  const member = (g) => ({ names: [{ displayName: 'G' }], emailAddresses: [{ value: 'g@x.example' }], memberships: [{ contactGroupMembership: { contactGroupResourceName: g } }] });
+  const run = (groups) => {
+    const asked = [];
+    const fetch = async (url) => {
+      const u = new URL(String(url));
+      asked.push(u.pathname);
+      if (u.pathname.endsWith('/connections')) return new Response(JSON.stringify({ connections: [member('contactGroups/a'), member('contactGroups/b')] }), { status: 200 });
+      return groups(u);
+    };
+    return googleContacts('acct', { accessToken: async () => 'tok', lists: ['saved'], fetch }).then((r) => ({ r, asked }));
+  };
+  const page = (u) => (u.searchParams.get('pageToken') === '2'
+    ? new Response(JSON.stringify({ contactGroups: [{ resourceName: 'contactGroups/b', formattedName: 'B', groupType: 'USER_CONTACT_GROUP' }] }), { status: 200 })
+    : new Response(JSON.stringify({ contactGroups: [{ resourceName: 'contactGroups/a', formattedName: 'A', groupType: 'USER_CONTACT_GROUP' }], nextPageToken: '2' }), { status: 200 }));
+  assert.deepEqual((await run(page)).r.groups, { 'contactGroups/a': 'A', 'contactGroups/b': 'B' });
+  assert.equal((await run(() => new Response('{}', { status: 500 }))).r.groups, null);
+  await assert.rejects(run(() => new Response('{}', { status: 401 })), (e) => e.code === 'MAIL_AUTH');
+});
+
