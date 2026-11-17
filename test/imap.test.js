@@ -341,3 +341,27 @@ test('a large text body is read whatever its size; a forwarded message as the wh
   assert.match((await one.c.getAttachment('p1', 'INBOX/999/2')).content.toString(), /Inner text/);
 });
 
+
+test('a client taken again after a use before selects its folder anew, once: what arrived since is known', async () => {
+  const c = new ImapClient(ACCT, { username: 'me', password: 'x' });
+  const did = [];
+  const conn = {
+    usable: true,
+    mailbox: { path: 'INBOX', uidValidity: 999n },
+    async getMailboxLock(path) { did.push(`lock ${path}`); if (conn.mailbox?.path !== path) { did.push(`select ${path}`); conn.mailbox = { path, uidValidity: 999n }; } return { release() {} }; },
+    async mailboxOpen(path) { did.push(`select ${path}`); },
+    async fetchOne() { did.push('fetch'); return { uid: 7 }; },
+    async messageFlagsAdd() { did.push('store'); return true; }
+  };
+  c.client = conn;
+  c.folderMap = { inbox: 'INBOX', sent: 'Sent' };
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'fetch', 'store'], 'the folder it has selected: used as it is');
+  did.length = 0;
+  c.again();
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'select INBOX', 'fetch', 'store'], 'taken again: selected anew first');
+  did.length = 0;
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'fetch', 'store'], 'once');
+});

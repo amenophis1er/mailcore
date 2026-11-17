@@ -45,13 +45,25 @@ export function imapOptions(acct, creds) {
   };
 }
 
+/**
+ * The server will take no more connections for this account just now (Gmail allows fifteen at once, counting every
+ * app and device signed in to it): said at sign-in, where a wrong password is said too, and not to be taken for one.
+ */
+export function busyError(e) {
+  return !!e && /too many simultaneous connections|too many connections|connection limit|\[(?:UNAVAILABLE|LIMIT|INUSE)\]/i.test(String(e.responseText || e.message || ''));
+}
+
 export function authError(e) {
+  if (busyError(e)) return false;
   return !!e && (e.authenticationFailed === true || e.code === 'MAIL_AUTH' || e.code === 'EAUTH' ||
     /AUTHENTICATIONFAILED|Invalid credentials|LOGIN failed/i.test(String(e.responseText || e.message || '')));
 }
 
 function tagAuth(e) {
-  if (authError(e)) e.code = 'MAIL_AUTH';
+  if (busyError(e)) {
+    e.code = 'MAIL_BUSY';
+    e.message = `the mail server takes no more connections for this account just now (${String(e.responseText || e.message).replace(/\s*\(Failure\)\s*$/, '').trim()}): other apps and devices signed in to it count too. Try again in a moment`;
+  } else if (authError(e)) e.code = 'MAIL_AUTH';
   return e;
 }
 
@@ -81,10 +93,30 @@ export class ImapClient {
     try {
       await c.connect();
     } catch (e) {
-      throw tagAuth(e);
+      const said = tagAuth(e);
+      // (refused before anything was asked on this client: whoever holds it may wait and ask again from the start)
+      if (said.code === 'MAIL_BUSY' && !this.connected) said.unstarted = true;
+      throw said;
     }
+    this.connected = true;
     this.client = c;
     return c;
+  }
+
+  /** Kept from a use before, and taken for another (Mailcore.keepClients): the folder its connection has selected is selected anew at its first use (#inMailbox). */
+  again() { this.resync = true; }
+
+  /**
+   * Whether the connection kept still answers: a NOOP, waited for `ms` (a connection the network dropped looks
+   * usable, and its next command would wait for minutes). The server also says with it what arrived meanwhile.
+   * true when there is none, or one known to be gone: the next use makes one.
+   */
+  async ping(ms = 3000) {
+    const c = this.client;
+    if (!c || !c.usable) return true;
+    let timer;
+    const late = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('no answer')), ms); });
+    try { await Promise.race([c.noop(), late]); return true; } catch { return false; } finally { clearTimeout(timer); }
   }
 
   /**
@@ -123,8 +155,14 @@ export class ImapClient {
       if (c.mailbox && c.mailbox.readOnly && Date.now() - (this.openedAt || 0) > 1500) await c.mailboxClose();
       if (!c.mailbox) this.openedAt = Date.now();
     }
+    // Taken again after a use before (again()), with this very folder still selected: selected anew, once, so that what
+    // arrived or left since is known here (a session sees its folder as it was until told, and Gmail tells late; the
+    // lock alone selects nothing when the folder is the one selected). Any other folder is selected now anyway.
+    const stale = !this.watcher && this.resync === true && !!c.mailbox && c.mailbox.path === path;
+    this.resync = false;
     const lock = await c.getMailboxLock(path, this.watcher ? { readOnly: true } : undefined);
     try {
+      if (stale) await c.mailboxOpen(path);
       return await fn(c, c.mailbox);
     } finally {
       lock.release();
@@ -164,6 +202,7 @@ export class ImapClient {
       if (opts.flaggedOnly) query.flagged = true; // Gmail's star
       if (opts.senderContains) query.from = opts.senderContains;
       if (opts.subjectContains) query.subject = opts.subjectContains;
+      if (opts.threadId) query.threadId = String(opts.threadId); // the server's own thread (Gmail's X-GM-THRID, THREADID): see findThread
       if (opts.sinceIso) query.since = new Date(opts.sinceIso);
       if (opts.untilIso) query.before = new Date(new Date(opts.untilIso).getTime() + 86400e3); // BEFORE is exclusive, by day
       if (opts.fromMe) query.from = await this.selfEmail();
@@ -211,6 +250,21 @@ export class ImapClient {
       const filtered = opts.hasAttachments ? items.filter((i) => i.hasAttachments) : items;
       return filtered.slice(0, max);
     });
+  }
+
+  /**
+   * The messages of one thread of the server's own keeping, in a folder: by its thread id (what a message's
+   * conversationId is: Gmail's X-GM-THRID, or THREADID where the server has OBJECTID), which the server looks up
+   * at once, where a search by subject reads through months of mail. null where the server keeps no thread ids
+   * to search by: the caller searches as it did.
+   */
+  async findThread({ folder, threadId, limit = 100 } = {}) {
+    if (!threadId) return null;
+    try { return await this.findInbox({ folder, threadId, limit }); } catch (e) {
+      // (no thread ids to search by, or the server refused this search: by subject, as before)
+      if (e?.code === 'MissingServerExtension' || /THREADID|refused the search/.test(String(e?.message))) return null;
+      throw e;
+    }
   }
 
   async getMessage(id, { bodyType = 'Text' } = {}) {

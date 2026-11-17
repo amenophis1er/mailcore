@@ -357,12 +357,15 @@ export function awaitingApi(core) {
     // every account and folder at once: each search is a round trip (a login, on IMAP)
     await Promise.all(names.flatMap((name) => ['inbox', 'sent'].map(async (folder) => {
       try {
-        // live, inbox too: cached rows may predate the server's thread id (IMAP)
-        const items = await withAuthRetry((c) => c.findInbox({ folder, subjectContains: normalized, sinceIso, limit: 100, live: true }), null, name);
+        // The server's own thread, where it keeps one and can be asked by it (Gmail): looked up at once, whatever its
+        // age. Else by subject (live, inbox too: cached rows may predate the server's thread id): months of mail read through.
+        const byThread = seed?.conversationId ? await withAuthRetry((c) => (typeof c.findThread === 'function' ? c.findThread({ folder, threadId: seed.conversationId, limit: 100 }) : null), null, name) : null;
+        const items = byThread ?? await withAuthRetry((c) => c.findInbox({ folder, subjectContains: normalized, sinceIso, limit: 100, live: true }), null, name);
         found.push(...items.map((m) => ({ ...m, folder })));
       } catch (e) { onError?.(name, e); }
     })));
-    let items = found.filter((m) => normalizeSubject(m.subject) === normalized);
+    // (what the server's own thread holds is its thread, whatever a message of it is titled)
+    let items = found.filter((m) => normalizeSubject(m.subject) === normalized || (!!seed?.conversationId && m.conversationId === seed.conversationId));
     if (seed) {
       // a cached copy from before the server's thread id was kept: the search found the message too
       if (!seed.conversationId) seed.conversationId = items.find((m) => m.id === seed.id)?.conversationId || '';

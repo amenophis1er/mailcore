@@ -256,3 +256,144 @@ test('searchTerms: the words of a search box, a quoted phrase as one', async () 
   assert.deepEqual(searchTerms('Smith & Co - march'), ['Smith', 'Co', 'march']);
   assert.equal(searchTerms('- " 🙂'), undefined);
 });
+
+test('keepClients: an IMAP client is kept after a use that went well and taken by the next; never after a failure, never for Exchange, closed when unused or told to', async () => {
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: noCreds });
+  let made = 0;
+  const closed = [];
+  mc.client = async (name) => { const n = ++made; return { n, name, close: async () => { closed.push(n); } }; };
+  // not kept unless asked: each use makes its own, and closes it
+  assert.equal(await mc.withClient('home', (c) => c.n), 1);
+  assert.deepEqual(closed, [1]);
+  mc.keepClients({ ms: 80, max: 2 });
+  assert.equal(await mc.withClient('home', (c) => c.n), 2);
+  assert.equal(await mc.withClient('home', (c) => c.n), 2, 'the same client again');
+  assert.equal(await mc.withClient('home:INBOX/1/7', (c) => c.n), 2, 'by an id of the account, too');
+  assert.deepEqual(closed, [1]);
+  // at once, each use has its own: the kept one, and one made
+  const both = await Promise.all([mc.withClient('home', async (c) => { await new Promise((r) => setTimeout(r, 10)); return c.n; }), mc.withClient('home', (c) => c.n)]);
+  assert.deepEqual(both.sort(), [2, 3]);
+  // a use that fails: its client is closed, not kept
+  await assert.rejects(mc.withClient('home', (c) => { throw new Error(`broke ${c.n}`); }), /broke/);
+  assert.equal(closed.length, 2);
+  // Exchange: never kept
+  const before = made;
+  await mc.withClient('work', (c) => c.n);
+  await mc.withClient('work', (c) => c.n);
+  assert.equal(made, before + 2);
+  // unused for a while: closed
+  const kept = await mc.withClient('home', (c) => c.n);
+  await new Promise((r) => setTimeout(r, 160));
+  assert.ok(closed.includes(kept));
+  assert.notEqual(await mc.withClient('home', (c) => c.n), kept);
+  // told to close: none is left, and the next use makes one
+  await mc.closeClients();
+  const after = made;
+  await mc.withClient('home', (c) => c.n);
+  assert.equal(made, after + 1);
+  await mc.closeClients();
+});
+
+test('keepClients: an auth failure lets go of what was kept for the account before signing in again', async () => {
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: noCreds });
+  let made = 0;
+  const closed = [];
+  mc.client = async () => { const n = ++made; return { n, close: async () => { closed.push(n); } }; };
+  mc.keepClients({ ms: 5000 });
+  await mc.withClient('home', (c) => c.n); // 1, kept
+  let tries = 0;
+  const out = await mc.withClient('home', (c) => { if (tries++ === 0) throw Object.assign(new Error('refused'), { code: 'MAIL_AUTH' }); return c.n; });
+  assert.equal(out, 2, 'a client signed in anew');
+  assert.ok(closed.includes(1));
+  await mc.closeClients();
+});
+
+test('keepClients: let go of during a use, a client is not kept after it; nor one of an account set up otherwise since; one that no longer answers is not used', async () => {
+  let accounts = structuredClone(ACCOUNTS);
+  const mc = createMailcore({ accounts: () => accounts, credentials: noCreds });
+  let made = 0;
+  const closed = [];
+  const answers = new Map();
+  mc.client = async () => { const n = ++made; return { n, ping: async () => answers.get(n) !== false, close: async () => { closed.push(n); } }; };
+  mc.keepClients({ ms: 5000, probeMs: 20 });
+  // closed for the account while one of its clients is in use: that one is closed as it comes back
+  assert.equal(await mc.withClient('home', async (c) => { await mc.closeClients('home'); return c.n; }), 1);
+  assert.deepEqual(closed, [1]);
+  assert.equal(await mc.withClient('home', (c) => c.n), 2);
+  // everyone's closed during a use: the same
+  await mc.withClient('home', async () => { await mc.closeClients(); });
+  assert.ok(closed.includes(2));
+  // the account set up otherwise (its calendar, here): what was kept for it as it was is not taken
+  assert.equal(await mc.withClient('home', (c) => c.n), 3);
+  accounts = { ...accounts, home: { ...accounts.home, displayName: 'Another Name' } };
+  assert.equal(await mc.withClient('home', (c) => c.n), 4);
+  // changed during a use: not kept
+  await mc.withClient('home', async () => { accounts = { ...accounts, home: { ...accounts.home, displayName: 'A Third' } }; });
+  assert.ok(closed.includes(4));
+  // unused for a while, it is asked whether it answers: one that does not is closed, and another made
+  const kept = await mc.withClient('home', (c) => c.n);
+  await new Promise((r) => setTimeout(r, 40));
+  answers.set(kept, false);
+  assert.notEqual(await mc.withClient('home', (c) => c.n), kept);
+  assert.ok(closed.includes(kept));
+  // one that does is used
+  const next = await mc.withClient('home', (c) => c.n);
+  await new Promise((r) => setTimeout(r, 40));
+  assert.equal(await mc.withClient('home', (c) => c.n), next);
+  await mc.closeClients();
+});
+
+
+test('an IMAP account is asked by a few at a time: what else there is to ask waits its turn', async () => {
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: noCreds });
+  mc.client = async () => ({ close: async () => {} });
+  let now = 0;
+  let most = 0;
+  const use = () => mc.withClient('home', async () => { most = Math.max(most, ++now); await new Promise((r) => setTimeout(r, 20)); now--; });
+  await Promise.all(Array.from({ length: 11 }, use));
+  assert.equal(most, 4);
+  // Exchange holds no connection: all at once
+  now = 0; most = 0;
+  await Promise.all(Array.from({ length: 7 }, () => mc.withClient('work', async () => { most = Math.max(most, ++now); await new Promise((r) => setTimeout(r, 10)); now--; })));
+  assert.equal(most, 7);
+});
+
+test('a server that takes no more connections is waited for and asked again, when nothing was asked yet; it is no wrong password', async () => {
+  const { busyError, authError } = await import('../src/imap.js');
+  const full = Object.assign(new Error('Command failed'), { authenticationFailed: true, responseText: 'Too many simultaneous connections. (Failure)' });
+  assert.equal(busyError(full), true);
+  assert.equal(authError(full), false, 'not a sign-in that failed');
+  assert.equal(authError(Object.assign(new Error('Command failed'), { authenticationFailed: true, responseText: 'Invalid credentials (Failure)' })), true);
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: noCreds });
+  let made = 0;
+  const closed = [];
+  mc.client = async () => { const n = ++made; return { n, close: async () => { closed.push(n); } }; };
+  let asked = 0;
+  const started = Date.now();
+  const out = await mc.withClient('home', async (c) => { if (asked++ === 0) throw Object.assign(new Error('full'), { code: 'MAIL_BUSY', unstarted: true }); return c.n; });
+  assert.equal(out, 2, 'asked again, with another client');
+  assert.deepEqual(closed, [1, 2]);
+  assert.ok(Date.now() - started >= 900, 'after a wait');
+  // refused once something was asked: not asked again (what was done would be done twice)
+  asked = 0;
+  await assert.rejects(mc.withClient('home', async () => { asked++; throw Object.assign(new Error('full'), { code: 'MAIL_BUSY' }); }), /full/);
+  assert.equal(asked, 1);
+});
+
+test('keepClients: a client is told when it is put by and when it is taken again; one made with the password asked anew is not kept', async () => {
+  const mc = createMailcore({ accounts: ACCOUNTS, credentials: noCreds });
+  let made = 0;
+  const said = [];
+  mc.client = async (_name, { refresh } = {}) => { const n = ++made; return { n, refresh, rest: () => said.push(`rest ${n}`), again: () => said.push(`again ${n}`), close: async () => said.push(`close ${n}`) }; };
+  mc.keepClients({ ms: 5000 });
+  await mc.withClient('home', (c) => c.n);
+  await mc.withClient('home', (c) => c.n);
+  assert.deepEqual(said, ['rest 1', 'again 1', 'rest 1']);
+  // refused twice, then signed in with the password asked for anew: that client is closed after its use
+  said.length = 0;
+  let tries = 0;
+  const out = await mc.withClient('home', (c) => { if (tries++ < 2) throw Object.assign(new Error('refused'), { code: 'MAIL_AUTH' }); return c.refresh; });
+  assert.equal(out, true);
+  assert.equal(said.at(-1), `close ${made}`);
+  await mc.closeClients();
+});

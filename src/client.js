@@ -105,6 +105,7 @@ export class AccountClient {
     this.hasMail = !!backend;
     this.backend = backend ? backend : new Proxy({}, { get: (_, prop) => { if (prop === 'then' || prop === 'close' || typeof prop === 'symbol') return undefined; return () => { throw Object.assign(new Error(`account "${name}" holds no mail (calendar only)`), { code: 'NO_MAIL' }); }; } });
     this._calendarFactory = typeof calendar === 'function' ? calendar : () => calendar;
+    this._calendarLazy = typeof calendar === 'function';
     this._calendar = typeof calendar === 'function' ? undefined : calendar;
   }
   #in(id) {
@@ -130,6 +131,22 @@ export class AccountClient {
     return out;
   }
   async findInbox(opts) { return (await this.backend.findInbox(opts)).map((i) => this.#item(i)); }
+  /**
+   * Kept between two uses (Mailcore.keepClients). `rest`: as it is put by: its calendar backend, built for the use
+   * that ends, is let go (it remembers the calendars it found: the next use finds them again). `again`: as it is
+   * taken for another use: what its connection had selected is selected anew (see ImapClient.again).
+   */
+  rest() {
+    if (!this._calendarLazy || !this._calendar) return;
+    const cal = this._calendar;
+    this._calendar = undefined;
+    if (cal !== this.backend) Promise.resolve().then(() => cal.close?.()).catch(() => {});
+  }
+  again() { this.backend?.again?.(); }
+  /** Whether a connection kept still answers (see ImapClient.ping); true where the backend keeps none. */
+  async ping(ms) { return typeof this.backend.ping === 'function' ? this.backend.ping(ms) : true; }
+  /** The messages of one of the server's own threads in a folder (IMAP with thread ids; see ImapClient.findThread); null where the backend cannot search by it. */
+  async findThread(o) { const got = typeof this.backend.findThread === 'function' ? await this.backend.findThread(o) : null; return got && got.map((i) => this.#item(i)); }
   async getMessage(id, o) { return this.#item(await this.backend.getMessage(this.#in(id), o)); }
   /** What changed in a folder since a mark (IMAP; see ImapClient.changesIn): ids prefixed; null where the backend cannot say. */
   async changesIn(folder, o) {

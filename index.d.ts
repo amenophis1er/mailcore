@@ -727,6 +727,14 @@ export class Mailcore {
   /** fn(client) with one same-credential retry and one refresh retry on auth failure; account may be a prefixed id. */
   withClient<T>(account: string | undefined, fn: (client: AccountClient) => Promise<T> | T, opts?: { onRefresh?: (error: Error) => void }): Promise<T>;
   withAuthRetry<T>(fn: (client: AccountClient) => Promise<T> | T, onRefresh: ((error: Error) => void) | null | undefined, account?: string): Promise<T>;
+  /**
+   * Keep IMAP clients between uses (a process that stays up: signing in takes a second or two each time): for `ms`
+   * unused (default two minutes), at most `max` per account (default 3). Kept connections hold the process up
+   * until closeClients().
+   */
+  keepClients(opts?: { ms?: number; max?: number; /** unused for longer than this, a kept client is asked whether it still answers before it is used (default 15 s) */ probeMs?: number }): void;
+  /** Close the clients kept (all, or one account's). */
+  closeClients(name?: string): Promise<void>;
   stream(name: string, hooks?: {
     /** how: 'told' by the server's push, or 'asked' (IMAP's own look); from: IMAP, the first new UID when known. */
     onNewMail?: (how?: 'told' | 'asked', from?: number | null) => void;

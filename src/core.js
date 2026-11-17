@@ -19,6 +19,19 @@ export { htmlToText };
 const val = (x) => (typeof x === 'function' ? x() : x);
 const emptyState = () => ({ seenIds: [], baselined: false });
 
+/** How many connections to one IMAP account this process holds at a time (see Mailcore.withClient). */
+const MAX_AT_ONCE = 4;
+/** How long a use waits for its turn before going ahead without one. */
+const TURN_WAIT_MS = 20_000;
+/** A connection the server refused for want of room: asked again after these waits (ms), then given up. */
+const BUSY_WAITS = [1000, 2500, 5000];
+/** A kept IMAP client (see Mailcore.keepClients): unused for longer than this, it is asked whether it still answers before it is used. */
+const PROBE_MS = 15_000;
+/** How long that answer is waited for. */
+const PROBE_WAIT_MS = 3_000;
+/** And it is not kept longer than this after it signed in, however much it is used (a password changed since is then asked for again). */
+const LIFE_MS = 15 * 60_000;
+
 export class Mailcore {
   /**
    * @param {object} o
@@ -138,13 +151,46 @@ export class Mailcore {
   async withClient(account, fn, { onRefresh } = {}) {
     const name = account && splitId(account).account ? splitId(account).account : account;
     const attempt = async (refresh) => {
-      const c = await this.client(name, { refresh });
-      try { return await fn(c); } finally { try { await c.close(); } catch {} }
+      // One IMAP account takes only so many connections at once (Gmail: fifteen, every app and device counted): a
+      // process holds a few at a time, and what else it has to ask waits its turn.
+      const release = await this.#turn(name);
+      try {
+        for (let tries = 0; ; tries++) {
+          // (a client kept from a use a moment ago, where clients are kept: its connection is there already)
+          const key = this.#keptKey(name);
+          const gen = key ? this.#keptGen(key) : '';
+          let lease = !refresh && key ? await this.#takeKept(key) : null;
+          if (lease) { try { lease.c.again?.(); } catch { /* as it is */ } }
+          const c = lease?.c ?? await this.client(name, { refresh });
+          lease ??= { c, born: Date.now() };
+          let done = false;
+          try {
+            const out = await fn(c);
+            done = true;
+            return out;
+          } catch (e) {
+            // the server would take no more connections, and nothing was asked yet: waited for, and asked again from the
+            // start (a kept client may have come back meanwhile, or another app let one go)
+            if (!(e?.code === 'MAIL_BUSY' && e.unstarted && tries < BUSY_WAITS.length)) throw e;
+            await new Promise((r) => setTimeout(r, BUSY_WAITS[tries]));
+          } finally {
+            // Kept for the next use only after one that went well (one that failed may have left its connection anywhere),
+            // and only as the account still is: not when it was let go of meanwhile (signed in again, its clients closed),
+            // nor when its settings changed during the use.
+            // Nor one made with the password asked for anew (what it builds later would ask for it anew again).
+            const still = done && !refresh && key && this.#keptKey(name) === key && this.#keptGen(key) === gen;
+            if (!(still && this.#keep(key, lease))) { try { await c.close(); } catch {} }
+          }
+        }
+      } finally {
+        release();
+      }
     };
     try {
       return await attempt(false);
     } catch (e) {
       if (!isAuthError(e)) throw e;
+      await this.closeClients(this.#nameOf(name)); // (signed in with what is refused now)
       try {
         return await attempt(false);
       } catch (e2) {
@@ -153,6 +199,130 @@ export class Mailcore {
         return await attempt(true);
       }
     }
+  }
+
+  // --- a few at a time ------------------------------------------------------------------
+
+  #turns = new Map(); // account name → { busy, waiting: [fn] }
+
+  /**
+   * A turn at an IMAP account's connections (MAX_AT_ONCE of them at a time in this process); settles with what gives
+   * it back. A turn not had within TURN_WAIT_MS is taken all the same: a use that waits for another use of the same
+   * account, itself waiting, must not wait for ever.
+   */
+  async #turn(name) {
+    let acct = null;
+    try { acct = this.account(name); } catch { /* said where the client is made */ }
+    if (acct?.provider !== 'imap') return () => {};
+    const t = this.#turns.get(acct.name) ?? { busy: 0, waiting: [] };
+    this.#turns.set(acct.name, t);
+    if (t.busy >= MAX_AT_ONCE) {
+      await new Promise((go) => {
+        const timer = setTimeout(() => { const at = t.waiting.indexOf(mine); if (at >= 0) t.waiting.splice(at, 1); go(); }, TURN_WAIT_MS);
+        timer.unref?.();
+        const mine = () => { clearTimeout(timer); go(); };
+        t.waiting.push(mine);
+      });
+    }
+    t.busy++;
+    let given = false;
+    return () => {
+      if (given) return;
+      given = true;
+      t.busy--;
+      t.waiting.shift()?.();
+    };
+  }
+
+  // --- clients kept between uses ----------------------------------------------------
+  //
+  // Signing in to an IMAP server takes a second or two (Gmail), and withClient signs in for each use. A process that
+  // stays up (a server answering a person's clicks) may keep the clients it used a moment ago instead: keepClients().
+  // IMAP only (an Exchange client holds no connection). A client is kept after a use that went well, for `ms`
+  // without another use and LIFE_MS at most since it signed in, `max` of them per account; taken again by the next
+  // use (one at a time: concurrent uses each have their own, made as before when none is kept). One unused for
+  // more than PROBE_MS is asked first whether it still answers (a connection the network dropped looks alive, and
+  // would hold the next use up for minutes): not answering within PROBE_WAIT_MS, it is let go and another is made.
+  // They are filed under the account as it is set up: changed in any way, the old ones are not taken, and closed.
+  // Not for a process that should end when its work is done: kept connections hold it up until closeClients().
+
+  #keptFor = 0;
+  #keptMax = 0;
+  #kept = new Map(); // key (the account as it is set up now) → [{ c, born, at, timer }]
+  #gens = new Map(); // account name → how many times its clients were let go of
+  #genAll = 0; // and how many times everyone's were
+  #probeMs = PROBE_MS;
+
+  /** Keep IMAP clients between uses: for `ms` unused (default two minutes), at most `max` per account (default 3). */
+  keepClients({ ms = 120_000, max = 3, probeMs = PROBE_MS } = {}) {
+    this.#probeMs = Math.max(0, Number(probeMs) || 0);
+    this.#keptFor = Math.max(0, Number(ms) || 0);
+    this.#keptMax = Math.max(0, Number(max) || 0);
+    if (!this.#keptFor || !this.#keptMax) void this.closeClients();
+  }
+
+  /** Close the clients kept (all, or one account's), and those in use as they come back: before the process ends, or when an account's sign-in or settings change. */
+  async closeClients(name) {
+    const closing = [];
+    if (name) this.#gens.set(name, (this.#gens.get(name) || 0) + 1); else this.#genAll++;
+    for (const [key, list] of this.#kept) {
+      if (name && key.split('\n')[0] !== name) continue;
+      this.#kept.delete(key);
+      for (const e of list) { clearTimeout(e.timer); closing.push(Promise.resolve().then(() => e.c.close()).catch(() => {})); }
+    }
+    await Promise.all(closing);
+  }
+
+  #nameOf(name) { try { return this.account(name).name; } catch { return name; } }
+  #keptGen(key) { return `${this.#genAll}.${this.#gens.get(key.split('\n')[0]) || 0}`; }
+
+  /** What an account's kept clients are filed under: its name and all of how it is set up now. null: none are kept for it. */
+  #keptKey(name) {
+    if (!this.#keptFor || !this.#keptMax) return null;
+    let acct;
+    try { acct = this.account(name); } catch { return null; }
+    if (acct?.provider !== 'imap') return null;
+    let tz = '';
+    try { tz = String(this.timeZone ?? ''); } catch { /* none */ }
+    return `${acct.name}\n${JSON.stringify(acct)}\n${tz}`;
+  }
+
+  /** A kept client for this key, known to answer; null when none is kept (or none of them answers any more). */
+  async #takeKept(key) {
+    for (;;) {
+      const e = this.#kept.get(key)?.pop();
+      if (!e) return null;
+      clearTimeout(e.timer);
+      if (Date.now() - e.at <= this.#probeMs) return e;
+      let alive = false;
+      try { alive = typeof e.c.ping === 'function' ? await e.c.ping(PROBE_WAIT_MS) : true; } catch { alive = false; }
+      if (alive) return e;
+      Promise.resolve().then(() => e.c.close()).catch(() => {});
+      // (one does not answer: the network changed, and the others kept beside it are no better. All let go, not asked one by one)
+      for (const other of this.#kept.get(key) ?? []) { clearTimeout(other.timer); Promise.resolve().then(() => other.c.close()).catch(() => {}); }
+      this.#kept.delete(key);
+      return null;
+    }
+  }
+
+  #keep(key, lease) {
+    if (Date.now() - lease.born > LIFE_MS) return false;
+    const list = this.#kept.get(key) ?? [];
+    if (list.length >= this.#keptMax) return false;
+    try { lease.c.rest?.(); } catch { /* kept as it is */ }
+    const e = { c: lease.c, born: lease.born, at: Date.now(), timer: null };
+    e.timer = setTimeout(() => {
+      const now = this.#kept.get(key);
+      const at = now ? now.indexOf(e) : -1;
+      if (at < 0) return;
+      now.splice(at, 1);
+      if (!now.length) this.#kept.delete(key);
+      Promise.resolve().then(() => e.c.close()).catch(() => {});
+    }, this.#keptFor);
+    e.timer.unref?.();
+    list.push(e);
+    this.#kept.set(key, list);
+    return true;
   }
 
   /** MailWatcher's historical signature: withAuthRetry(fn, onRefresh, account). */
