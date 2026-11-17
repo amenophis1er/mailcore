@@ -144,3 +144,9 @@ test('a mail attached to a mail is listed as an .eml, and downloaded as a mail o
   await assert.rejects(contact.getAttachment('I2'), /cannot be downloaded/);
 });
 
+test('findInbox withAny goes through the content index: from, to or cc, any of the addresses', async () => {
+  const c = stubbed(FIND_RESPONSE);
+  await c.findInbox({ withAny: ['a@x.org', 'b@y.org'], limit: 5 });
+  assert.match(c.sent[0], /<m:QueryString>\(from:&quot;a@x\.org&quot; OR to:&quot;a@x\.org&quot; OR cc:&quot;a@x\.org&quot; OR from:&quot;b@y\.org&quot; OR to:&quot;b@y\.org&quot; OR cc:&quot;b@y\.org&quot;\)<\/m:QueryString>/);
+});
+

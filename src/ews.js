@@ -170,8 +170,11 @@ export class EwsClient {
     // OWA's search box). When either is requested, translate ALL filters to
     // AQS, since QueryString and Restriction cannot be combined.
     // Recipients cannot be restricted on (a Contains over To or Cc matched nothing, ever): they go through AQS too.
-    if (opts.text || opts.hasAttachments || opts.toContains) {
+    const withAny = (Array.isArray(opts.withAny) ? opts.withAny : opts.withAny ? [opts.withAny] : []).filter((a) => typeof a === 'string' && a);
+    if (opts.text || opts.hasAttachments || opts.toContains || withAny.length) {
       const parts = [];
+      // with any of these addresses: who wrote it, whom it was written to, or who was in copy
+      if (withAny.length) parts.push(`(${withAny.flatMap((a) => [`from:"${aqs(a)}"`, `to:"${aqs(a)}"`, `cc:"${aqs(a)}"`]).join(' OR ')})`);
       // text may be one term or a list — every term must match (AND),
       // each in the subject OR the body.
       const texts = Array.isArray(opts.text) ? opts.text : opts.text ? [opts.text] : [];

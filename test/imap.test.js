@@ -342,26 +342,66 @@ test('a large text body is read whatever its size; a forwarded message as the wh
 });
 
 
-test('a client taken again after a use before selects its folder anew, once: what arrived since is known', async () => {
+test('a client taken again after a use before: its folder is selected anew when that was long ago, when mail is moved, or when a message is not found', async () => {
   const c = new ImapClient(ACCT, { username: 'me', password: 'x' });
   const did = [];
+  let known = true; // whether the session knows message 7
   const conn = {
     usable: true,
     mailbox: { path: 'INBOX', uidValidity: 999n },
     async getMailboxLock(path) { did.push(`lock ${path}`); if (conn.mailbox?.path !== path) { did.push(`select ${path}`); conn.mailbox = { path, uidValidity: 999n }; } return { release() {} }; },
-    async mailboxOpen(path) { did.push(`select ${path}`); },
-    async fetchOne() { did.push('fetch'); return { uid: 7 }; },
-    async messageFlagsAdd() { did.push('store'); return true; }
+    async mailboxOpen(path) { did.push(`select ${path}`); known = true; },
+    async fetchOne() { did.push('fetch'); return known ? { uid: 7 } : false; },
+    async messageFlagsAdd() { did.push('store'); return true; },
+    async messageMove() { did.push('move'); return { uidValidity: 5n, uidMap: new Map([[7, 70]]) }; }
+  };
+  c.client = conn;
+  c.folderMap = { inbox: 'INBOX', sent: 'Sent', trash: 'Trash', archive: 'Archive' };
+  c.selectedAt = Date.now();
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'fetch', 'store'], 'the folder it has selected: used as it is');
+  // taken again a moment after it was selected: used as it is (selecting a large inbox anew takes a second and more)
+  did.length = 0; c.again();
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'fetch', 'store']);
+  // … unless the message is not found there: it may have arrived since. Selected anew, and asked once more
+  did.length = 0; c.again(); known = false;
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'fetch', 'select INBOX', 'fetch', 'store']);
+  // truly gone: said so, after the one more look
+  did.length = 0; c.again(); conn.mailboxOpen = async (path) => { did.push(`select ${path}`); };
+  known = false;
+  await assert.rejects(c.markRead('INBOX/999/7'), /not found/);
+  assert.deepEqual(did, ['lock INBOX', 'fetch', 'select INBOX', 'fetch']);
+  known = true;
+  // selected long ago: anew first
+  did.length = 0; c.again(); c.selectedAt = Date.now() - 60_000;
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'select INBOX', 'fetch', 'store']);
+  // what moves mail by its number: anew first, however lately it was selected
+  did.length = 0; c.again();
+  await c.deleteItem('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'select INBOX', 'move']);
+  // not taken again (the same use going on): as it is
+  did.length = 0;
+  await c.markRead('INBOX/999/7');
+  assert.deepEqual(did, ['lock INBOX', 'fetch', 'store']);
+});
+
+test('findInbox withAny: one search for mail from, to or in copy to any of a person\'s addresses', async () => {
+  const c = new ImapClient(ACCT, { username: 'me', password: 'x' });
+  const asked = [];
+  const conn = {
+    usable: true,
+    mailbox: null,
+    async getMailboxLock(path) { conn.mailbox = { path, uidValidity: 999n, exists: 5 }; return { release() {} }; },
+    async search(query) { asked.push(query); return [3]; },
+    fetch() { return (async function* () { yield { uid: 3, flags: new Set(), envelope: { subject: 'S', from: [{ address: 'a@x.example' }] }, internalDate: new Date('2026-11-16T10:00:00Z') }; })(); }
   };
   c.client = conn;
   c.folderMap = { inbox: 'INBOX', sent: 'Sent' };
-  await c.markRead('INBOX/999/7');
-  assert.deepEqual(did, ['lock INBOX', 'fetch', 'store'], 'the folder it has selected: used as it is');
-  did.length = 0;
-  c.again();
-  await c.markRead('INBOX/999/7');
-  assert.deepEqual(did, ['lock INBOX', 'select INBOX', 'fetch', 'store'], 'taken again: selected anew first');
-  did.length = 0;
-  await c.markRead('INBOX/999/7');
-  assert.deepEqual(did, ['lock INBOX', 'fetch', 'store'], 'once');
+  const got = await c.findInbox({ withAny: ['a@x.example', 'a@work.example'], limit: 10 });
+  assert.deepEqual(asked[0], { or: [{ from: 'a@x.example' }, { to: 'a@x.example' }, { cc: 'a@x.example' }, { from: 'a@work.example' }, { to: 'a@work.example' }, { cc: 'a@work.example' }] });
+  assert.equal(got.length, 1);
 });
+

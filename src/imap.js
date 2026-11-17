@@ -148,22 +148,38 @@ export class ImapClient {
     this.openedAt = 0;
   }
 
-  async #inMailbox(path, fn) {
+  /**
+   * Run fn(connection, mailbox) with a folder selected. `sure`: the folder's state must be the server's now (what
+   * moves or deletes mail by its number).
+   */
+  async #inMailbox(path, fn, { sure = false } = {}) {
     const c = await this.#conn();
     if (this.watcher) {
       // (not between the steps of one look: the listing, then the bodies of what it found)
       if (c.mailbox && c.mailbox.readOnly && Date.now() - (this.openedAt || 0) > 1500) await c.mailboxClose();
       if (!c.mailbox) this.openedAt = Date.now();
     }
-    // Taken again after a use before (again()), with this very folder still selected: selected anew, once, so that what
-    // arrived or left since is known here (a session sees its folder as it was until told, and Gmail tells late; the
-    // lock alone selects nothing when the folder is the one selected). Any other folder is selected now anyway.
-    const stale = !this.watcher && this.resync === true && !!c.mailbox && c.mailbox.path === path;
+    // Taken again after a use before (again()), with this very folder still selected: the session sees the folder as
+    // it was until told otherwise, and the lock alone selects nothing when the folder is the one selected. Selecting
+    // it anew costs (a second and more for a large inbox at Gmail), so: at once when it must be sure, or when it was
+    // selected more than RESELECT_MS ago; else only if a message turns out not to be found (one that arrived since:
+    // selected anew then, and asked once more, nothing having been done). Any other folder is selected now anyway.
+    const kept = !this.watcher && this.resync === true && !!c.mailbox && c.mailbox.path === path;
     this.resync = false;
+    const before = !!c.mailbox && c.mailbox.path === path;
     const lock = await c.getMailboxLock(path, this.watcher ? { readOnly: true } : undefined);
     try {
-      if (stale) await c.mailboxOpen(path);
-      return await fn(c, c.mailbox);
+      if (!before) this.selectedAt = Date.now();
+      const anew = async () => { await c.mailboxOpen(path); this.selectedAt = Date.now(); };
+      const now = kept && (sure || Date.now() - (this.selectedAt || 0) > RESELECT_MS);
+      if (now) await anew();
+      try {
+        return await fn(c, c.mailbox);
+      } catch (e) {
+        if (!(kept && !now && /not found|no longer in that folder/i.test(String(e?.message)))) throw e;
+        await anew();
+        return await fn(c, c.mailbox);
+      }
     } finally {
       lock.release();
     }
@@ -206,7 +222,11 @@ export class ImapClient {
       if (opts.sinceIso) query.since = new Date(opts.sinceIso);
       if (opts.untilIso) query.before = new Date(new Date(opts.untilIso).getTime() + 86400e3); // BEFORE is exclusive, by day
       if (opts.fromMe) query.from = await this.selfEmail();
-      if (opts.toContains) query.or = [{ to: opts.toContains }, { cc: opts.toContains }];
+      // with any of these addresses: who wrote it, whom it was written to, or who was in copy (one search for all of a
+      // person's mail in a folder, where from, to and cc were three)
+      const withAny = (Array.isArray(opts.withAny) ? opts.withAny : opts.withAny ? [opts.withAny] : []).filter((a) => typeof a === 'string' && a);
+      if (withAny.length) query.or = withAny.flatMap((a) => [{ from: a }, { to: a }, { cc: a }]);
+      else if (opts.toContains) query.or = [{ to: opts.toContains }, { cc: opts.toContains }];
       const texts = Array.isArray(opts.text) ? opts.text : opts.text ? [opts.text] : [];
       if (texts.length === 1) query.text = texts[0];
       // every term: IMAP's criteria are ANDed but a key holds one value, and imapflow has no AND to nest,
@@ -533,7 +553,7 @@ export class ImapClient {
     await this.#inMailbox(path, async (c) => {
       if (path === trash) await c.messageDelete(uid, { uid: true });
       else await c.messageMove(uid, trash, { uid: true });
-    });
+    }, { sure: true });
     return true;
   }
 
@@ -561,7 +581,7 @@ export class ImapClient {
             // a server that says where each went (UIDPLUS) and not where this one went: it was no longer there
             out.set(x.id, uid && r.uidValidity ? `${encodeURIComponent(dest)}/${r.uidValidity}/${uid}` : r.uidMap ? null : x.id);
           }
-        });
+        }, { sure: true });
       } catch (e) {
         failure ||= e;
       }
@@ -784,7 +804,7 @@ export class ImapClient {
   }
 
   async #delete(path, uid) {
-    return this.#inMailbox(path, (c) => c.messageDelete(uid, { uid: true }));
+    return this.#inMailbox(path, (c) => c.messageDelete(uid, { uid: true }), { sure: true });
   }
 
   async #smtpSend(raw, envelope) {
@@ -1066,5 +1086,7 @@ export function withMessageId(raw, id) {
   return Buffer.concat([Buffer.from(`${lines}${nl}Message-ID: ${id}`, 'latin1'), buf.subarray(end)]);
 }
 
+/** A folder kept selected from a use before is selected anew when it was selected longer ago than this (see #inMailbox). */
+const RESELECT_MS = 30_000;
 /** A message bigger than this is read without the bytes of its attachments (they are fetched when asked for). */
 const LIGHT_OVER = 512 * 1024;

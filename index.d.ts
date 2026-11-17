@@ -179,6 +179,8 @@ export interface FindOptions {
   senderContains?: string;
   subjectContains?: string;
   toContains?: string;
+  /** with any of these addresses: who wrote it, whom it was written to, or who was in copy (one search for a person's mail in a folder) */
+  withAny?: string[];
   /** Subject OR body; several terms all match. */
   text?: string | string[];
   fromMe?: boolean;
