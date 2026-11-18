@@ -3,7 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createMailcore, googleContacts, googleContactOf } from '../src/index.js';
+import { createMailcore, googleContacts, googleContactOf, googleCreateContact, contactsAllowed } from '../src/index.js';
 
 const json = (status, data) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 const token = (asked = []) => async (account, { force }) => { asked.push({ account, force }); return force ? 'fresh' : 'tok'; };
@@ -178,3 +178,53 @@ test('the groups\' names come after the contacts, every page of them; failing, t
   await assert.rejects(run(() => new Response('{}', { status: 401 })), (e) => e.code === 'MAIL_AUTH');
 });
 
+
+test('a contact is added as Google takes it, and comes back as Google keeps it', async () => {
+  const sent = [];
+  const fetch = async (url, init) => {
+    sent.push({ url: new URL(String(url)), init });
+    const p = JSON.parse(init.body);
+    return json(200, { resourceName: 'people/c42', ...p, names: [{ displayName: 'Jeune Group Cargo', metadata: { primary: true } }] });
+  };
+  const made = await googleCreateContact('gmail', {
+    name: 'Jeune Group Cargo', emails: ['info@cargo.example', 'INFO@cargo.example', 'not an address'], phones: ['+228 70 08 36 36', { number: '+1 929 351 7603', kind: 'WhatsApp' }, 'none'],
+    addresses: [{ text: '623 Melrose Ave\nBronx, NY 10455', kind: 'work' }], company: 'Jeune Group SARL U', note: 'From a flyer', urls: ['javascript:alert(1)', 'https://cargo.example']
+  }, { accessToken: token(), fetch });
+  assert.equal(sent.length, 1);
+  const { url, init } = sent[0];
+  assert.equal(init.method, 'POST');
+  assert.equal(url.pathname, '/v1/people:createContact');
+  assert.match(url.searchParams.get('personFields'), /emailAddresses/);
+  const body = JSON.parse(init.body);
+  assert.deepEqual(body.names, [{ unstructuredName: 'Jeune Group Cargo' }]);
+  assert.deepEqual(body.emailAddresses, [{ value: 'info@cargo.example' }]);
+  assert.deepEqual(body.phoneNumbers, [{ value: '+228 70 08 36 36' }, { value: '+1 929 351 7603', type: 'whatsapp' }]);
+  assert.deepEqual(body.addresses, [{ formattedValue: '623 Melrose Ave\nBronx, NY 10455', type: 'work' }]);
+  assert.deepEqual(body.urls, [{ value: 'https://cargo.example' }]);
+  assert.deepEqual(body.organizations, [{ name: 'Jeune Group SARL U' }]);
+  assert.equal(made.id, 'people/c42');
+  assert.equal(made.kind, 'saved');
+  assert.equal(made.email, 'info@cargo.example');
+});
+
+test('adding: nothing that names it is refused before Google is asked; a sign-in that only reads is GOOGLE_SCOPE; a 401 is asked again once', async () => {
+  let n = 0;
+  await assert.rejects(googleCreateContact('gmail', { note: 'only a note' }, { accessToken: token(), fetch: async () => { n++; return json(200, {}); } }), /needs a name/);
+  assert.equal(n, 0);
+  const scope = json(403, { error: { status: 'PERMISSION_DENIED', details: [{ reason: 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' }] } });
+  await assert.rejects(googleCreateContact('gmail', { name: 'Ann' }, { accessToken: token(), fetch: async () => scope }), (e) => e.code === 'GOOGLE_SCOPE' && /adding/.test(e.message));
+  const asked = [];
+  const calls = [];
+  const made = await googleCreateContact('gmail', { name: 'Ann' }, { accessToken: token(asked), fetch: async (u, init) => { calls.push(init.headers.authorization); return calls.length === 1 ? json(401, {}) : json(200, { resourceName: 'people/c1', names: [{ displayName: 'Ann' }] }); } });
+  assert.deepEqual(calls, ['Bearer tok', 'Bearer fresh']);
+  assert.equal(made.name, 'Ann');
+  await assert.rejects(googleCreateContact('gmail', { name: 'Ann' }, { accessToken: token(), fetch: async () => json(401, {}) }), (e) => e.code === 'MAIL_AUTH');
+});
+
+test('what granted scopes allow of the contacts: reading by either scope with the other contacts, adding by contacts alone', () => {
+  const G = (s) => `https://www.googleapis.com/auth/${s}`;
+  assert.deepEqual(contactsAllowed([G('contacts.readonly'), G('contacts.other.readonly')]), { read: true, write: false });
+  assert.deepEqual(contactsAllowed([G('contacts'), G('contacts.other.readonly')]), { read: true, write: true });
+  assert.deepEqual(contactsAllowed([G('contacts')]), { read: false, write: true });
+  assert.deepEqual(contactsAllowed(null), { read: false, write: false });
+});

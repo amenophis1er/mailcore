@@ -25,6 +25,19 @@ export const GOOGLE_CONTACTS_SCOPES = [
   'https://www.googleapis.com/auth/contacts.readonly',
   'https://www.googleapis.com/auth/contacts.other.readonly'
 ];
+/** Reading and adding one's own contacts (it holds contacts.readonly's reading): asked in its place to add contacts. */
+export const GOOGLE_CONTACTS_WRITE_SCOPE = 'https://www.googleapis.com/auth/contacts';
+/** Contacts read and written: the write scope with "other contacts" (what a sign-in asks for to read and add contacts). */
+export const GOOGLE_CONTACTS_WRITE_SCOPES = [GOOGLE_CONTACTS_WRITE_SCOPE, GOOGLE_CONTACTS_SCOPES[1]];
+
+/**
+ * What granted scopes allow of the contacts: `read` (one's own, by contacts.readonly or contacts, and the other
+ * contacts), `write` (adding one's own: contacts).
+ */
+export function contactsAllowed(scopes) {
+  const has = (s) => Array.isArray(scopes) && scopes.includes(s);
+  return { read: (has(GOOGLE_CONTACTS_SCOPES[0]) || has(GOOGLE_CONTACTS_WRITE_SCOPE)) && has(GOOGLE_CONTACTS_SCOPES[1]), write: has(GOOGLE_CONTACTS_WRITE_SCOPE) };
+}
 const AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const PRIMARY_URL = 'https://www.googleapis.com/calendar/v3/calendars/primary';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';

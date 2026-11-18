@@ -20,8 +20,8 @@ export { ruleMatches, matchRule, accountOk, inQuietHours, splitList } from './ru
 export { parseWhen, parseDuration, dayStart } from './calendar.js';
 export { normalizeSubject, askedSomething, unquoted, snippet, groupThreads, looksBulk } from './awaiting.js';
 export { prepareBody, replaceAboveQuote, splitQuoted, splitBreaks, markdownToHtml, textToHtml, escapeHtml, BODY_FORMATS } from './body.js';
-export { GOOGLE_SCOPES, GOOGLE_CONTACTS_SCOPES, grantedScopes, googleAccountAddress } from './google-auth.js';
-export { googleContacts, contactOf as googleContactOf } from './google-contacts.js';
+export { GOOGLE_SCOPES, GOOGLE_CONTACTS_SCOPES, GOOGLE_CONTACTS_WRITE_SCOPE, GOOGLE_CONTACTS_WRITE_SCOPES, contactsAllowed, grantedScopes, googleAccountAddress } from './google-auth.js';
+export { googleContacts, googleCreateContact, contactOf as googleContactOf } from './google-contacts.js';
 export { jsonFileStore, memoryStore } from './store.js';
 export { AUTH_HEADER_NAMES, OVERSIZED, authHeadersFrom, headerPairs } from './auth-headers.js';
 export { isAutoReply, AUTO_REPLY_HEADERS } from './auto-reply.js';

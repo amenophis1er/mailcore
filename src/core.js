@@ -9,7 +9,7 @@ import { normalizeAccounts, calendarProvider, hasMail, MAIL_PROVIDERS } from './
 import { AccountClient, splitId, isAuthError, makeBackend, makeCalendarBackend, makeStream } from './client.js';
 import { createCache } from './cache.js';
 import { googleAuth } from './google-auth.js';
-import { googleContacts } from './google-contacts.js';
+import { googleContacts, googleCreateContact } from './google-contacts.js';
 import { calendarApi } from './calendar.js';
 import { awaitingApi } from './awaiting.js';
 import { jsonFileStore, memoryStore } from './store.js';
@@ -65,6 +65,7 @@ export class Mailcore {
     this.google = googleAuth({ store: credentials.google, client: g, signInHint: (account) => (typeof g().signInHint === 'function' ? g().signInHint(account) : null) });
     // a Google account's contacts (People API), over the same tokens
     this.google.contacts = (account, opts = {}) => googleContacts(account, { accessToken: this.google.accessToken, signInHint: this.google.signInHint, ...opts });
+    this.google.createContact = (account, contact, opts = {}) => googleCreateContact(account, contact, { accessToken: this.google.accessToken, signInHint: this.google.signInHint, ...opts });
     this.cache = createCache({
       dir: dataDir,
       key: cacheKey,
