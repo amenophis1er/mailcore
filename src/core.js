@@ -22,7 +22,7 @@ const emptyState = () => ({ seenIds: [], baselined: false });
 
 /** How many connections to one IMAP account this process holds at a time (see Mailcore.withClient). */
 const MAX_AT_ONCE = 4;
-/** How long a use waits for its turn before going ahead without one. */
+/** How long a use waits for its turn before it is refused as busy (MAIL_BUSY). */
 const TURN_WAIT_MS = 20_000;
 /** A connection the server refused for want of room: asked again after these waits (ms), then given up. */
 const BUSY_WAITS = [1000, 2500, 5000];
@@ -158,7 +158,7 @@ export class Mailcore {
       const turn = await this.#turn(name);
       const release = turn.release;
       // (what fn asks of the same account meanwhile is part of this use: it has its turn)
-      const inside = (work) => (turn.name ? this.#inUse.run(new Set([...(this.#inUse.getStore() ?? []), turn.name]), work) : work());
+      const inside = (work) => (turn.held ? this.#inUse.run([...(this.#inUse.getStore() ?? []), turn.held], work) : work());
       try {
         for (let tries = 0; ; tries++) {
           // (a client kept from a use a moment ago, where clients are kept: its connection is there already)
@@ -209,19 +209,20 @@ export class Mailcore {
   // --- a few at a time ------------------------------------------------------------------
 
   #turns = new Map(); // account name → { busy, waiting: [fn] }
-  #inUse = new AsyncLocalStorage(); // the accounts whose turn the work under way already has (a use inside a use)
+  #inUse = new AsyncLocalStorage(); // the turns the work under way has (a use inside a use): [{ name, live }], live until given back
 
   /**
    * A turn at an IMAP account's connections (MAX_AT_ONCE of them at a time in this process); settles with
-   * { release, name }: what gives it back, and the account it is of (null: none was needed). A use made inside a
-   * use of the same account has its turn already (it would wait for itself). A turn not had within TURN_WAIT_MS is
+   * { release, held }: what gives it back, and the turn itself (null: none was needed). A use made inside a use of
+   * the same account, while that one lasts, has its turn already (it would wait for itself). A turn not had within TURN_WAIT_MS is
    * not taken: the use is refused as busy (MAIL_BUSY: said, or waited for and asked again by whoever asked), so
    * that never more than MAX_AT_ONCE are at an account at once, however many wait.
    */
   async #turn(name) {
     let acct = null;
     try { acct = this.account(name); } catch { /* said where the client is made */ }
-    if (acct?.provider !== 'imap' || this.#inUse.getStore()?.has(acct.name)) return { release: () => {}, name: null };
+    // (a turn that is still had: something started inside a use and left running after it has none, and waits like any other)
+    if (acct?.provider !== 'imap' || this.#inUse.getStore()?.some((t) => t.name === acct.name && t.live)) return { release: () => {}, held: null };
     const t = this.#turns.get(acct.name) ?? { busy: 0, waiting: [] };
     this.#turns.set(acct.name, t);
     if (t.busy >= MAX_AT_ONCE) {
@@ -237,12 +238,12 @@ export class Mailcore {
         t.waiting.push(mine);
       });
     } else t.busy++;
-    let given = false;
+    const held = { name: acct.name, live: true };
     return {
-      name: acct.name,
+      held,
       release: () => {
-        if (given) return;
-        given = true;
+        if (!held.live) return;
+        held.live = false;
         const next = t.waiting.shift();
         if (next) next(); else t.busy--;
       }

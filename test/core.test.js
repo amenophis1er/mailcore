@@ -376,6 +376,13 @@ test('never more at an IMAP account than a few, however long the rest wait: one 
   // four uses that each ask the same account again while they hold their turn: not waiting for themselves
   const nested = () => mc.withClient('home', async () => { await new Promise((r) => setTimeout(r, 5)); return mc.withClient('home', async () => 'inner'); });
   assert.deepEqual(await Promise.all(Array.from({ length: 4 }, nested)), ['inner', 'inner', 'inner', 'inner']);
+  // what a use starts and leaves running has no turn once the use has ended: it waits its own, like anything else
+  now = 0; most = 0;
+  let later;
+  await mc.withClient('home', async () => { later = () => Promise.all(Array.from({ length: 9 }, quick)); setTimeout(() => {}, 0); });
+  const afterwards = new Promise((done) => { mc.withClient('home', async () => { setTimeout(() => { later().then(done); }, 10); }); });
+  await afterwards;
+  assert.equal(most, 4, 'started inside a use, run after it: under the cap');
 });
 
 test('a server that takes no more connections is waited for and asked again, when nothing was asked yet; it is no wrong password', async () => {

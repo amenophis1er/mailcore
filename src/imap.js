@@ -128,6 +128,8 @@ export class ImapClient {
    * goodbye within `logoutMs` (a dead connection never will) is not waited for.
    */
   async close() {
+    // (a connection being made as this is closed: waited for, and closed too, rather than left signed in for no one)
+    if (this.connecting) { try { await this.connecting; } catch { /* none was made */ } }
     const c = this.client;
     this.client = null;
     if (!c) return;

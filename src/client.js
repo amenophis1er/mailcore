@@ -168,10 +168,16 @@ export class AccountClient {
       const m = await this.backend.attachmentsOf(ids.map((id) => this.#in(id)));
       return new Map([...m].map(([id, v]) => [`${this.account}:${id}`, v]));
     }
+    // (a message that is not there is left out of the answer; any other failure is said: a caller that takes "left
+    // out" for "gone" must not be told so of a message that only could not be read this time)
     const out = new Map();
+    let failure = null;
     for (const id of ids) {
-      try { out.set(id, (await this.backend.getMessage(this.#in(id), { bodyType: 'Text' })).attachments || []); } catch { /* that message is skipped */ }
+      try { out.set(id, (await this.backend.getMessage(this.#in(id), { bodyType: 'Text' })).attachments || []); } catch (e) {
+        if (!/not found|no longer|ItemNotFound|no such/i.test(String(e?.message))) failure ??= e;
+      }
     }
+    if (failure) throw failure;
     return out;
   }
   /** The authentication headers of many messages (auth-headers.js): Map id → { results, bimiSelector, msAuthAs, fromEmail }; empty where the backend cannot say. */
