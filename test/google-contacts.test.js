@@ -207,6 +207,13 @@ test('a contact is added as Google takes it, and comes back as Google keeps it',
   assert.equal(made.email, 'info@cargo.example');
 });
 
+test('adding: a company alone, made by Google, is told by its id (not taken for a failure, which would make it again)', async () => {
+  const made = await googleCreateContact('gmail', { company: 'Acme Ltd' }, { accessToken: token(), fetch: async () => json(200, { resourceName: 'people/c77', organizations: [{ name: 'Acme Ltd' }] }) });
+  assert.equal(made.id, 'people/c77');
+  assert.equal(made.name, 'Acme Ltd');
+  await assert.rejects(googleCreateContact('gmail', { company: 'Acme Ltd' }, { accessToken: token(), fetch: async () => json(200, { organizations: [{ name: 'Acme Ltd' }] }) }), /without the contact/);
+});
+
 test('adding: nothing that names it is refused before Google is asked; a sign-in that only reads is GOOGLE_SCOPE; a 401 is asked again once', async () => {
   let n = 0;
   await assert.rejects(googleCreateContact('gmail', { note: 'only a note' }, { accessToken: token(), fetch: async () => { n++; return json(200, {}); } }), /needs a name/);

@@ -279,8 +279,10 @@ export async function googleCreateContact(account, contact, { accessToken, signI
     try { data = textBody.trim() ? JSON.parse(textBody) : null; } catch { /* not JSON: the status says it */ }
     if (res.status === 401) throw contactsError(`Google no longer accepts the sign-in for "${account}" — ${signInHint(account)}`, 'MAIL_AUTH', 401);
     if (res.status !== 200) throw failure(res.status, data, 'the contact', 'adding');
-    const made = contactOf(data, 'saved');
-    if (!made?.id) throw contactsError('Google answered without the contact it made', 'GOOGLE_API', res.status);
-    return made;
+    // (made is made: a contact of a company alone, no name, mail or phone, is one too: told by its id)
+    const id = typeof data?.resourceName === 'string' && /^people\/[\w-]{1,200}$/.test(data.resourceName) ? data.resourceName : '';
+    if (!id) throw contactsError('Google answered without the contact it made', 'GOOGLE_API', res.status);
+    const company = text(primaryFirst(data?.organizations).map((o) => o?.name).find((n) => text(n)) || '');
+    return { ...(contactOf(data, 'saved') ?? { name: company, email: '', emails: [], kind: 'saved' }), id };
   }
 }
