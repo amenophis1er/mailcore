@@ -719,6 +719,8 @@ export class Mailcore {
     signInHint(account: string): string;
     /** The account's Google contacts (People API: its own, and its "other contacts"), over its tokens. See googleContacts. */
     contacts(account: string, opts?: Omit<GoogleContactsOptions, 'accessToken'> & { accessToken?: GoogleContactsOptions['accessToken'] }): Promise<GoogleContactsResult>;
+    /** Adds a contact to the account's own Google contacts, over its tokens (the sign-in must allow `contacts`). See googleCreateContact. */
+    createContact(account: string, contact: NewGoogleContact, opts?: { signal?: AbortSignal; fetch?: typeof fetch }): Promise<GoogleContact>;
   };
 
   accountNames(): string[];
@@ -848,6 +850,12 @@ export function plainText(text: string): string;
 export const GOOGLE_SCOPES: string[];
 /** Reading contacts (People API): contacts.readonly and contacts.other.readonly. */
 export const GOOGLE_CONTACTS_SCOPES: string[];
+/** Reading and adding one's own contacts (holds contacts.readonly's reading). */
+export const GOOGLE_CONTACTS_WRITE_SCOPE: string;
+/** Contacts read and added: GOOGLE_CONTACTS_WRITE_SCOPE and contacts.other.readonly. */
+export const GOOGLE_CONTACTS_WRITE_SCOPES: string[];
+/** What granted scopes allow of the contacts: reading (contacts.readonly or contacts, with the other contacts), adding (contacts). */
+export function contactsAllowed(scopes: string[] | null | undefined): { read: boolean; write: boolean };
 /** The scopes stored tokens were granted (their `scope`), as a list; [] when unknown. */
 export function grantedScopes(tokens: GoogleTokens | null | undefined): string[];
 /** The address of the Google account an access token is for (its primary calendar's id); null when Google does not say. */
@@ -917,6 +925,30 @@ export interface GoogleContactsOptions {
  * with `errors`). Nothing is kept.
  */
 export function googleContacts(account: string, opts: GoogleContactsOptions): Promise<GoogleContactsResult>;
+/** A contact to add: at least a name, an address, a phone or a company. Lists take plain strings or { …, kind }. */
+export interface NewGoogleContact {
+  name?: string;
+  givenName?: string;
+  familyName?: string;
+  emails?: (string | { value?: string; email?: string; kind?: string })[];
+  phones?: (string | { number?: string; value?: string; kind?: string })[];
+  /** lines as given (Google's formatted value) */
+  addresses?: (string | { text?: string; value?: string; kind?: string })[];
+  company?: string;
+  title?: string;
+  department?: string;
+  note?: string;
+  /** http(s) only */
+  urls?: (string | { url?: string; value?: string; kind?: string })[];
+  /** 'YYYY-MM-DD' or '--MM-DD' */
+  birthday?: string;
+}
+/**
+ * Adds a contact to a Google account's own contacts (people:createContact): the contact as Google keeps it (kind
+ * 'saved', with its id). Throws a TypeError when nothing names it; MAIL_AUTH after one forced renewal; GOOGLE_SCOPE
+ * when the sign-in only allows reading.
+ */
+export function googleCreateContact(account: string, contact: NewGoogleContact, opts: { accessToken: GoogleContactsOptions['accessToken']; signInHint?: (account: string) => string; signal?: AbortSignal; fetch?: typeof fetch }): Promise<GoogleContact>;
 /** One person of the People API as a GoogleContact (null: an other contact without an email address, a saved one with neither address, name nor phone). */
 export function googleContactOf(person: unknown, kind: 'saved' | 'other'): GoogleContact | null;
 export function jsonFileStore<T = Record<string, unknown>>(file: string, fallback?: () => T): StateStore<T>;

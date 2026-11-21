@@ -1,6 +1,7 @@
 // Google contacts over the People API: the account's own contacts
 // (people/me/connections) and its "other contacts" (otherContacts: the people
-// it wrote to or got mail from, which Google keeps apart). Read only, paged.
+// it wrote to or got mail from, which Google keeps apart), read paged; and a
+// contact of its own added (people:createContact, the contacts scope).
 // Access tokens come from the accessToken function the caller passes
 // (google-auth.js builds one over the caller's token store); the scopes are
 // GOOGLE_CONTACTS_SCOPES (contacts.readonly, contacts.other.readonly).
@@ -38,11 +39,11 @@ function reasonsOf(data) {
  * client's Google Cloud project), GOOGLE_RATE (rate-limited), GOOGLE_API
  * (anything else).
  */
-function failure(status, data, what) {
+function failure(status, data, what, doing = 'reading') {
   const reasons = reasonsOf(data);
   const message = String(data?.error?.message || '').split('\n')[0].slice(0, 300);
   if (status === 403 && reasons.some((r) => /SCOPE_INSUFFICIENT|insufficientPermissions/i.test(r))) {
-    return contactsError(`Google did not allow reading ${what} (the sign-in lacks the contacts permission)`, 'GOOGLE_SCOPE', status);
+    return contactsError(`Google did not allow ${doing} ${what} (the sign-in lacks the contacts permission${doing === 'reading' ? '' : ' to add them'})`, 'GOOGLE_SCOPE', status);
   }
   if (status === 403 && (reasons.some((r) => /SERVICE_DISABLED|accessNotConfigured/i.test(r)) || /has not been used in project|is disabled/i.test(message))) {
     return contactsError(`the People API is not enabled for this OAuth client's Google Cloud project${message ? `: ${message}` : ''}`, 'GOOGLE_API_DISABLED', status);
@@ -210,4 +211,78 @@ export async function googleContacts(account, { accessToken, signInHint = () => 
   }
   if (asked.length && result.errors.length === asked.length) throw Object.assign(firstError, { errors: result.errors });
   return result;
+}
+
+const PERSON_FIELDS = 'names,nicknames,emailAddresses,phoneNumbers,addresses,organizations,biographies,birthdays,urls,relations,events,memberships,photos';
+const clean = (v, max) => (typeof v === 'string' ? v.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim().slice(0, max) : '');
+const line = (v, max) => clean(v, max).replace(/\s+/g, ' ');
+const listOf = (v, max) => (Array.isArray(v) ? v.slice(0, max) : []);
+
+/**
+ * A contact as the People API takes it, from { name, givenName?, familyName?, emails?, phones?, addresses?, company?,
+ * title?, department?, note?, urls?, birthday? }: emails ['a@b'] or [{ value|email, kind }], phones ['+1…'] or
+ * [{ number, kind }], addresses ['text'] or [{ text, kind }] (kept as Google's formatted value, the lines as given),
+ * urls ['https://…'] or [{ url, kind }], birthday 'YYYY-MM-DD' or '--MM-DD'. Throws when nothing names it (a name,
+ * an address, a phone or a company).
+ */
+export function personOf(c) {
+  if (!c || typeof c !== 'object') throw new TypeError('a contact is an object');
+  const kindOf = (x) => line(x?.kind ?? x?.type, 40).toLowerCase();
+  const p = {};
+  const given = line(c.givenName, 100), family = line(c.familyName, 100), full = line(c.name, 200);
+  if (given || family) p.names = [{ givenName: given || undefined, familyName: family || undefined, ...(full ? { unstructuredName: full } : {}) }];
+  else if (full) p.names = [{ unstructuredName: full }];
+  const emails = [];
+  const seen = new Set();
+  for (const e of listOf(c.emails, 10)) {
+    const v = line(typeof e === 'string' ? e : e?.value ?? e?.email, 320);
+    if (!EMAIL.test(v) || seen.has(v.toLowerCase())) continue;
+    seen.add(v.toLowerCase());
+    emails.push({ value: v, ...(typeof e === 'object' && kindOf(e) ? { type: kindOf(e) } : {}) });
+  }
+  if (emails.length) p.emailAddresses = emails;
+  const phones = listOf(c.phones, 10).map((x) => ({ value: line(typeof x === 'string' ? x : x?.number ?? x?.value, 60), ...(typeof x === 'object' && kindOf(x) ? { type: kindOf(x) } : {}) })).filter((x) => /\d/.test(x.value));
+  if (phones.length) p.phoneNumbers = phones;
+  const addresses = listOf(c.addresses, 6).map((x) => ({ formattedValue: clean(typeof x === 'string' ? x : x?.text ?? x?.value, 600).split(/\r?\n/).map((l) => line(l, 200)).filter(Boolean).join('\n'), ...(typeof x === 'object' && kindOf(x) ? { type: kindOf(x) } : {}) })).filter((x) => x.formattedValue);
+  if (addresses.length) p.addresses = addresses;
+  const company = line(c.company, 200), title = line(c.title, 200), department = line(c.department, 200);
+  if (company || title || department) p.organizations = [{ ...(company ? { name: company } : {}), ...(title ? { title } : {}), ...(department ? { department } : {}) }];
+  const note = clean(typeof c.note === 'string' ? c.note.replace(/\r\n?/g, '\n') : '', 4000);
+  if (note) p.biographies = [{ value: note, contentType: 'TEXT_PLAIN' }];
+  const urls = listOf(c.urls, 6).map((x) => ({ value: line(typeof x === 'string' ? x : x?.url ?? x?.value, 500), ...(typeof x === 'object' && kindOf(x) ? { type: kindOf(x) } : {}) })).filter((x) => /^https?:\/\/\S+$/i.test(x.value));
+  if (urls.length) p.urls = urls;
+  const b = typeof c.birthday === 'string' ? /^(?:(\d{4})|-)-(\d{2})-(\d{2})$/.exec(c.birthday.trim()) : null;
+  if (b && +b[2] >= 1 && +b[2] <= 12 && +b[3] >= 1 && +b[3] <= 31) p.birthdays = [{ date: { ...(b[1] ? { year: +b[1] } : {}), month: +b[2], day: +b[3] } }];
+  if (!p.names && !p.emailAddresses && !p.phoneNumbers && !p.organizations?.[0]?.name) throw new TypeError('a contact needs a name, an email address, a phone number or a company');
+  return p;
+}
+
+/**
+ * Adds a contact to a Google account's own contacts (people:createContact; the sign-in must allow `contacts`):
+ * the contact as Google keeps it (GoogleContact, kind 'saved', with its id). `contact`: see personOf. Throws as
+ * googleContacts does (MAIL_AUTH after one forced renewal; GOOGLE_SCOPE when the sign-in only allows reading).
+ * opts: accessToken(account, { force }) (required), signInHint(account), signal, fetch (a stand-in, for tests).
+ */
+export async function googleCreateContact(account, contact, { accessToken, signInHint = () => 'sign in to Google again', signal, fetch: fetchFn = globalThis.fetch } = {}) {
+  if (typeof accessToken !== 'function') throw new TypeError(`account "${account}": Google contacts need an access token source (credentials.google)`);
+  const body = JSON.stringify(personOf(contact));
+  const url = new URL(`${API}/people:createContact`);
+  url.searchParams.set('personFields', PERSON_FIELDS);
+  for (const retry of [true, false]) {
+    const token = await accessToken(account, { force: !retry });
+    const timeout = AbortSignal.timeout(TIMEOUT_MS);
+    // (never sent twice: a 401 is Google refusing it before it made anything)
+    const res = await fetchFn(url, { method: 'POST', headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json' }, body, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+    if (res.status === 401 && retry) continue;
+    const textBody = await res.text();
+    let data = null;
+    try { data = textBody.trim() ? JSON.parse(textBody) : null; } catch { /* not JSON: the status says it */ }
+    if (res.status === 401) throw contactsError(`Google no longer accepts the sign-in for "${account}" — ${signInHint(account)}`, 'MAIL_AUTH', 401);
+    if (res.status !== 200) throw failure(res.status, data, 'the contact', 'adding');
+    // (made is made: a contact of a company alone, no name, mail or phone, is one too: told by its id)
+    const id = typeof data?.resourceName === 'string' && /^people\/[\w-]{1,200}$/.test(data.resourceName) ? data.resourceName : '';
+    if (!id) throw contactsError('Google answered without the contact it made', 'GOOGLE_API', res.status);
+    const company = text(primaryFirst(data?.organizations).map((o) => o?.name).find((n) => text(n)) || '');
+    return { ...(contactOf(data, 'saved') ?? { name: company, email: '', emails: [], kind: 'saved' }), id };
+  }
 }
