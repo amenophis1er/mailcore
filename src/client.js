@@ -1,6 +1,6 @@
 // Mail client contract, backend factory, and per-account auth retry.
 //
-// Every backend (EwsClient in ews.js, ImapClient in imap.js) implements the
+// Every backend (EwsClient in ews.js, ImapClient in imap.js, JmapClient in jmap.js) implements the
 // same duck-typed MailClient interface; callers never see the provider.
 //
 //   findInbox(opts)                     → ListItem[]   newest first
@@ -51,7 +51,7 @@ export function isAuthError(e) {
 export function splitId(id) {
   const s = String(id || '');
   const i = s.indexOf(':');
-  // EWS ids are base64 (no ':'); IMAP raw ids are "<mailbox>/<uidvalidity>/<uid>".
+  // EWS ids are base64 (no ':'), JMAP ids [A-Za-z0-9_-]; IMAP raw ids are "<mailbox>/<uidvalidity>/<uid>".
   if (i <= 0) return { account: null, rawId: s };
   return { account: s.slice(0, i), rawId: s.slice(i + 1) };
 }
@@ -65,6 +65,7 @@ export function idParts(id) {
 
 export function makeBackend(acct, creds) {
   if (!hasMail(acct)) return Promise.resolve(null); // calendar-only account
+  if (acct.provider === 'jmap') return import('./jmap.js').then((m) => new m.JmapClient(acct, creds));
   return acct.provider === 'imap'
     ? import('./imap.js').then((m) => new m.ImapClient(acct, creds))
     : import('./ews.js').then((m) => new m.EwsClient({ host: acct.host, email: acct.email, ...creds }));
@@ -92,6 +93,7 @@ export async function makeCalendarBackend(acct, mailBackend, { timeZone = null, 
 }
 
 export function makeStream(acct, creds, hooks) {
+  if (acct.provider === 'jmap') return import('./jmap-stream.js').then((m) => new m.JmapStream({ account: acct, creds, ...hooks }));
   return acct.provider === 'imap'
     ? import('./imap-stream.js').then((m) => new m.ImapStream({ account: acct, creds, ...hooks }))
     : import('./ews-stream.js').then((m) => new m.EwsStream({ host: acct.host, ...creds, ...hooks }));

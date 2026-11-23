@@ -10,7 +10,7 @@ const credentials: CredentialsProvider = {
 };
 
 const mc: Mailcore = createMailcore({
-  accounts: { work: { provider: 'ews', host: 'https://mail.example.org', email: 'me@example.org' } },
+  accounts: { work: { provider: 'ews', host: 'https://mail.example.org', email: 'me@example.org' }, fm: { provider: 'jmap', email: 'me@example.org', jmap: { session: 'https://api.fastmail.com/jmap/session' } } },
   credentials,
   dataDir: '/tmp/mailcore-types',
   cacheKey: ({ create }) => (create ? 'k' : null),

@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events';
 
 // --- accounts -----------------------------------------------------------------
 
-export type Provider = 'ews' | 'imap' | 'caldav' | 'google';
+export type Provider = 'ews' | 'imap' | 'jmap' | 'caldav' | 'google';
 export type CalendarProvider = 'ews' | 'caldav' | 'google';
 
 export interface CacheSettings { enabled?: boolean; days?: number; bodies?: boolean }
@@ -36,6 +36,17 @@ export interface AccountDefinition {
   streaming?: boolean;
   imap?: ServerSettings;
   smtp?: SmtpSettings;
+  /**
+   * JMAP: `session` is the session URL (e.g. https://api.fastmail.com/jmap/session); a bare host means
+   * https://<host>/.well-known/jmap, and none the email domain's. The password is the API key (a Bearer token).
+   * `folders` names a mailbox (path or name) for a folder the server gives no role.
+   */
+  jmap?: {
+    session?: string;
+    folders?: Partial<Record<'inbox' | 'junk' | 'sent' | 'drafts' | 'trash' | 'archive', string>>;
+    /** TESTS ONLY (a server on 127.0.0.1): lets the API key go to http, IP literals and private addresses. Never set it for a real account. */
+    allowPrivate?: boolean;
+  };
   /** CalDAV: icloud | fastmail | other */
   service?: string;
   server?: string;
@@ -480,7 +491,7 @@ export class AccountClient {
   constructor(name: string, backend: object | null, calendar?: object | (() => Promise<object | null>));
   readonly account: string;
   readonly hasMail: boolean;
-  /** The provider's own client (EwsClient, ImapClient), unprefixed ids. */
+  /** The provider's own client (EwsClient, ImapClient, JmapClient), unprefixed ids. */
   readonly backend: any;
   findInbox(opts?: FindOptions): Promise<ListItem[]>;
   getMessage(id: string, opts?: { bodyType?: BodyType }): Promise<Message>;
@@ -745,7 +756,7 @@ export class Mailcore {
     /** how: 'told' by the server's push, or 'asked' (IMAP's own look); from: IMAP, the first new UID when known. */
     onNewMail?: (how?: 'told' | 'asked', from?: number | null) => void;
     onCalendarChange?: () => void;
-    /** Exchange: the Drafts folder changed. */
+    /** Exchange: the Drafts folder changed. JMAP: the account's Emails changed (drafts among them). */
     onDraftsChange?: () => void;
     authGate?: AuthGate;
     onState?: (state: string) => void;
@@ -798,6 +809,8 @@ export const CACHE_DEFAULTS: Required<CacheSettings>;
 export const CALENDAR_DEFAULTS: Required<CalendarSettings>;
 export const ACCOUNT_DEFAULTS: Record<Provider, Partial<Account>>;
 export function normalizeAccount(name: string, def?: AccountDefinition): Account;
+/** The session URL of a JMAP account (jmap.session, a bare host's or the email domain's /.well-known/jmap). Throws when there is nothing to go by. */
+export function jmapSessionUrl(acct: AccountDefinition): string;
 export function normalizeAccounts(accounts: AccountsInput): Record<string, Account>;
 export function calendarProvider(account: AccountDefinition | null | undefined): CalendarProvider | null;
 export function hasMail(account: AccountDefinition | null | undefined): boolean;

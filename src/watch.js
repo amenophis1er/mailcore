@@ -1,5 +1,5 @@
 // Watching mail accounts: one poll ticker and one push stream (EWS streaming
-// notifications or IMAP IDLE) per account; the interval stays as a safety
+// notifications, IMAP IDLE or a JMAP event source) per account; the interval stays as a safety
 // net for both. New mail is detected against a seen-set kept in the core's
 // state store, and headers (plus bodies of new mail) go to the cache.
 //

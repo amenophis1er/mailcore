@@ -347,7 +347,7 @@ export class Mailcore {
   /** MailWatcher's historical signature: withAuthRetry(fn, onRefresh, account). */
   withAuthRetry(fn, onRefresh, account) { return this.withClient(account, fn, { onRefresh: onRefresh || undefined }); }
 
-  /** Push stream for one mail account (EWS streaming notifications or IMAP IDLE). */
+  /** Push stream for one mail account (EWS streaming notifications, IMAP IDLE, or a JMAP event source). Not the IMAP connection-holding of withClient: a JMAP client holds no connection. */
   async stream(name, hooks = {}) {
     const acct = this.account(name);
     if (!hasMail(acct)) throw new Error(`account "${acct.name}" holds no mail`);
