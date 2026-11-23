@@ -104,9 +104,9 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
    * computer), or, with `redirectUri` (an https address registered for the app, such as a relay's), elsewhere: whoever
    * serves that address hands what Microsoft gave it ({ code, state, error, error_description }) to `complete`, which
    * answers { ok, status, text } for the page shown there. `stateTag`: put before the state (the relay reads which
-   * computer it is for from it). Either way the code is worth nothing without the verifier, which never leaves here.
+   * computer it is for from it). `port`: the local server's (one a tunnel forwards; any free one otherwise). Either way the code is worth nothing without the verifier, which never leaves here.
    */
-  async function beginLogin(account, { loginHint, timeoutMs = 10 * 60e3, appName = 'the app', accept, redirectUri, stateTag } = {}) {
+  async function beginLogin(account, { loginHint, timeoutMs = 10 * 60e3, appName = 'the app', accept, redirectUri, stateTag, port: wanted = 0 } = {}) {
     const id = client();
     const store = tokenStore();
     const verifier = randomBytes(48).toString('base64url');
@@ -119,7 +119,7 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
       redirect = r.toString();
     } else {
       server = http.createServer();
-      await new Promise((res, rej) => { server.once('error', rej); server.listen(0, '127.0.0.1', res); });
+      await new Promise((res, rej) => { server.once('error', rej); server.listen(wanted, '127.0.0.1', res); });
       const port = server.address().port;
       // (Microsoft matches a loopback redirect whatever its port: registered as http://localhost)
       redirect = `http://localhost:${port}/`;
