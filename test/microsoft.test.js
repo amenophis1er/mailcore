@@ -46,6 +46,32 @@ test('a sign-in: the consent URL, the redirect answered once, the code exchanged
   assert.equal(m.get('work').email, 'sam@contoso.com');
 });
 
+test('a sign-in returned to an outside address (a relay): no server here, the state tagged, completed once with what arrived there', async () => {
+  const { m, store } = memory();
+  const asked = [];
+  const fetchFn = async (url, init) => { asked.push(Object.fromEntries(new URLSearchParams(init.body))); return new Response(JSON.stringify({ access_token: 'at1', refresh_token: 'rt1', expires_in: 3600, id_token: jwt({ preferred_username: 'me@outlook.com', tid: MICROSOFT_PERSONAL_TENANT, oid: 'o2' }) })); };
+  const ms = microsoftAuth({ store, clientId: 'app-id', fetchFn });
+  await assert.rejects(ms.beginLogin('x', { redirectUri: 'http://relay.example/oauth' }), /https/);
+  const flow = await ms.beginLogin('me', { redirectUri: 'https://relay.example/oauth/microsoft', stateTag: '0123456789abcdef' });
+  const u = new URL(flow.url);
+  assert.equal(u.searchParams.get('redirect_uri'), 'https://relay.example/oauth/microsoft');
+  assert.match(flow.state, /^0123456789abcdef\.[A-Za-z0-9_-]{32}$/);
+  assert.equal(u.searchParams.get('state'), flow.state);
+  assert.equal((await flow.complete({ state: '0123456789abcdef.other', code: 'c' })).status, 400); // (not this sign-in: it still waits)
+  const a = await flow.complete({ state: flow.state, code: 'the-code' });
+  assert.deepEqual([a.ok, a.status], [true, 200]);
+  assert.match(a.text, /me@outlook\.com/);
+  assert.deepEqual([asked[0].redirect_uri, asked[0].code], ['https://relay.example/oauth/microsoft', 'the-code']);
+  assert.equal((await flow.done).personal, true);
+  assert.equal(m.get('me').identity, `${MICROSOFT_PERSONAL_TENANT}:o2`);
+  assert.equal((await flow.complete({ state: flow.state, code: 'again' })).status, 410);
+  assert.equal(asked.length, 1);
+  // refused at Microsoft: said, and the flow ends refused
+  const f2 = await ms.beginLogin('me', { redirectUri: 'https://relay.example/oauth/microsoft' });
+  assert.equal((await f2.complete({ state: f2.state, error: 'access_denied', error_description: 'the user declined' })).ok, false);
+  await assert.rejects(f2.done, (e) => e.code === 'SIGN_IN_REFUSED' && /declined/.test(e.message));
+});
+
 test('renewals: the token kept while fresh, renewed near expiry with the new refresh token kept; refused, it says to sign in again', async () => {
   const { m, store } = memory();
   m.set('work', { refresh_token: 'rt1', access_token: 'old', expires_at: Date.now() + 30e3, email: 'sam@contoso.com' });

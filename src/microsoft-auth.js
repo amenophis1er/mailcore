@@ -96,22 +96,35 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
   }
 
   /**
-   * Start an interactive sign-in: a one-time server on 127.0.0.1 waits for Microsoft's redirect. Returns at once
-   * with { url, done, cancel } as google-auth's beginLogin does. `done` resolves with what was stored, which carries
-   * `email`, `name` and `personal` from the ID token. opts: loginHint, timeoutMs, appName, accept(tokens, { signal }).
+   * Start an interactive sign-in. Returns at once with { url, redirectUri, state, done, cancel, complete }, as
+   * google-auth's beginLogin does; `done` resolves with what was stored, which carries `email`, `name` and `personal`
+   * from the ID token. opts: loginHint, timeoutMs, appName, accept(tokens, { signal }).
+   *
+   * Microsoft sends the browser back either to a one-time server on 127.0.0.1 (the default: the browser is on this
+   * computer), or, with `redirectUri` (an https address registered for the app, such as a relay's), elsewhere: whoever
+   * serves that address hands what Microsoft gave it ({ code, state, error, error_description }) to `complete`, which
+   * answers { ok, status, text } for the page shown there. `stateTag`: put before the state (the relay reads which
+   * computer it is for from it). Either way the code is worth nothing without the verifier, which never leaves here.
    */
-  async function beginLogin(account, { loginHint, timeoutMs = 10 * 60e3, appName = 'the app', accept } = {}) {
+  async function beginLogin(account, { loginHint, timeoutMs = 10 * 60e3, appName = 'the app', accept, redirectUri, stateTag } = {}) {
     const id = client();
     const store = tokenStore();
     const verifier = randomBytes(48).toString('base64url');
     const challenge = createHash('sha256').update(verifier).digest('base64url');
-    const state = randomBytes(16).toString('hex');
-    const server = http.createServer();
-    await new Promise((res, rej) => { server.once('error', rej); server.listen(0, '127.0.0.1', res); });
-    const port = server.address().port;
-    // (Microsoft matches a loopback redirect whatever its port: registered as http://localhost)
-    const redirect = `http://localhost:${port}/`;
-    const hosts = new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
+    const state = (stateTag ? `${stateTag}.` : '') + randomBytes(24).toString('base64url');
+    let server = null, redirect, hosts;
+    if (redirectUri) {
+      const r = new URL(redirectUri);
+      if (r.protocol !== 'https:') throw new Error('an outside redirect must be https');
+      redirect = r.toString();
+    } else {
+      server = http.createServer();
+      await new Promise((res, rej) => { server.once('error', rej); server.listen(0, '127.0.0.1', res); });
+      const port = server.address().port;
+      // (Microsoft matches a loopback redirect whatever its port: registered as http://localhost)
+      redirect = `http://localhost:${port}/`;
+      hosts = new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
+    }
     const url = new URL(`${AUTHORITY}/authorize`);
     Object.entries({ client_id: id, redirect_uri: redirect, response_type: 'code', response_mode: 'query', scope: MICROSOFT_MAIL_SCOPES.join(' '), prompt: 'select_account', code_challenge: challenge, code_challenge_method: 'S256', state, ...(loginHint ? { login_hint: String(loginHint) } : {}) })
       .forEach(([k, v]) => url.searchParams.set(k, v));
@@ -122,36 +135,27 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
     let finish;
     const done = new Promise((resolve, reject) => { finish = (err, value) => { phase = 'ended'; if (err) reject(err); else resolve(value); }; });
     done.catch(() => {});
-    const shut = () => { server.close(); server.closeAllConnections?.(); };
+    const shut = () => { if (server) { server.close(); server.closeAllConnections?.(); } };
     const end = (err, value) => { if (settled) return; settled = true; clearTimeout(timer); shut(); finish(err, value); };
     const timer = setTimeout(() => end(signInError(`sign-in timed out after ${Math.max(1, Math.round(timeoutMs / 60e3))} minute(s)`, 'SIGN_IN_TIMEOUT')), timeoutMs);
     timer.unref?.();
     const back = `You can close this tab and return to ${appName}.`;
 
-    server.on('request', async (req, res) => {
-      const refuse = (status, text) => res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', connection: 'close' }).end(text);
-      if (settled) return refuse(410, 'This sign-in has ended.');
-      if (req.method !== 'GET') return refuse(405, 'not here');
-      // only this machine's own address: not a name of the web that points here
-      if (!hosts.has(req.headers.host)) return refuse(400, 'wrong host');
-      let q;
-      try { q = new URL(req.url, redirect); } catch { return refuse(400, 'bad request'); }
-      if (q.pathname !== '/') return refuse(404, 'not here');
-      if (q.searchParams.get('state') !== state) return refuse(400, 'wrong state');
+    /** What Microsoft sent back, wherever it arrived: { ok, status, text } for the page that shows it. */
+    async function complete({ code, state: given, error, error_description: described } = {}) {
+      if (settled) return { ok: false, status: 410, text: 'This sign-in has ended.' };
+      if (typeof given !== 'string' || given !== state) return { ok: false, status: 400, text: 'This is not the sign-in that was started.' };
       settled = true;
       phase = 'checking';
       clearTimeout(timer);
-      const page = (ok, text) => res.writeHead(ok ? 200 : 400, { 'content-type': 'text/html; charset=utf-8', connection: 'close', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }).end(endPage(ok, text));
-      const error = q.searchParams.get('error');
-      const code = q.searchParams.get('code');
+      const said = (ok, text) => ({ ok, status: ok ? 200 : 400, text }); // (the server, if any, shuts once it has answered)
       if (error || !code) {
-        page(false, `Microsoft said: ${error || 'no code'}. ${back}`);
-        shut();
-        return finish(signInError(`Microsoft refused: ${q.searchParams.get('error_description')?.split('\r\n')[0] || error || 'no code was sent'}`, 'SIGN_IN_REFUSED'));
+        finish(signInError(`Microsoft refused: ${String(described || '').split('\r\n')[0] || error || 'no code was sent'}`, 'SIGN_IN_REFUSED'));
+        return said(false, `Microsoft said: ${error || 'no code'}. ${back}`);
       }
       const cancelled = () => signInError('sign-in cancelled', 'SIGN_IN_CANCELLED');
       try {
-        const t = await tokenRequest({ client_id: id, code, code_verifier: verifier, grant_type: 'authorization_code', redirect_uri: redirect, scope: MICROSOFT_MAIL_SCOPES.join(' ') }, abort.signal);
+        const t = await tokenRequest({ client_id: id, code: String(code), code_verifier: verifier, grant_type: 'authorization_code', redirect_uri: redirect, scope: MICROSOFT_MAIL_SCOPES.join(' ') }, abort.signal);
         if (abort.signal.aborted) throw cancelled();
         if (!t.refresh_token) throw signInError('Microsoft did not return a refresh token', 'SIGN_IN_FAILED');
         const who = idTokenClaims(t.id_token);
@@ -166,15 +170,28 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
         }
         phase = 'storing';
         await store.set(account, stored);
-        page(true, `Signed in to Microsoft as ${who.email}. ${back}`);
-        shut();
         finish(null, stored);
+        return said(true, `Signed in to Microsoft as ${who.email}. ${back}`);
       } catch (e) {
         const err = abort.signal.aborted ? cancelled() : e.code ? e : signInError(e.message, 'SIGN_IN_FAILED');
-        page(false, err.code === 'SIGN_IN_REJECTED' ? `${err.message} ${back}` : err.code === 'SIGN_IN_CANCELLED' ? `The sign-in was cancelled. ${back}` : `The sign-in could not be completed. ${back}`);
-        shut();
         finish(err);
+        return said(false, err.code === 'SIGN_IN_REJECTED' ? `${err.message} ${back}` : err.code === 'SIGN_IN_CANCELLED' ? `The sign-in was cancelled. ${back}` : `The sign-in could not be completed. ${back}`);
       }
+    }
+
+    server?.on('request', async (req, res) => {
+      const refuse = (status, text) => res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8', connection: 'close' }).end(text);
+      if (settled) return refuse(410, 'This sign-in has ended.');
+      if (req.method !== 'GET') return refuse(405, 'not here');
+      // only this machine's own address: not a name of the web that points here
+      if (!hosts.has(req.headers.host)) return refuse(400, 'wrong host');
+      let q;
+      try { q = new URL(req.url, redirect); } catch { return refuse(400, 'bad request'); }
+      if (q.pathname !== '/') return refuse(404, 'not here');
+      if (q.searchParams.get('state') !== state) return refuse(400, 'wrong state');
+      const a = await complete(Object.fromEntries(['code', 'state', 'error', 'error_description'].map((k) => [k, q.searchParams.get(k) ?? undefined])));
+      res.writeHead(a.status, { 'content-type': 'text/html; charset=utf-8', connection: 'close', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' }).end(endPage(a.ok, a.text));
+      shut();
     });
 
     const cancel = () => {
@@ -182,7 +199,7 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
       if (phase === 'checking') { abort.abort(); return true; }
       return false;
     };
-    return { url: url.toString(), redirectUri: redirect, done, cancel };
+    return { url: url.toString(), redirectUri: redirect, state, done, cancel, complete };
   }
 
   /** A valid access token for the account's IMAP and SMTP, renewed when within a minute of expiry (and its refresh token with it). */
