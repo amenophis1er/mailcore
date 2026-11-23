@@ -5,18 +5,22 @@
 //   { provider: 'ews',    host, username, domain, email, cache, calendar, streaming }
 //   { provider: 'imap',   email, username, imap: { host, port, secure }, smtp: { … }, cache,
 //                         calendar?: { provider: 'google' | 'caldav', … } }
+//   { provider: 'jmap',   email, username, jmap: { session }, cache }
+//                         session: the JMAP session URL (RFC 8620); empty: https://<email's domain>/.well-known/jmap,
+//                         and a bare host stands for https://<host>/.well-known/jmap. The password is the API key
+//                         (sent as a Bearer token); a sign-in with a provider (creds.oauth) works too.
 //   { provider: 'caldav', service, server, username, email, calendar }   (calendar only)
 //   { provider: 'google', email, calendar }                               (calendar only)
 //
-//   displayName (optional, ews and imap): the name mail is written as — on
+//   displayName (optional, ews, imap and jmap): the name mail is written as — on
 //   IMAP the name in the From of what is sent and drafted (see displayNameOf).
 //
 // Unknown fields are kept as they are (front ends carry their own, such as
 // where the password comes from).
 
-export const PROVIDERS = ['ews', 'imap', 'caldav', 'google'];
+export const PROVIDERS = ['ews', 'imap', 'jmap', 'caldav', 'google'];
 /** Providers that hold mail (the others are calendar-only accounts). */
-export const MAIL_PROVIDERS = ['ews', 'imap'];
+export const MAIL_PROVIDERS = ['ews', 'imap', 'jmap'];
 
 // cache: encrypted local copy of the inbox (headers always, bodies of new
 // mail) for the last `days` days — on by default, see cache.js.
@@ -31,6 +35,7 @@ export const ACCOUNT_DEFAULTS = {
   ews: { provider: 'ews', host: '', username: '', domain: '', email: '', cache: { ...CACHE_DEFAULTS }, calendar: { ...CALENDAR_DEFAULTS } },
   caldav: { provider: 'caldav', service: 'other', server: '', username: '', email: '', calendar: { ...CALENDAR_DEFAULTS } },
   google: { provider: 'google', email: '', calendar: { ...CALENDAR_DEFAULTS } },
+  jmap: { provider: 'jmap', email: '', username: '', jmap: { session: '' }, cache: { ...CACHE_DEFAULTS } },
   imap: {
     provider: 'imap',
     email: '',
@@ -55,6 +60,8 @@ export function normalizeAccount(name, acct = {}) {
       ? { imap: { ...base.imap, ...(acct.imap || {}) }, smtp: { ...base.smtp, ...(acct.smtp || {}) },
           // an IMAP mailbox may carry a calendar of its own: calendar: { provider: 'google' | 'caldav', … }
           ...(acct.calendar && acct.calendar.provider ? { calendar: { ...CALENDAR_DEFAULTS, ...acct.calendar } } : {}) }
+      : provider === 'jmap'
+      ? { jmap: { ...base.jmap, ...(acct.jmap || {}) } } // (no calendar: JMAP calendars are not read here)
       : { calendar: { ...CALENDAR_DEFAULTS, ...(acct.calendar === false ? { watch: false } : acct.calendar || {}) } })
   };
 }
@@ -77,6 +84,19 @@ export function calendarProvider(acct) {
   if (acct.provider === 'caldav' || acct.provider === 'google') return acct.provider;
   if (acct.provider === 'imap' && acct.calendar && ['google', 'caldav'].includes(acct.calendar.provider)) return acct.calendar.provider;
   return null;
+}
+
+/**
+ * The session URL of a JMAP account: jmap.session as it is when it is a URL; a bare host (no scheme) is that host's
+ * well-known address (RFC 8620 §2.2), and none at all is the email domain's. Throws when there is nothing to go by.
+ */
+export function jmapSessionUrl(acct) {
+  const set = String(acct?.jmap?.session || '').trim();
+  if (/^https?:\/\//i.test(set)) return set;
+  if (set) return `https://${set.replace(/\/+$/, '')}${set.includes('/') ? '' : '/.well-known/jmap'}`;
+  const domain = /@([^@\s]+)$/.exec(String(acct?.email || acct?.username || '').trim())?.[1];
+  if (!domain) throw new Error(`account "${acct?.name}": set jmap.session (the JMAP session URL) or an email address`);
+  return `https://${domain.toLowerCase()}/.well-known/jmap`;
 }
 
 export function hasMail(acct) { return !!acct && MAIL_PROVIDERS.includes(acct.provider); }

@@ -1,4 +1,4 @@
-// mailcore: mail and calendar accounts (Exchange/EWS, IMAP+SMTP, CalDAV,
+// mailcore: mail and calendar accounts (Exchange/EWS, IMAP+SMTP, JMAP, CalDAV,
 // Google) with push, an encrypted cache, drafts and calendars. One entry
 // point; configuration and secrets are always handed in by the caller.
 
@@ -12,7 +12,7 @@ export function createMailcore(options) {
 export { Mailcore } from './core.js';
 export { htmlToText, plainText } from './text.js';
 export { AccountClient, splitId, idParts, isAuthError } from './client.js';
-export { PROVIDERS, MAIL_PROVIDERS, CACHE_DEFAULTS, CALENDAR_DEFAULTS, ACCOUNT_DEFAULTS, normalizeAccount, normalizeAccounts, calendarProvider, hasMail, displayNameOf } from './accounts.js';
+export { PROVIDERS, MAIL_PROVIDERS, CACHE_DEFAULTS, CALENDAR_DEFAULTS, ACCOUNT_DEFAULTS, normalizeAccount, normalizeAccounts, calendarProvider, hasMail, displayNameOf, jmapSessionUrl } from './accounts.js';
 export { MailWatch } from './watch.js';
 export { watchCalendar } from './calendar-watch.js';
 export { EventLog, gapInfo, matchesFilter, QUEUED_TYPES, MAIL_TYPES } from './event-log.js';

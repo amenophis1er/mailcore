@@ -1,7 +1,8 @@
 # mailcore
 
-Mail and calendar accounts for Node: Exchange (EWS over NTLM), IMAP + SMTP, CalDAV (iCloud, Fastmail, any
-RFC 4791 server) and Google Calendar. Push (EWS streaming notifications, IMAP IDLE), an encrypted local cache
+Mail and calendar accounts for Node: Exchange (EWS over NTLM), IMAP + SMTP, JMAP (Fastmail, Mailflare, any
+RFC 8621 server), CalDAV (iCloud, Fastmail, any RFC 4791 server) and Google Calendar. Push (EWS streaming
+notifications, IMAP IDLE, JMAP event source), an encrypted local cache
 (SQLCipher), search, plain-text reads, threads, attachments, drafts and send, and calendars (list, events,
 free/busy, free slots, create/update/delete/respond).
 
@@ -75,6 +76,23 @@ Also exported: `EventLog` (a cursor-backed, bounded, optionally persisted event 
 an async iterator `events()`), rule matching (`ruleMatches`, `matchRule`, `accountOk`, `inQuietHours`), date
 helpers (`parseWhen`, `parseDuration`, `dayStart`), body helpers (`prepareBody`, `replaceAboveQuote`,
 `htmlToText`, …), thread helpers, and account normalization.
+
+### JMAP accounts
+
+```js
+fm: { provider: 'jmap', email: 'me@example.org', jmap: { session: 'https://api.fastmail.com/jmap/session' } }
+```
+
+- The API key is the account's password: `getPassword` returns `{ password: '<api key>' }`, sent as
+  `Authorization: Bearer <api key>`. A sign-in token works too (`{ oauth: async () => token }`, asked at each request).
+- `jmap.session` is the session URL. A bare host (`mail.example.org`) means `https://mail.example.org/.well-known/jmap`;
+  none at all means the email domain's `/.well-known/jmap`. The well-known redirect is followed with the key sent
+  again (to https only). `jmap.folders` names a mailbox for a folder the server gives no role (as `imap.folders`).
+- Written to RFC 8620/8621 only: folders by mailbox role, sending by `EmailSubmission/set` (the identity of the From
+  address, else the account's), drafts imported as raw messages, so they read and reply exactly as on IMAP.
+- Push holds the session's `eventSourceUrl` (Server-Sent Events); a server without one is polled. No
+  `changesIn`/`newSince` (those are IMAP UID marks): a watcher keeps a JMAP account in step by listing it, as Exchange.
+- A 401/403 is `MAIL_AUTH`; an unreachable server is `MAIL_NETWORK`; a 5xx carries its `status` and is not an auth error.
 
 ### Credentials and the cache key
 

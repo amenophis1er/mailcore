@@ -24,14 +24,14 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { z } from 'zod';
 import { prepareBody, BODY_FORMATS } from './body.js';
-import { calendarProvider } from './accounts.js';
+import { calendarProvider, hasMail, jmapSessionUrl } from './accounts.js';
 import { parseWhen } from './calendar.js';
 
 export const EFFECTS = ['read', 'local', 'draft', 'own-calendar', 'others'];
 
 /** The server instructions that go with the tools (allowSend says whether sending is on). */
 export function mailInstructions({ allowSend = false, name = 'mailwatcher' } = {}) {
-  return `${name}: the user's mailboxes (Exchange and/or IMAP; list_accounts) and Exchange calendars. Message and event ids are "<account>:<id>".
+  return `${name}: the user's mailboxes (Exchange, IMAP and/or JMAP; list_accounts) and Exchange calendars. Message and event ids are "<account>:<id>".
 Reading is open. Writing creates DRAFTS only (draft_reply, draft_reply_all, compose_draft) — mail is never sent unless a send_draft tool is present AND the user explicitly asks to send. Bodies are plain text by default; pass format: 'markdown' for tables/lists/bold (converted to HTML) or 'html'. add_attachment with inline: true embeds an image for <img src=\"cid:…\">.
 
 Calendar (Exchange, CalDAV — iCloud/Fastmail — and Google accounts; list_accounts says which): list_calendars, list_events (own calendars by name, or a colleague's shared calendar by email on Exchange/Google), get_event, free_busy / find_free_slots (anyone in the organisation on Exchange; people who share with you on Google; via the scheduling outbox on CalDAV), create_event, update_event, delete_event, respond_to_event. Dates accept ISO or natural forms ("tomorrow 9am", "friday 14:00", "+2d"). Creating a meeting with attendees, changing or cancelling one, and accepting/declining all SEND mail to other people: ${allowSend ? 'allowed here, but only do it when the user explicitly asks' : 'disabled here (mcp.allowSend is off) — create attendee-less appointments only, and tell the user how to enable it'}.`;
@@ -328,7 +328,7 @@ export function mailTools({ allowSend = false, attachmentsDir, attachmentsLabel,
     ({ core, mail, cal, json, when, needSend, getThread, awaitingReply, saveAttachments, attachmentsDir }) =>
     async () => {
       const cfg = core.config;
-      return json(Object.values(cfg.accounts).map((a) => ({ name: a.name, provider: a.provider, mail: ['ews', 'imap'].includes(a.provider), calendar: calendarProvider(a) || null, server: a.provider === 'imap' ? a.imap?.host : a.provider === 'caldav' ? (a.server || a.service) : a.provider === 'google' ? 'calendar.google.com' : a.host, email: a.email || undefined })));
+      return json(Object.values(cfg.accounts).map((a) => ({ name: a.name, provider: a.provider, mail: hasMail(a), calendar: calendarProvider(a) || null, server: a.provider === 'imap' ? a.imap?.host : a.provider === 'jmap' ? jmapHost(a) : a.provider === 'caldav' ? (a.server || a.service) : a.provider === 'google' ? 'calendar.google.com' : a.host, email: a.email || undefined })));
     }),
   tool('list_calendars', 'read',
     {
@@ -476,4 +476,9 @@ export function mailTools({ allowSend = false, attachmentsDir, attachmentsLabel,
 function mimeFor(file) {
   const ext = String(file).toLowerCase().split('.').pop();
   return { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf', txt: 'text/plain', csv: 'text/csv', html: 'text/html', json: 'application/json', zip: 'application/zip' }[ext] || undefined;
+}
+
+/** The host of a JMAP account's session URL ('' when it has none to go by). */
+function jmapHost(acct) {
+  try { return new URL(jmapSessionUrl(acct)).host; } catch { return ''; }
 }

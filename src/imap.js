@@ -22,7 +22,7 @@ import { isAutoReply, AUTO_REPLY_HEADERS } from './auto-reply.js';
 export { idParts }; // defined beside splitId, so it can be had without loading the IMAP backend
 
 const FOLDER_SPECIAL = { inbox: '\\Inbox', junk: '\\Junk', sent: '\\Sent', drafts: '\\Drafts', trash: '\\Trash', archive: '\\Archive' };
-const FOLDER_NAMES = {
+export const FOLDER_NAMES = {
   inbox: ['inbox'],
   junk: ['junk', 'spam', 'junk e-mail', 'junk email', 'bulk mail'],
   sent: ['sent', 'sent items', 'sent messages', 'sent mail'],
@@ -434,33 +434,7 @@ export class ImapClient {
     const { path, uid } = parseId(id);
     // (a reply carries none of the attachments: a large message is read without them, but with the pictures its quote shows)
     const { parsed } = await this.#read(path, uid, { pictures: bodyType === 'HTML' });
-    const from = addrs(parsed.from)[0] || {};
-    const replyTo = addrs(parsed.replyTo);
-    const recipients = (replyTo.length ? replyTo : [from]).concat(all ? addrs(parsed.to) : []).map((a) => a.email).filter(Boolean);
-    const cc = all ? addrs(parsed.cc).map((a) => a.email).filter(Boolean) : [];
-    const notSelf = (e) => e.toLowerCase() !== this.self;
-    const to = uniq(recipients.filter(notSelf));
-    const subject = /^re:/i.test(parsed.subject || '') ? parsed.subject : `Re: ${parsed.subject || ''}`;
-    const when = parsed.date ? parsed.date.toUTCString() : '';
-    const who = from.name ? `${from.name} <${from.email}>` : from.email || '';
-    const origText = String(parsed.text || stripHtml(parsed.html || ''));
-    const quoted = origText.split('\n').map((l) => '> ' + l).join('\n');
-    const html = bodyType === 'HTML';
-    const text = `${html ? stripHtml(newBodyText) : newBodyText}\n\nOn ${when}, ${who} wrote:\n${quoted}\n`;
-    const htmlBody = html
-      ? `${newBodyText}<br><br><div>On ${escapeHtml(when)}, ${escapeHtml(who)} wrote:</div><blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${parsed.html || `<pre style="white-space:pre-wrap">${escapeHtml(origText)}</pre>`}</blockquote>`
-      : undefined;
-    const refs = [].concat(parsed.references || [], parsed.messageId || []).filter(Boolean);
-    const draftId = await this.#appendDraft({
-      from: this.#from,
-      to,
-      cc: uniq(cc.filter(notSelf).filter((e) => !to.includes(e))),
-      subject,
-      text,
-      html: htmlBody,
-      inReplyTo: parsed.messageId,
-      references: refs.join(' ')
-    });
+    const draftId = await this.#appendDraft(replyMail(parsed, newBodyText, { all, bodyType, self: this.self, from: this.#from }));
     return { draftId, changeKey: draftId };
   }
 
@@ -468,22 +442,7 @@ export class ImapClient {
   async draftForward(id, _changeKey, newBodyText, { bodyType = 'Text', to = [], cc = [], bcc = [] } = {}) {
     const { path, uid } = parseId(id);
     const { parsed } = await this.#fetchParsed(path, uid);
-    const from = addrs(parsed.from)[0] || {};
-    const who = from.name ? `${from.name} <${from.email}>` : from.email || '';
-    const when = parsed.date ? parsed.date.toUTCString() : '';
-    const toLine = addrs(parsed.to).map((a) => a.email).join(', ');
-    const subject = /^fwd?:/i.test(parsed.subject || '') ? parsed.subject : `Fwd: ${parsed.subject || ''}`;
-    const header = [`From: ${who}`, `Date: ${when}`, `Subject: ${parsed.subject || ''}`, `To: ${toLine}`];
-    const origText = String(parsed.text || stripHtml(parsed.html || ''));
-    const html = bodyType === 'HTML';
-    const text = `${html ? stripHtml(newBodyText) : newBodyText}\n\n---------- Forwarded message ----------\n${header.join('\n')}\n\n${origText}\n`;
-    const htmlBody = html
-      ? `${newBodyText}<br><br><div>---------- Forwarded message ----------<br>${header.map(escapeHtml).join('<br>')}</div><br>${parsed.html || `<pre style="white-space:pre-wrap">${escapeHtml(origText)}</pre>`}`
-      : undefined;
-    const draftId = await this.#appendDraft({
-      from: this.#from, to, cc, bcc, subject, text, html: htmlBody,
-      attachments: (parsed.attachments || []).map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType, cid: a.cid }))
-    });
+    const draftId = await this.#appendDraft(forwardMail(parsed, newBodyText, { bodyType, to, cc, bcc, from: this.#from }));
     return { draftId, changeKey: draftId };
   }
 
@@ -815,13 +774,6 @@ export class ImapClient {
     return name ? { name, address: this.self } : this.self;
   }
 
-  /** The From a draft keeps when it is written again: its own when it is from another address (an alias), else the account's as it is now. */
-  #fromOf(parsed) {
-    const was = addrs(parsed.from)[0];
-    if (!was?.email || was.email.toLowerCase() === this.self) return this.#from;
-    return was.name ? { name: was.name, address: was.email } : was.email;
-  }
-
   async #appendDraft(mail) {
     return this.#append(await this.#folder('drafts'), await compose(mail, { keepBcc: true }), ['\\Draft', '\\Seen']); // a draft remembers its Bcc
   }
@@ -829,18 +781,7 @@ export class ImapClient {
   async #rewriteDraft(id, mutate) {
     const { path, uid } = parseId(id);
     const { parsed } = await this.#fetchParsed(path, uid);
-    const mail = {
-      from: this.#fromOf(parsed),
-      to: addrs(parsed.to).map((a) => a.email),
-      cc: addrs(parsed.cc).map((a) => a.email),
-      bcc: addrs(parsed.bcc).map((a) => a.email),
-      subject: parsed.subject || '',
-      text: parsed.text || undefined,
-      html: parsed.html || undefined,
-      inReplyTo: parsed.inReplyTo || undefined,
-      references: Array.isArray(parsed.references) ? parsed.references.join(' ') : parsed.references || undefined,
-      attachments: (parsed.attachments || []).map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType, cid: a.cid }))
-    };
+    const mail = draftMail(parsed, { self: this.self, from: this.#from });
     mutate(mail);
     const newId = await this.#appendDraft(mail);
     await this.#delete(path, uid);
@@ -879,6 +820,79 @@ export class ImapClient {
   }
 }
 
+// --- drafts: what a reply, a forward or a draft written again is made of (shared with jmap.js) -------------
+
+/** A reply to a parsed message (to its sender, or `all`): its people, subject, quoted original and threading, as MailComposer takes it. */
+export function replyMail(parsed, newBodyText, { all = true, bodyType = 'Text', self = '', from }) {
+  const sender = addrs(parsed.from)[0] || {};
+  const replyTo = addrs(parsed.replyTo);
+  const recipients = (replyTo.length ? replyTo : [sender]).concat(all ? addrs(parsed.to) : []).map((a) => a.email).filter(Boolean);
+  const cc = all ? addrs(parsed.cc).map((a) => a.email).filter(Boolean) : [];
+  const notSelf = (e) => e.toLowerCase() !== self;
+  const to = uniq(recipients.filter(notSelf));
+  const subject = /^re:/i.test(parsed.subject || '') ? parsed.subject : `Re: ${parsed.subject || ''}`;
+  const when = parsed.date ? parsed.date.toUTCString() : '';
+  const who = sender.name ? `${sender.name} <${sender.email}>` : sender.email || '';
+  const origText = String(parsed.text || stripHtml(parsed.html || ''));
+  const quoted = origText.split('\n').map((l) => '> ' + l).join('\n');
+  const html = bodyType === 'HTML';
+  const text = `${html ? stripHtml(newBodyText) : newBodyText}\n\nOn ${when}, ${who} wrote:\n${quoted}\n`;
+  const htmlBody = html
+    ? `${newBodyText}<br><br><div>On ${escapeHtml(when)}, ${escapeHtml(who)} wrote:</div><blockquote style="margin:0 0 0 .8ex;border-left:1px solid #ccc;padding-left:1ex">${parsed.html || `<pre style="white-space:pre-wrap">${escapeHtml(origText)}</pre>`}</blockquote>`
+    : undefined;
+  const refs = [].concat(parsed.references || [], parsed.messageId || []).filter(Boolean);
+  return {
+    from,
+    to,
+    cc: uniq(cc.filter(notSelf).filter((e) => !to.includes(e))),
+    subject,
+    text,
+    html: htmlBody,
+    inReplyTo: parsed.messageId,
+    references: refs.join(' ')
+  };
+}
+
+/** A forward of a parsed message: the original below the new body, its attachments carried over. */
+export function forwardMail(parsed, newBodyText, { bodyType = 'Text', to = [], cc = [], bcc = [], from }) {
+  const sender = addrs(parsed.from)[0] || {};
+  const who = sender.name ? `${sender.name} <${sender.email}>` : sender.email || '';
+  const when = parsed.date ? parsed.date.toUTCString() : '';
+  const toLine = addrs(parsed.to).map((a) => a.email).join(', ');
+  const subject = /^fwd?:/i.test(parsed.subject || '') ? parsed.subject : `Fwd: ${parsed.subject || ''}`;
+  const header = [`From: ${who}`, `Date: ${when}`, `Subject: ${parsed.subject || ''}`, `To: ${toLine}`];
+  const origText = String(parsed.text || stripHtml(parsed.html || ''));
+  const html = bodyType === 'HTML';
+  const text = `${html ? stripHtml(newBodyText) : newBodyText}\n\n---------- Forwarded message ----------\n${header.join('\n')}\n\n${origText}\n`;
+  const htmlBody = html
+    ? `${newBodyText}<br><br><div>---------- Forwarded message ----------<br>${header.map(escapeHtml).join('<br>')}</div><br>${parsed.html || `<pre style="white-space:pre-wrap">${escapeHtml(origText)}</pre>`}`
+    : undefined;
+  return {
+    from, to, cc, bcc, subject, text, html: htmlBody,
+    attachments: (parsed.attachments || []).map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType, cid: a.cid }))
+  };
+}
+
+/**
+ * A parsed draft as MailComposer takes it, to be written again. Its From is its own when it is from another
+ * address (an alias), else `from` (the account's as it is now; `self`: the account's address).
+ */
+export function draftMail(parsed, { self = '', from }) {
+  const was = addrs(parsed.from)[0];
+  return {
+    from: !was?.email || was.email.toLowerCase() === self ? from : was.name ? { name: was.name, address: was.email } : was.email,
+    to: addrs(parsed.to).map((a) => a.email),
+    cc: addrs(parsed.cc).map((a) => a.email),
+    bcc: addrs(parsed.bcc).map((a) => a.email),
+    subject: parsed.subject || '',
+    text: parsed.text || undefined,
+    html: parsed.html || undefined,
+    inReplyTo: parsed.inReplyTo || undefined,
+    references: Array.isArray(parsed.references) ? parsed.references.join(' ') : parsed.references || undefined,
+    attachments: (parsed.attachments || []).map((a) => ({ filename: a.filename, content: a.content, contentType: a.contentType, cid: a.cid }))
+  };
+}
+
 // --- helpers -----------------------------------------------------------------
 
 function makeId(path, uidValidity, uid) {
@@ -886,7 +900,7 @@ function makeId(path, uidValidity, uid) {
 }
 
 /** A parsed message as the clients hand it out: the list item, the people, the attachments and one form of the body. */
-function shaped(item, parsed, bodyType = 'Text') {
+export function shaped(item, parsed, bodyType = 'Text') {
   const html = parsed.html || null;
   const text = parsed.text || (html ? stripHtml(html) : '');
   const useHtml = bodyType === 'HTML' && html;
@@ -928,7 +942,7 @@ function parseId(id) {
   return { path: decodeURIComponent(m[1]), uidValidity: m[2], uid: Number(m[3]) };
 }
 
-function attachmentId(a, i) {
+export function attachmentId(a, i) {
   // by its part (the same whether the message was read whole or without its attachments); else, stable across
   // re-parses of the same source: content checksum, else position
   if (a.partId) return `p${a.partId}`;
@@ -936,7 +950,7 @@ function attachmentId(a, i) {
 }
 
 /** Whether an attachment is the one an id names: as attachmentId names it now, or as it named it before (by checksum). */
-function isAttachment(a, i, id) {
+export function isAttachment(a, i, id) {
   return attachmentId(a, i) === id || `${i + 1}-${a.checksum || 'x'}` === id;
 }
 
@@ -1071,7 +1085,7 @@ function hasAttachment(node) {
   return (node.childNodes || []).some(hasAttachment);
 }
 
-function addrs(list) {
+export function addrs(list) {
   const values = Array.isArray(list) ? list.flatMap((l) => l.value || []) : list?.value || [];
   // a group ("Team: Ann <ann@x>, Bob <bob@x>;") is its members
   return values.flatMap((a) => (Array.isArray(a.group) ? a.group : [a])).map((a) => ({ name: a.name || '', email: a.address || '' }));
@@ -1085,7 +1099,7 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function stripHtml(html) {
+export function stripHtml(html) {
   return String(html)
     .replace(/<style[\s\S]*?<\/style>|<script[\s\S]*?<\/script>/gi, '')
     .replace(/<br\s*\/?>|<\/p>|<\/div>|<\/tr>/gi, '\n')
@@ -1095,7 +1109,7 @@ function stripHtml(html) {
     .trim();
 }
 
-function compose(mail, { keepBcc = false } = {}) {
+export function compose(mail, { keepBcc = false } = {}) {
   const compiled = new MailComposer({ ...mail, attachments: mail.attachments || [] }).compile();
   compiled.keepBcc = keepBcc;
   return compiled.build();
