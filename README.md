@@ -294,4 +294,4 @@ against `index.d.ts`.
 
 ## Licence
 
-To be announced.
+MIT © 908 Studio. See [LICENSE](LICENSE).
