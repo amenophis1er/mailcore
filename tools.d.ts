@@ -1,8 +1,8 @@
-// Types for 'mailcore/tools': MailWatcher's MCP mail and calendar tools as
+// Types for '@amenophis1er/mailcore/tools': MCP mail and calendar tools as
 // plain objects. Schemas are built with the consumer's zod (a peer dependency, ^4).
 
 import type { z } from 'zod';
-import type { Mailcore } from 'mailcore';
+import type { Mailcore } from './index.js';
 
 /**
  * What a call can do, strictest first:

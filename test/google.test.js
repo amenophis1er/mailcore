@@ -31,18 +31,18 @@ test('the OAuth client is asked for each time one is needed, not once', async (t
 
 test('every Google auth error ends with the hint given, and a default one without', async (t) => {
   const tokens = { g: { refresh_token: 'r', access_token: 'tok', expires_at: Date.now() + 3600e3 } };
-  const hint = (a) => `run: mailwatcher google-login ${a}`;
+  const hint = (a) => `run: an-app google-login ${a}`;
   const core = createMailcore({ accounts: { g: { provider: 'google', email: 'me@gmail.example' }, none: { provider: 'google' } }, credentials: noCreds(tokens), google: { clientId: 'c', clientSecret: 's', signInHint: hint } });
   const f = withFetch((url) => (url.includes('oauth2') ? json(400, { error: 'invalid_grant' }) : json(401, { error: { message: 'unauthorized' } })));
   t.after(f.restore);
-  await assert.rejects(core.google.accessToken('none'), (e) => e.code === 'MAIL_AUTH' && e.message === 'account "none" is not signed in to Google — run: mailwatcher google-login none');
-  await assert.rejects(core.google.accessToken('g', { force: true }), (e) => e.code === 'MAIL_AUTH' && e.message.endsWith('— run: mailwatcher google-login g'));
+  await assert.rejects(core.google.accessToken('none'), (e) => e.code === 'MAIL_AUTH' && e.message === 'account "none" is not signed in to Google — run: an-app google-login none');
+  await assert.rejects(core.google.accessToken('g', { force: true }), (e) => e.code === 'MAIL_AUTH' && e.message.endsWith('— run: an-app google-login g'));
   // the calendar API refusing a token twice (the second time with a refresh that is refused too, or not)
   tokens.g = { refresh_token: 'r', access_token: 'tok', expires_at: Date.now() + 3600e3 };
   const f2 = withFetch((url) => (url.includes('oauth2') ? json(200, { access_token: 'tok2', expires_in: 3600 }) : json(401, { error: { message: 'unauthorized' } })));
   t.after(f2.restore);
   const c = await core.client('g');
-  await assert.rejects(c.findCalendars(), (e) => e.code === 'MAIL_AUTH' && e.message === 'Google no longer accepts the sign-in for "g" — run: mailwatcher google-login g');
+  await assert.rejects(c.findCalendars(), (e) => e.code === 'MAIL_AUTH' && e.message === 'Google no longer accepts the sign-in for "g" — run: an-app google-login g');
   f2.restore();
 
   const plain = createMailcore({ accounts: { none: { provider: 'google' } }, credentials: noCreds({}), google: { clientId: 'c' } });
@@ -135,11 +135,11 @@ test('a wrong state, another path or another Host is refused and the sign-in goe
 test('Google saying no ends the sign-in, tells the tab, and keeps the tokens before', async () => {
   const tokens = { g: { refresh_token: 'old' } };
   const core = signer(tokens);
-  const flow = await core.google.beginLogin('g', { appName: 'Mail Watcher' });
+  const flow = await core.google.beginLogin('g', { appName: 'An App' });
   const state = new URL(flow.url).searchParams.get('state');
   const page = await visit(back(flow, { state, error: 'access_denied' }));
   assert.equal(page.status, 400);
-  assert.match(page.body, /access_denied\. You can close this tab and return to Mail Watcher\./);
+  assert.match(page.body, /access_denied\. You can close this tab and return to An App\./);
   await assert.rejects(flow.done, (e) => e.code === 'SIGN_IN_REFUSED');
   assert.equal(tokens.g.refresh_token, 'old');
 });
@@ -193,7 +193,7 @@ test('accept: a string stores nothing and tells the tab why; an object is kept b
   withFetch(() => json(200, { access_token: 'at', refresh_token: 'new', expires_in: 3600, scope: GOOGLE_SCOPES.join(' ') }));
   t.after(() => { globalThis.fetch = realFetch; });
   const seen = [];
-  const no = await core.google.beginLogin('g', { appName: 'Mail Watcher', accept: async (tk) => { seen.push(tk.access_token); return 'You signed in to Google as b@x.example; this account is a@x.example. Sign in with a@x.example.'; } });
+  const no = await core.google.beginLogin('g', { appName: 'An App', accept: async (tk) => { seen.push(tk.access_token); return 'You signed in to Google as b@x.example; this account is a@x.example. Sign in with a@x.example.'; } });
   const page = await visit(back(no, { state: new URL(no.url).searchParams.get('state'), code: 'c' }));
   assert.equal(page.status, 400);
   assert.match(page.body, /You signed in to Google as b@x\.example; this account is a@x\.example\. Sign in with a@x\.example\. You can close this tab/);

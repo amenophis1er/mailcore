@@ -2,7 +2,6 @@
 // know their namespace, text with entities decoded. No DTDs, no external
 // entities, nothing fetched. Elements are matched by namespace + local name,
 // never by prefix (every server picks its own: d:, D:, none).
-// Ported from Amen's buddi calendar plugin (Apache-2.0).
 
 export const DAV = 'DAV:';
 export const CALDAV = 'urn:ietf:params:xml:ns:caldav';

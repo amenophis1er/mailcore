@@ -27,7 +27,7 @@ test('a sign-in: the consent URL, the redirect answered once, the code exchanged
     return new Response(JSON.stringify({ access_token: 'at1', refresh_token: 'rt1', expires_in: 3600, scope: 'IMAP SMTP', id_token: jwt({ preferred_username: 'sam@contoso.com', name: 'Sam', tid: 'abc', oid: 'o1' }) }));
   };
   const ms = microsoftAuth({ store, clientId: 'app-id', fetchFn });
-  const flow = await ms.beginLogin('work', { appName: 'Sideora' });
+  const flow = await ms.beginLogin('work', { appName: 'An App' });
   const u = new URL(flow.url);
   assert.equal(u.origin + u.pathname, 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize');
   assert.equal(u.searchParams.get('client_id'), 'app-id');
@@ -104,7 +104,7 @@ test('IMAP signs in with a token asked for at each connection, or with a passwor
 test('a renewal writes only over the sign-in it renewed: a newer sign-in, or a removal, meanwhile is kept', async () => {
   const { m, store } = memory();
   m.set('work', { refresh_token: 'rt1', access_token: 'old', expires_at: 0 });
-  // the store's own one-step change, as Sideora gives it (a lock across processes)
+  // the store's own one-step change, as an app gives it (a lock across processes)
   store.update = async (a, fn) => { const next = fn(m.get(a) ?? null); if (next !== undefined) m.set(a, next); return next; };
   const fetchFn = async () => { m.set('work', { refresh_token: 'rt-new', access_token: 'signed-in-again', expires_at: Date.now() + 3600e3 }); return new Response(JSON.stringify({ access_token: 'renewed', refresh_token: 'rt2', expires_in: 3600 })); };
   const ms = microsoftAuth({ store, clientId: 'app-id', fetchFn });

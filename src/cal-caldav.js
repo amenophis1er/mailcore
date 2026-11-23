@@ -13,7 +13,6 @@
 //
 // Ids: event = base64url(object href) [+ "@" + occurrence UTC stamp];
 //      calendar = "cal:" + base64url(collection url).
-// Ported from Amen's buddi calendar plugin (Apache-2.0) and extended.
 
 import { randomUUID } from 'node:crypto';
 import { APPLE, CALDAV, DAV, childOf, childrenOf, escapeXml, parseXml } from './dav-xml.js';

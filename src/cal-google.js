@@ -9,8 +9,7 @@
 // calendar = the Google calendar id (the primary one is the account's email).
 // Shared calendars and other people's calendars are the same thing here:
 // anything in calendarList, or any calendar id (an email) the account can read.
-// Ported from Amen's buddi calendar plugin (Apache-2.0) and extended with
-// attendees, invitations, replies and free/busy.
+// Attendees, invitations, replies and free/busy included.
 
 import { localZone, freeBusyRow, eventShape } from './cal-common.js';
 import { zonedTime, addDays, dateIn } from './ical.js';

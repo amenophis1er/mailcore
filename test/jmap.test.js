@@ -250,12 +250,12 @@ const until = async (fn, ms = 3000) => { const end = Date.now() + ms; while (!(a
 // --- tests ---------------------------------------------------------------------
 
 test('account: jmap is a mail provider; the session URL is given, a bare host, or the email domain', () => {
-  const a = normalizeAccount('x', { provider: 'jmap', email: 'me@Mailflare.example' });
+  const a = normalizeAccount('x', { provider: 'jmap', email: 'me@Jmap-Server.example' });
   assert.equal(a.provider, 'jmap');
   assert.deepEqual(a.jmap, { session: '' });
   assert.equal(a.cache.enabled, true);
   assert.ok(hasMail(a));
-  assert.equal(jmapSessionUrl(a), 'https://mailflare.example/.well-known/jmap');
+  assert.equal(jmapSessionUrl(a), 'https://jmap-server.example/.well-known/jmap');
   assert.equal(jmapSessionUrl({ ...a, jmap: { session: 'mail.example.net' } }), 'https://mail.example.net/.well-known/jmap');
   assert.equal(jmapSessionUrl({ ...a, jmap: { session: 'https://api.fastmail.com/jmap/session' } }), 'https://api.fastmail.com/jmap/session');
   assert.throws(() => jmapSessionUrl({ name: 'n', jmap: { session: '' } }), /jmap.session/);

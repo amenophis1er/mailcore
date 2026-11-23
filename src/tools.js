@@ -1,11 +1,11 @@
-// The mail and calendar tools of MailWatcher's MCP server, as plain objects
+// Mail and calendar tools for an MCP server, as plain objects
 // any agent host can serve in-process. They are static (declared before any
 // mailcore instance exists); the instance is passed to each call:
 //
 //   { name, description, input (a zod object schema), effect, run(core, args, ctx) }
 //
-// Names, descriptions, schemas and outputs are the MCP server's, unchanged.
-// run() returns the data the MCP server sends as JSON text.
+// Names, descriptions and schemas are ready to list as MCP tools.
+// run() returns the data an MCP server sends as JSON text.
 //
 // effect, strictest first:
 //   'others'        sends mail to someone, or changes a meeting that has other
@@ -30,7 +30,7 @@ import { parseWhen } from './calendar.js';
 export const EFFECTS = ['read', 'local', 'draft', 'own-calendar', 'others'];
 
 /** The server instructions that go with the tools (allowSend says whether sending is on). */
-export function mailInstructions({ allowSend = false, name = 'mailwatcher' } = {}) {
+export function mailInstructions({ allowSend = false, name = 'mailcore' } = {}) {
   return `${name}: the user's mailboxes (Exchange, IMAP and/or JMAP; list_accounts) and Exchange calendars. Message and event ids are "<account>:<id>".
 Reading is open. Writing creates DRAFTS only (draft_reply, draft_reply_all, compose_draft) — mail is never sent unless a send_draft tool is present AND the user explicitly asks to send. Bodies are plain text by default; pass format: 'markdown' for tables/lists/bold (converted to HTML) or 'html'. add_attachment with inline: true embeds an image for <img src=\"cid:…\">.
 
@@ -47,7 +47,7 @@ export const MAIL_INSTRUCTIONS = mailInstructions({ allowSend: false });
  *   sendDisabledHint  what the refusal tells the user to do to allow sending
  * Each tool: run(core, args, ctx?) → the data the MCP server sends as JSON text.
  */
-export function mailTools({ allowSend = false, attachmentsDir, attachmentsLabel, sendDisabledHint = 'set mcp.allowSend: true in ~/.mailwatcher/config.json to allow it' } = {}) {
+export function mailTools({ allowSend = false, attachmentsDir, attachmentsLabel, sendDisabledHint = 'enable sending in the caller\'s config to allow it' } = {}) {
   if (attachmentsLabel === undefined) attachmentsLabel = attachmentsDir || '<dataDir>/attachments';
   const accountSchema = z.string().optional().describe('Account name (default: all accounts)');
   const calendarArg = z.string().optional().describe('Own calendar by name or id (default: the default calendar), or a colleague\'s email for their shared calendar');
