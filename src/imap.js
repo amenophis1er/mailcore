@@ -39,10 +39,22 @@ export function imapOptions(acct, creds) {
     host,
     port: Number(port),
     secure: !!secure,
-    auth: { user: creds.username || acct.email, pass: creds.password },
+    // a token (XOAUTH2) for an account signed in with its provider, else its password
+    auth: creds.accessToken ? { user: creds.username || acct.email, accessToken: creds.accessToken } : { user: creds.username || acct.email, pass: creds.password },
     logger: false,
     tls: rejectUnauthorized === false ? { rejectUnauthorized: false } : undefined
   };
+}
+
+/**
+ * imapOptions, with a token asked for now when the account signs in with its provider (`creds.oauth()`): a token
+ * lasts an hour, a connection may be made at any time.
+ */
+export async function imapOptionsNow(acct, creds) {
+  if (typeof creds?.oauth !== 'function') return imapOptions(acct, creds);
+  let accessToken;
+  try { accessToken = await creds.oauth(); } catch (e) { throw Object.assign(e instanceof Error ? e : new Error(String(e)), { code: e?.code ?? 'MAIL_AUTH' }); }
+  return imapOptions(acct, { ...creds, accessToken });
 }
 
 /**
@@ -90,7 +102,7 @@ export class ImapClient {
     if (this.client && this.client.usable) return this.client;
     // (one connection, however many ask for it at once as it is being made)
     this.connecting ??= (async () => {
-      const c = new ImapFlow(imapOptions(this.acct, this.creds));
+      const c = new ImapFlow(await imapOptionsNow(this.acct, this.creds));
       c.on('error', () => {}); // surfaced through the awaiting command instead
       try {
         await c.connect();
@@ -846,7 +858,9 @@ export class ImapClient {
       secure: !!s.secure,
       // not encrypted from the start: encrypted by STARTTLS, or nothing is sent (set for accounts added from the panel)
       requireTLS: !s.secure && !!s.requireTLS,
-      auth: { user: this.creds.username || this.acct.email, pass: this.creds.password },
+      auth: typeof this.creds.oauth === 'function'
+        ? { type: 'OAuth2', user: this.creds.username || this.acct.email, accessToken: await this.creds.oauth() }
+        : { user: this.creds.username || this.acct.email, pass: this.creds.password },
       tls: s.rejectUnauthorized === false ? { rejectUnauthorized: false } : undefined
     });
     try {

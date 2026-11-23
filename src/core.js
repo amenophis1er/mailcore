@@ -126,6 +126,8 @@ export class Mailcore {
 
   async #password(acct, refresh) {
     const c = await this.credentials.getPassword(acct, { refresh: !!refresh });
+    // signed in with a provider instead of a password (Microsoft): a token, asked for fresh at each connection
+    if (c && typeof c.oauth === 'function') return { username: c.username ?? acct.email ?? '', domain: '', oauth: c.oauth };
     if (!c || typeof c.password !== 'string') throw Object.assign(new Error(`no password for account "${acct.name}"`), { code: 'MAIL_AUTH' });
     return splitDomain({ username: c.username ?? acct.username ?? acct.email ?? '', domain: c.domain ?? acct.domain ?? '', password: c.password });
   }

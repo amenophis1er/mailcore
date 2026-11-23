@@ -14,7 +14,7 @@
 // Whichever notices first calls onNewMail; the other's call finds nothing new.
 
 import { ImapFlow } from 'imapflow';
-import { imapOptions, authError } from './imap.js';
+import { imapOptionsNow, authError } from './imap.js';
 
 /** How long one IDLE is held before it is ended and begun again (RFC 2177 asks for under 29 minutes; Gmail needs under ten). */
 const IDLE_RENEW_MS = 4 * 60e3;
@@ -62,7 +62,7 @@ export class ImapStream {
     while (!this.stopped) {
       if (this.authGate?.blocked?.()) { await sleep(30000); continue; }
       // a server that stops answering without hanging up is a dead connection: known within seconds, not minutes
-      const client = new ImapFlow({ ...imapOptions(this.account, this.creds), disableAutoIdle: true, socketTimeout: 20000 });
+      const client = new ImapFlow({ ...(await imapOptionsNow(this.account, this.creds)), disableAutoIdle: true, socketTimeout: 20000 });
       this.asker = client;
       client.on('error', () => {}); // surfaced through the awaiting command
       /** Where the inbox stands. A refusal comes back as `false`, not as an error: it is one here. */
@@ -151,11 +151,13 @@ export class ImapStream {
     this.onState('off');
   }
 
-  holdOnce(onConnected) {
+  async holdOnce(onConnected) {
+    // (the token, when the account signs in with its provider, is asked for first: a refusal is this call's error)
+    const options = await imapOptionsNow(this.account, this.creds);
     return new Promise(async (resolve, reject) => {
       // IDLE is renewed every few minutes. Left alone, a server may keep the connection open and simply stop
       // telling: Gmail goes quiet after about ten minutes, and new mail then waited for the next poll.
-      const client = new ImapFlow({ ...imapOptions(this.account, this.creds), maxIdleTime: IDLE_RENEW_MS });
+      const client = new ImapFlow({ ...options, maxIdleTime: IDLE_RENEW_MS });
       this.client = client;
       let settled = false;
       const done = (err) => {

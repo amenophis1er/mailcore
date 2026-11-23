@@ -22,6 +22,7 @@ export { normalizeSubject, askedSomething, unquoted, snippet, groupThreads, look
 export { prepareBody, replaceAboveQuote, splitQuoted, splitBreaks, markdownToHtml, textToHtml, escapeHtml, BODY_FORMATS } from './body.js';
 export { GOOGLE_SCOPES, GOOGLE_CONTACTS_SCOPES, GOOGLE_CONTACTS_WRITE_SCOPE, GOOGLE_CONTACTS_WRITE_SCOPES, contactsAllowed, grantedScopes, googleAccountAddress } from './google-auth.js';
 export { googleContacts, googleCreateContact, contactOf as googleContactOf } from './google-contacts.js';
+export { microsoftAuth, microsoftServers, idTokenClaims, MICROSOFT_MAIL_SCOPES, MICROSOFT_PERSONAL_TENANT } from './microsoft-auth.js';
 export { jsonFileStore, memoryStore } from './store.js';
 export { AUTH_HEADER_NAMES, OVERSIZED, authHeadersFrom, headerPairs } from './auth-headers.js';
 export { isAutoReply, AUTO_REPLY_HEADERS } from './auto-reply.js';
