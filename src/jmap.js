@@ -12,6 +12,8 @@
 // have. Without them a caller keeps an account in step by listing it (findInbox), as it does Exchange; push (see
 // jmap-stream.js) says when to.
 
+import { isIP, BlockList } from 'node:net';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { simpleParser } from 'mailparser';
 import { displayNameOf, jmapSessionUrl } from './accounts.js';
 import { FOLDERS, FOLDER_NAMES, shaped, addrs, compose, isAttachment, stripHtml, replyMail, forwardMail, draftMail, withoutBcc, withMessageId, newMessageId } from './imap.js';
@@ -30,13 +32,22 @@ const NOT_FOUND = 'message not found (it may have been moved or deleted)';
 export class JmapClient {
   changeKeyIsId = true;
 
-  constructor(acct, creds = {}) {
+  /**
+   * opts.allowPrivate (or acct.jmap.allowPrivate) is FOR TESTS ONLY (a server on 127.0.0.1): with it, hosts that
+   * resolve to private, loopback or link-local addresses, hosts that are IP literals, and plain http are allowed.
+   * Never set it for a real account: the API key would go wherever the session sends it. opts.lookup replaces
+   * node:dns's lookup (tests).
+   */
+  constructor(acct, creds = {}, opts = {}) {
     this.acct = acct;
     this.creds = creds || {};
     this.self = (acct.email || (String(this.creds.username || '').includes('@') ? this.creds.username : '')).toLowerCase();
     this.sessionUrl = jmapSessionUrl(acct);
     this.timeoutMs = 60_000; // one API call
     this.blobTimeoutMs = 300_000; // one upload or download
+    this.allowPrivate = !!(opts.allowPrivate ?? acct.jmap?.allowPrivate);
+    this.lookup = opts.lookup || dnsLookup;
+    this._hosts = new Map(); // hostname → its check (a promise), for the client's lifetime
   }
 
   async selfEmail() {
@@ -61,18 +72,23 @@ export class JmapClient {
   }
 
   /**
-   * A request with the account's Authorization. 401/403: MAIL_AUTH. The network failing: MAIL_NETWORK. Any other
-   * failure (5xx included) is an error with its `status`, never taken for a refused sign-in. timeoutMs 0: none.
+   * A request with the account's Authorization, to a URL that passes #guard (else JMAP_UNSAFE, nothing sent).
+   * 401 (and a 403 to the session fetch, `authOn403`): MAIL_AUTH. The network failing: MAIL_NETWORK. Any other
+   * failure (another 403, a 5xx) is an error with its `status`, never taken for a refused sign-in. timeoutMs 0: none.
+   * An error thrown before anything was sent carries `sentNothing`.
    */
-  async request(url, init = {}, { timeoutMs = this.timeoutMs } = {}) {
-    const headers = { ...(init.headers || {}), Authorization: await this.authorization() };
+  async request(url, init = {}, { timeoutMs = this.timeoutMs, authOn403 = false } = {}) {
+    await this.#guard(url);
+    let authorization;
+    try { authorization = await this.authorization(); } catch (e) { throw Object.assign(e, { sentNothing: true }); }
+    const headers = { ...(init.headers || {}), Authorization: authorization };
     const signal = init.signal || (timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined);
     let res;
     try { res = await fetch(url, { ...init, headers, signal }); } catch (e) {
       if (init.signal?.aborted) throw e; // stopped by whoever asked
       throw Object.assign(new Error(`${hostOf(url)} could not be reached (${e?.cause?.message || e?.message || e})`, { cause: e }), { code: 'MAIL_NETWORK' });
     }
-    if (res.status === 401 || res.status === 403) {
+    if (res.status === 401 || (res.status === 403 && authOn403)) {
       await res.body?.cancel().catch(() => {});
       throw Object.assign(new Error(`${hostOf(url)} refused the API key (HTTP ${res.status})`), { code: 'MAIL_AUTH', status: res.status });
     }
@@ -95,19 +111,22 @@ export class JmapClient {
     // (/.well-known/jmap is a redirect on many servers); never from https to plain http
     let url = this.sessionUrl;
     for (let hops = 0; ; hops++) {
-      const res = await this.request(url, { headers: { Accept: 'application/json' }, redirect: 'manual' });
+      const res = await this.request(url, { headers: { Accept: 'application/json' }, redirect: 'manual' }, { authOn403: true });
       if (res.status >= 300 && res.status < 400) {
         await res.body?.cancel().catch(() => {});
         const to = res.headers.get('location');
-        const next = to ? new URL(to, url) : null;
-        if (!next || hops >= 5 || (url.startsWith('https:') && next.protocol !== 'https:')) throw new Error(`${hostOf(url)}: the JMAP session could not be found (a redirect that leads nowhere)`);
+        let next = null;
+        try { next = to ? new URL(to, url) : null; } catch {}
+        if (!next || hops >= 5) throw new Error(`${hostOf(url)}: the JMAP session could not be found (a redirect that leads nowhere)`);
+        // the key goes with the request: never to another origin (another host, or http)
+        if (next.origin !== new URL(url).origin) throw unsafe(`${hostOf(url)} redirects the JMAP session to ${next.origin}: not followed with the API key (set jmap.session to the session URL itself)`);
         url = next.href;
         continue;
       }
       const s = await res.json().catch(() => null);
       const accountId = s?.primaryAccounts?.[MAIL];
       if (!s?.apiUrl || !accountId) throw new Error(`${hostOf(url)}: not a JMAP session with mail (${this.sessionUrl})`);
-      return {
+      const session = {
         url,
         state: s.state,
         apiUrl: absolute(s.apiUrl, url),
@@ -118,7 +137,59 @@ export class JmapClient {
         submissionAccountId: s.primaryAccounts[SUBMISSION] || null,
         maxObjectsInGet: Math.max(1, Math.min(500, Number(s.capabilities?.[CORE]?.maxObjectsInGet) || 500))
       };
+      this.#checkSessionUrls(session);
+      return session;
     }
+  }
+
+  /**
+   * Where the session sends the key: apiUrl, uploadUrl and eventSourceUrl https on the session's own host;
+   * downloadUrl https, on another host only when that is a public DNS name (Fastmail's is www.fastmailusercontent.com).
+   */
+  #checkSessionUrls(s) {
+    const home = new URL(s.url).hostname;
+    const check = (what, template, sameHost) => {
+      if (!template) return;
+      let u;
+      try { u = new URL(expand(template, {})); } catch { throw unsafe(`the JMAP session's ${what} is not a URL`); }
+      if (!this.#schemeOk(u)) throw unsafe(`the JMAP session's ${what} is not https (${u.origin})`);
+      if (u.hostname === home) return;
+      if (sameHost) throw unsafe(`the JMAP session's ${what} is on another host (${u.hostname}, not ${home})`);
+      if (!this.allowPrivate && !isPublicName(u.hostname)) throw unsafe(`the JMAP session's ${what} is on ${u.hostname}: not a public host name`);
+    };
+    check('apiUrl', s.apiUrl, true);
+    check('uploadUrl', s.uploadUrl, true);
+    check('eventSourceUrl', s.eventSourceUrl, true);
+    check('downloadUrl', s.downloadUrl, false);
+  }
+
+  #schemeOk(u) { return u.protocol === 'https:' || (this.allowPrivate && u.protocol === 'http:'); }
+
+  /**
+   * Before the key goes to a URL: https; not an IP literal; a host whose every address is public (resolved once per
+   * host for the client's lifetime). allowPrivate (tests only) lets http, IP literals and private addresses by.
+   */
+  async #guard(url) {
+    let u;
+    try { u = new URL(url); } catch { throw unsafe(`not a URL: ${String(url).slice(0, 100)}`); }
+    if (!this.#schemeOk(u)) throw unsafe(`${u.host}: not https, the API key is not sent there`);
+    if (this.allowPrivate) return;
+    const host = u.hostname.replace(/^\[|\]$/g, '');
+    if (isIP(host)) throw unsafe(`${host}: an IP address, not a host name; the API key is not sent there`);
+    let check = this._hosts.get(host);
+    if (!check) {
+      check = this.lookup(host, { all: true }).then((addrs) => {
+        const list = (Array.isArray(addrs) ? addrs : [addrs]).map((a) => (typeof a === 'string' ? a : a?.address));
+        if (!list.length) throw unsafe(`${host} has no address`);
+        const bad = list.find((a) => isPrivateAddress(a));
+        if (bad !== undefined) throw unsafe(`${host} is at a private address (${bad}); the API key is not sent there`);
+      }, (e) => {
+        this._hosts.delete(host); // (a lookup that failed is tried again next time)
+        throw Object.assign(new Error(`${host} could not be found (${e?.code || e?.message || e})`, { cause: e }), { code: 'MAIL_NETWORK', sentNothing: true });
+      });
+      this._hosts.set(host, check);
+    }
+    await check;
   }
 
   /**
@@ -236,22 +307,36 @@ export class JmapClient {
     if (opts.toContains) all.push({ operator: 'OR', conditions: [{ to: String(opts.toContains) }, { cc: String(opts.toContains) }] });
     for (const t of Array.isArray(opts.text) ? opts.text : opts.text ? [opts.text] : []) all.push({ text: String(t) });
     const filter = all.length === 1 ? all[0] : { operator: 'AND', conditions: all };
-    const r = await this.#run([
-      ['Email/query', { filter, sort: [{ property: 'receivedAt', isAscending: false }], position: offset, limit: max, collapseThreads: false }, 'q'],
-      ['Email/get', { '#ids': { resultOf: 'q', name: 'Email/query', path: '/ids' }, properties: LIST_PROPS }, 'g']
-    ]);
-    return newestFirst((r.get('g').list || []).map(listItem));
+    const got = await this.#queryEmails({ filter, sort: [{ property: 'receivedAt', isAscending: false }], position: offset, limit: max, collapseThreads: false }, LIST_PROPS);
+    return newestFirst(got.map(listItem));
+  }
+
+  /**
+   * Email/query, then Email/get of what it found, in the query's order: in one request (a back-reference) when the
+   * server takes that many ids in one Email/get (maxObjectsInGet), else the ids first and the Emails in chunks.
+   */
+  async #queryEmails(query, properties) {
+    const per = (await this.session()).maxObjectsInGet;
+    if (query.limit <= per) {
+      const r = await this.#run([
+        ['Email/query', query, 'q'],
+        ['Email/get', { '#ids': { resultOf: 'q', name: 'Email/query', path: '/ids' }, properties }, 'g']
+      ]);
+      return r.get('g').list || [];
+    }
+    const ids = (await this.#one('Email/query', query)).ids || [];
+    return inOrder(await this.#getEmails(ids, properties), ids);
   }
 
   /** The messages of one of the server's threads (a message's conversationId) that are in a folder: Thread/get, then the Emails. */
   async findThread({ folder, threadId, limit = 100 } = {}) {
     if (!threadId) return null;
     const box = await this.#folder(folder);
-    const r = await this.#run([
-      ['Thread/get', { ids: [String(threadId)] }, 't'],
-      ['Email/get', { '#ids': { resultOf: 't', name: 'Thread/get', path: '/list/*/emailIds' }, properties: LIST_PROPS }, 'g']
-    ]);
-    return newestFirst((r.get('g').list || []).filter((e) => e.mailboxIds?.[box]).map(listItem)).slice(0, limit);
+    // (two requests: a thread may hold more Emails than the server gives in one Email/get)
+    const { list = [] } = await this.#one('Thread/get', { ids: [String(threadId)] });
+    const ids = [...new Set(list.flatMap((t) => t.emailIds || []))];
+    const got = await this.#getEmails(ids, LIST_PROPS);
+    return newestFirst(got.filter((e) => e.mailboxIds?.[box]).map(listItem)).slice(0, limit);
   }
 
   async getMessage(id, { bodyType = 'Text' } = {}) {
@@ -302,12 +387,9 @@ export class JmapClient {
   async sentTo({ limit = 200 } = {}) {
     const sent = await this.#folder('sent');
     const heads = AUTO_REPLY_HEADERS.map((n) => `header:${n}:asText`);
-    const r = await this.#run([
-      ['Email/query', { filter: { inMailbox: sent }, sort: [{ property: 'receivedAt', isAscending: false }], limit: Math.min(200, limit) }, 'q'],
-      ['Email/get', { '#ids': { resultOf: 'q', name: 'Email/query', path: '/ids' }, properties: ['id', 'to', 'subject', 'sentAt', 'receivedAt', ...heads] }, 'g']
-    ]);
+    const got = await this.#queryEmails({ filter: { inMailbox: sent }, sort: [{ property: 'receivedAt', isAscending: false }], limit: Math.max(1, Math.min(200, limit)) }, ['id', 'to', 'subject', 'sentAt', 'receivedAt', ...heads]);
     const out = [];
-    for (const e of r.get('g').list || []) {
+    for (const e of got) {
       const said = AUTO_REPLY_HEADERS.map((n, i) => (e[heads[i]] == null ? '' : `${n}: ${e[heads[i]]}`)).join('\n');
       if (isAutoReply(e.subject, said)) continue;
       const to = [...new Set((e.to || []).map((a) => String(a.email || '').toLowerCase()).filter((x) => x.includes('@')))];
@@ -342,7 +424,9 @@ export class JmapClient {
       const draftId = await this.#importDraft(mail);
       return { sent: false, draftId, changeKey: draftId };
     }
-    const sentId = await this.#submit(await compose(mail), { from: this.self, to: [...to, ...cc, ...bcc] }); // (Bcc in the envelope only)
+    // Bcc in the envelope only; the copy kept in Sent has it (as on IMAP)
+    const whole = await compose(mail, { keepBcc: true });
+    const sentId = await this.#submit(withoutBcc(whole), { from: this.self, to: [...to, ...cc, ...bcc] }, { sentCopy: bcc.length ? whole : null });
     return { sent: true, draftId: sentId, changeKey: sentId };
   }
 
@@ -388,8 +472,10 @@ export class JmapClient {
     const to = [...addrs(parsed.to), ...addrs(parsed.cc), ...addrs(parsed.bcc)].map((a) => a.email).filter(Boolean);
     if (to.length === 0) throw new Error('sendItem: the draft has no recipients');
     const from = addrs(parsed.from)[0]?.email || this.self;
-    // as on IMAP: under a Message-ID of its own, not its draft's, and with no Bcc in what the others receive
-    await this.#submit(withoutBcc(withMessageId(raw, newMessageId(from))), { from, to });
+    // as on IMAP: under a Message-ID of its own, not its draft's, and with no Bcc in what the others receive (the
+    // copy kept in Sent has it)
+    const mail = withMessageId(raw, newMessageId(from));
+    await this.#submit(withoutBcc(mail), { from, to }, { sentCopy: addrs(parsed.bcc).length ? mail : null });
     // It has left. Removing the draft never makes this a send that failed (whoever tries again would send it twice).
     try { await this.#destroy([draft]); } catch { try { await this.#destroy([draft]); } catch {} }
     return true;
@@ -422,14 +508,20 @@ export class JmapClient {
 
   /**
    * Send a raw message: imported as a draft, then submitted (EmailSubmission/set) to the envelope's recipients;
-   * once sent the server moves it to Sent and takes its $draft off (onSuccessUpdateEmail). Its id.
+   * once sent the server moves it to Sent and takes its $draft off (onSuccessUpdateEmail). `sentCopy` (the message
+   * with its Bcc): imported into Sent in its place once sent. The id of what is in Sent.
+   *
+   * The copy made for sending is destroyed only when the server says the submission was not made (notCreated, a
+   * method error, or the request refused as a whole: a 4xx, or nothing sent at all). A network failure, a timeout,
+   * a 5xx or an answer that says nothing about it may come after the mail left: SEND_UNKNOWN, and the copy is kept.
    */
-  async #submit(raw, { from, to }) {
+  async #submit(raw, { from, to }, { sentCopy = null } = {}) {
     const s = await this.session();
     if (!s.submissionAccountId) throw new Error('this JMAP account cannot send (the server offers no submission)');
     const [drafts, sent] = [await this.#folder('drafts'), await this.#folder('sent')]; // (before anything leaves)
     const identityId = await this.#identity(from);
     const emailId = await this.#import(raw, { [drafts]: true }, { $draft: true, $seen: true });
+    const notSent = async (e) => { await this.#destroy([emailId]).catch(() => {}); return e; }; // the copy made for it goes
     let r;
     try {
       r = await this.#run([['EmailSubmission/set', {
@@ -437,17 +529,28 @@ export class JmapClient {
         create: { send: { identityId, emailId, envelope: { mailFrom: { email: from }, rcptTo: to.map((email) => ({ email })) } } },
         onSuccessUpdateEmail: { '#send': { mailboxIds: { [sent]: true }, 'keywords/$draft': null } }
       }, 's']]);
-      if (!r.get('s').created?.send) throw setError('EmailSubmission/set', r.get('s').notCreated?.send);
     } catch (e) {
-      await this.#destroy([emailId]).catch(() => {}); // not sent: the copy made for it goes
-      throw e;
+      if (e?.jmapType || e?.sentNothing || (e?.status >= 400 && e?.status < 500)) throw await notSent(e);
+      throw sendUnknown(e);
     }
-    // It has left. A server that did not move it (no implicit Email/set) is asked once more; never a failure.
+    const answer = r.get('s');
+    if (!answer?.created?.send) {
+      if (answer?.notCreated?.send) throw await notSent(setError('EmailSubmission/set', answer.notCreated.send));
+      throw sendUnknown(new Error('the server said nothing of the submission'));
+    }
+    // It has left: nothing below makes this a send that failed (whoever tries again would send it twice).
+    // A server that did not move it (no implicit Email/set) is asked once more.
     const moved = r.get('s Email/set')?.updated;
     if (!(moved && emailId in moved)) {
       await this.#update(emailId, { mailboxIds: { [sent]: true }, 'keywords/$draft': null }).catch(() => {});
     }
-    return emailId;
+    if (!sentCopy) return emailId;
+    // the copy with its Bcc in Sent, in place of the one submitted (which stays when this fails)
+    let keptId = null;
+    const keep = async () => { keptId = await this.#import(sentCopy, { [sent]: true }, { $seen: true }); };
+    try { await keep(); } catch { try { await keep(); } catch { return emailId; } }
+    try { await this.#destroy([emailId]); } catch { try { await this.#destroy([emailId]); } catch {} }
+    return keptId;
   }
 
   /** The identity to send as: the one of the From address, else the account's own, else the first. */
@@ -552,6 +655,41 @@ function listItem(e) {
     messageId: bracketed(e.messageId),
     inReplyTo: bracketed(e.inReplyTo)
   };
+}
+
+/** A submission that may or may not have gone (the request went out, no answer came that says). */
+const sendUnknown = (cause) => Object.assign(new Error('the server may have sent it: check Sent before sending again', { cause }), { code: 'SEND_UNKNOWN' });
+
+/** Emails in the order of their ids. */
+const inOrder = (list, ids) => { const at = new Map(ids.map((id, i) => [id, i])); return list.sort((a, b) => (at.get(a.id) ?? 0) - (at.get(b.id) ?? 0)); };
+
+/** A refused URL: the key is not sent there. */
+const unsafe = (message) => Object.assign(new Error(message), { code: 'JMAP_UNSAFE', sentNothing: true });
+
+const PRIVATE_V4 = new BlockList();
+for (const [net, bits] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16]]) PRIVATE_V4.addSubnet(net, bits, 'ipv4');
+const PRIVATE_V6 = new BlockList();
+PRIVATE_V6.addAddress('::', 'ipv6');
+PRIVATE_V6.addAddress('::1', 'ipv6');
+PRIVATE_V6.addSubnet('fc00::', 7, 'ipv6');
+PRIVATE_V6.addSubnet('fe80::', 10, 'ipv6');
+
+/** A private, loopback, link-local or unspecified address, or an IPv4-mapped IPv6 one (anything not an address too). */
+export function isPrivateAddress(addr) {
+  const a = String(addr || '').replace(/^\[|\]$/g, '').replace(/%.*$/, '');
+  const v = isIP(a);
+  if (v === 4) return PRIVATE_V4.check(a, 'ipv4');
+  if (v !== 6) return true;
+  if (new URL(`http://[${a}]`).hostname.startsWith('[::ffff:')) return true; // (::ffff:a.b.c.d, however written)
+  return PRIVATE_V6.check(a, 'ipv6');
+}
+
+/** A DNS name that may be public: not an IP literal, not localhost, *.local, *.internal or *.lan. */
+function isPublicName(hostname) {
+  const h = String(hostname).toLowerCase().replace(/\.$/, '');
+  if (!h || isIP(h.replace(/^\[|\]$/g, ''))) return false;
+  if (!h.includes('.')) return false;
+  return !(h === 'localhost' || /\.(localhost|local|internal|lan)$/.test(h));
 }
 
 const bracketed = (ids) => (Array.isArray(ids) ? ids.map((x) => `<${x}>`).join(' ') : '');

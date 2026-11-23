@@ -86,13 +86,22 @@ fm: { provider: 'jmap', email: 'me@example.org', jmap: { session: 'https://api.f
 - The API key is the account's password: `getPassword` returns `{ password: '<api key>' }`, sent as
   `Authorization: Bearer <api key>`. A sign-in token works too (`{ oauth: async () => token }`, asked at each request).
 - `jmap.session` is the session URL. A bare host (`mail.example.org`) means `https://mail.example.org/.well-known/jmap`;
-  none at all means the email domain's `/.well-known/jmap`. The well-known redirect is followed with the key sent
-  again (to https only). `jmap.folders` names a mailbox for a folder the server gives no role (as `imap.folders`).
+  none at all means the email domain's `/.well-known/jmap`. A redirect is followed with the key only on the same
+  origin; one to another host (or to http) is refused (`JMAP_UNSAFE`): set `jmap.session` to the session URL itself. `jmap.folders` names a mailbox for a folder the server gives no role (as `imap.folders`).
 - Written to RFC 8620/8621 only: folders by mailbox role, sending by `EmailSubmission/set` (the identity of the From
   address, else the account's), drafts imported as raw messages, so they read and reply exactly as on IMAP.
 - Push holds the session's `eventSourceUrl` (Server-Sent Events); a server without one is polled. No
   `changesIn`/`newSince` (those are IMAP UID marks): a watcher keeps a JMAP account in step by listing it, as Exchange.
-- A 401/403 is `MAIL_AUTH`; an unreachable server is `MAIL_NETWORK`; a 5xx carries its `status` and is not an auth error.
+- Where the key goes: the session's `apiUrl`, `uploadUrl` and `eventSourceUrl` must be https on the session's host;
+  `downloadUrl` https, on another host only when that is a public DNS name (Fastmail's is on
+  www.fastmailusercontent.com). Every host is resolved before the first request to it and refused when any of its
+  addresses is private, loopback or link-local; IP-literal hosts are refused. A refusal is `JMAP_UNSAFE`, nothing
+  sent. `jmap.allowPrivate: true` lifts these for tests against a local server only: never set it for a real account.
+- A 401 (and a 403 to the session fetch) is `MAIL_AUTH`; an unreachable server is `MAIL_NETWORK`; any other 403 or
+  a 5xx carries its `status` and is not an auth error.
+- Sending: a submission the server refuses removes the copy made for it; one whose answer never came (the line cut,
+  a timeout, a 5xx) is `SEND_UNKNOWN` ("the server may have sent it: check Sent before sending again") and the draft
+  is kept. The copy kept in Sent has the Bcc header, as on IMAP.
 
 ### Credentials and the cache key
 

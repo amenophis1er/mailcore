@@ -1,6 +1,7 @@
 // JMAP push (RFC 8620 §7.3): the session's eventSourceUrl held open as Server-Sent Events (fetch, its body read
 // as it comes, parsed here: EventSource sends no Authorization). The server sends a StateChange whenever the
-// account's Emails or Mailboxes change; an Email state other than the last one known is a check (onNewMail).
+// account's Emails or Mailboxes change; an Email state other than the last one known is a check (onNewMail, and
+// onDraftsChange: a draft is an Email, and the state says nothing of which).
 // Same hooks as EwsStream and ImapStream. A server with no eventSourceUrl has no push: the stream says 'off' at
 // once, and the watcher's poll carries the account.
 
@@ -10,10 +11,11 @@ import { JmapClient, expand } from './jmap.js';
 const PING_SECONDS = 30;
 
 export class JmapStream {
-  constructor({ account, creds, onNewMail, refreshCreds, authGate, onState, log, retryMs = 5000, pauseMs = 15000, pingSeconds = PING_SECONDS }) {
+  constructor({ account, creds, onNewMail, onDraftsChange, refreshCreds, authGate, onState, log, retryMs = 5000, pauseMs = 15000, pingSeconds = PING_SECONDS }) {
     this.account = account;
     this.creds = creds;
     this.onNewMail = onNewMail || (() => {});
+    this.onDraftsChange = onDraftsChange || null;
     this.refreshCreds = refreshCreds;
     this.authGate = authGate;
     this.onState = onState || (() => {});
@@ -90,23 +92,31 @@ export class JmapStream {
 
   /** One connection to the event source, held until it ends (an error, always) or the stream is stopped; 'none' when the server has none. */
   async holdOnce(onConnected) {
-    const client = new JmapClient(this.account, this.creds);
-    const s = await client.session();
-    if (!s.eventSourceUrl) return 'none';
+    // the controller first: a stop() at any await below reaches it, and `finally` always closes what was opened
     const ac = new AbortController();
     this.abort = ac;
-    let heard = Date.now();
-    const quiet = (this.pingSeconds * 2 + 15) * 1000;
-    const watchdog = setInterval(() => { if (Date.now() - heard > quiet) ac.abort(new Error(`nothing heard for ${Math.round(quiet / 1000)}s`)); }, Math.min(5000, quiet / 3));
+    let watchdog = null;
+    let res = null;
+    let reader = null;
     try {
+      const client = new JmapClient(this.account, this.creds);
+      const s = await client.session();
+      if (this.stopped) return 'stopped';
+      if (!s.eventSourceUrl) return 'none';
+      let heard = Date.now();
+      const quiet = (this.pingSeconds * 2 + 15) * 1000;
+      watchdog = setInterval(() => { if (Date.now() - heard > quiet) ac.abort(new Error(`nothing heard for ${Math.round(quiet / 1000)}s`)); }, Math.min(5000, quiet / 3));
       const url = expand(s.eventSourceUrl, { types: 'Email,Mailbox', closeafter: 'no', ping: String(this.pingSeconds) });
-      const res = await client.request(url, { headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache' }, signal: ac.signal }, { timeoutMs: 0 });
+      res = await client.request(url, { headers: { Accept: 'text/event-stream', 'Cache-Control': 'no-cache' }, signal: ac.signal }, { timeoutMs: 0 });
+      reader = res.body.getReader();
       if (this.stopped) return 'stopped';
       this.log('watching via the JMAP event source');
       this.onState('connected');
       onConnected();
       // where the Emails stand, asked once listening: what changed while disconnected is told, and nothing after is missed
-      this.#heard(await client.emailState());
+      const state = await client.emailState();
+      if (this.stopped) return 'stopped';
+      this.#heard(state);
       const events = sseEvents((ev) => {
         if (ev.event !== 'state' && ev.event !== '') return; // ping, and what this does not know
         let change;
@@ -114,7 +124,6 @@ export class JmapStream {
         const now = change?.changed?.[s.accountId]?.Email;
         if (now !== undefined) this.#heard(now);
       });
-      const reader = res.body.getReader();
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -127,8 +136,11 @@ export class JmapStream {
       if (this.stopped) return 'stopped';
       throw ac.signal.aborted && ac.signal.reason instanceof Error ? ac.signal.reason : e;
     } finally {
-      clearInterval(watchdog);
-      this.abort = null;
+      if (watchdog) clearInterval(watchdog);
+      try { ac.abort(); } catch {}
+      if (reader) reader.cancel().catch(() => {});
+      else res?.body?.cancel().catch(() => {});
+      if (this.abort === ac) this.abort = null;
     }
   }
 
@@ -137,7 +149,10 @@ export class JmapStream {
     if (state == null) return;
     const was = this.emailState;
     this.emailState = state;
-    if (was != null && was !== state) { try { this.onNewMail('told'); } catch {} }
+    if (was != null && was !== state) {
+      try { this.onNewMail('told'); } catch {}
+      if (this.onDraftsChange) { try { this.onDraftsChange(); } catch {} }
+    }
   }
 
   #sleep(ms) {

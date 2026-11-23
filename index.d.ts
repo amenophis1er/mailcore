@@ -41,7 +41,12 @@ export interface AccountDefinition {
    * https://<host>/.well-known/jmap, and none the email domain's. The password is the API key (a Bearer token).
    * `folders` names a mailbox (path or name) for a folder the server gives no role.
    */
-  jmap?: { session?: string; folders?: Partial<Record<'inbox' | 'junk' | 'sent' | 'drafts' | 'trash' | 'archive', string>> };
+  jmap?: {
+    session?: string;
+    folders?: Partial<Record<'inbox' | 'junk' | 'sent' | 'drafts' | 'trash' | 'archive', string>>;
+    /** TESTS ONLY (a server on 127.0.0.1): lets the API key go to http, IP literals and private addresses. Never set it for a real account. */
+    allowPrivate?: boolean;
+  };
   /** CalDAV: icloud | fastmail | other */
   service?: string;
   server?: string;
@@ -751,7 +756,7 @@ export class Mailcore {
     /** how: 'told' by the server's push, or 'asked' (IMAP's own look); from: IMAP, the first new UID when known. */
     onNewMail?: (how?: 'told' | 'asked', from?: number | null) => void;
     onCalendarChange?: () => void;
-    /** Exchange: the Drafts folder changed. */
+    /** Exchange: the Drafts folder changed. JMAP: the account's Emails changed (drafts among them). */
     onDraftsChange?: () => void;
     authGate?: AuthGate;
     onState?: (state: string) => void;

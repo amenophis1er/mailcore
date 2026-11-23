@@ -30,7 +30,7 @@ async function mockServer({ eventSource = true } = {}) {
   const emails = new Map();
   const blobs = new Map();
   const srv = {
-    emails, blobs, requests: [], submissions: [], failNext: [], sse: new Set(), sseOpened: 0,
+    emails, blobs, requests: [], submissions: [], failNext: [], sse: new Set(), sseOpened: 0, maxGet: 500, session: {},
     state: 1, next: 1, url: '',
     bump() {
       srv.state++;
@@ -126,6 +126,7 @@ async function mockServer({ eventSource = true } = {}) {
       return { accountId: ACCOUNT, ids: list.slice(pos, pos + (a.limit || 256)).map((e) => e.id), position: pos, total: list.length, queryState: String(srv.state) };
     },
     'Email/get': (a) => {
+      if ((a.ids || []).length > srv.maxGet) return { error: 'requestTooLarge' };
       const list = [];
       const notFound = [];
       for (const id of a.ids || []) {
@@ -143,6 +144,7 @@ async function mockServer({ eventSource = true } = {}) {
     'Email/import': async (a) => {
       const created = {};
       for (const [cid, x] of Object.entries(a.emails)) {
+        if (srv.refuseSentImport && x.mailboxIds['mb-sent']) return { accountId: ACCOUNT, created: {}, notCreated: { [cid]: { type: 'overQuota' } } };
         const id = await srv.store(blobs.get(x.blobId).buf, { mailboxIds: x.mailboxIds, keywords: { ...x.keywords } });
         created[cid] = { id, blobId: emails.get(id).blobId, threadId: emails.get(id).threadId, size: 1 };
       }
@@ -152,6 +154,7 @@ async function mockServer({ eventSource = true } = {}) {
     'EmailSubmission/set': (a, out) => {
       const created = {};
       for (const [cid, x] of Object.entries(a.create)) {
+        if (srv.refuseSubmission) return { accountId: ACCOUNT, created: {}, notCreated: { [cid]: { type: 'forbiddenToSend', description: 'no' } } };
         if (!emails.has(x.emailId)) return { accountId: ACCOUNT, created: {}, notCreated: { [cid]: { type: 'invalidProperties', description: 'no such email' } } };
         srv.submissions.push({ ...x, raw: blobs.get(emails.get(x.emailId).blobId).buf.toString() });
         created[cid] = { id: `S${srv.next++}` };
@@ -167,14 +170,14 @@ async function mockServer({ eventSource = true } = {}) {
     const url = new URL(req.url, srv.url);
     srv.requests.push(`${req.method} ${url.pathname}`);
     const body = await new Promise((r) => { const c = []; req.on('data', (d) => c.push(d)); req.on('end', () => r(Buffer.concat(c))); });
-    if (url.pathname === '/.well-known/jmap') { res.writeHead(307, { Location: '/jmap/session' }); return res.end(); }
+    if (url.pathname === '/.well-known/jmap') { res.writeHead(307, { Location: srv.redirectTo || '/jmap/session' }); return res.end(); }
     if (req.headers.authorization !== `Bearer ${KEY}`) { res.writeHead(401); return res.end('unauthorized'); }
     const fail = srv.failNext.shift();
     if (fail) { res.writeHead(fail, { 'Content-Type': 'application/problem+json' }); return res.end(JSON.stringify({ type: 'about:blank', detail: 'down for a moment' })); }
     const json = (o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
     if (url.pathname === '/jmap/session') {
       return json({
-        capabilities: { 'urn:ietf:params:jmap:core': { maxObjectsInGet: 500 }, 'urn:ietf:params:jmap:mail': {}, 'urn:ietf:params:jmap:submission': {} },
+        capabilities: { 'urn:ietf:params:jmap:core': { maxObjectsInGet: srv.maxGet }, 'urn:ietf:params:jmap:mail': {}, 'urn:ietf:params:jmap:submission': {} },
         accounts: { [ACCOUNT]: { name: 'me@example.org', isPersonal: true, isReadOnly: false, accountCapabilities: {} } },
         primaryAccounts: { 'urn:ietf:params:jmap:mail': ACCOUNT, 'urn:ietf:params:jmap:submission': ACCOUNT },
         username: 'me@example.org',
@@ -182,7 +185,8 @@ async function mockServer({ eventSource = true } = {}) {
         downloadUrl: `${srv.url}/jmap/download/{accountId}/{blobId}/{name}?accept={type}`,
         uploadUrl: `${srv.url}/jmap/upload/{accountId}/`,
         eventSourceUrl: eventSource ? `${srv.url}/jmap/events/?types={types}&closeafter={closeafter}&ping={ping}` : undefined,
-        state: 's1'
+        state: 's1',
+        ...srv.session
       });
     }
     if (url.pathname === '/jmap/api/') {
@@ -198,9 +202,13 @@ async function mockServer({ eventSource = true } = {}) {
         const extra = [];
         const resolved = resolve(args, out);
         if (!resolved) { out.push(['error', { type: 'invalidResultReference' }, tag]); continue; }
-        out.push([name, await fn(resolved, extra), tag]);
+        const answer = await fn(resolved, extra);
+        if (answer?.error) { out.push(['error', { type: answer.error }, tag]); continue; }
+        out.push([name, answer, tag]);
         for (const x of extra) out.push([x[0], x[1], tag]);
       }
+      if (srv.hangAfter && methodCalls.some(([n]) => n === srv.hangAfter)) return; // done, and no answer
+      if (srv.dropAfter && methodCalls.some(([n]) => n === srv.dropAfter)) return req.socket.destroy(); // done, and the line cut
       return json({ methodResponses: out, sessionState: 's1' });
     }
     const up = /^\/jmap\/upload\/A1\/$/.exec(url.pathname);
@@ -235,7 +243,7 @@ async function mockServer({ eventSource = true } = {}) {
   return srv;
 }
 
-const acctOf = (srv, extra = {}) => normalizeAccount('fm', { provider: 'jmap', email: 'me@example.org', jmap: { session: `${srv.url}/.well-known/jmap` }, ...extra });
+const acctOf = (srv, extra = {}) => normalizeAccount('fm', { provider: 'jmap', email: 'me@example.org', jmap: { session: `${srv.url}/.well-known/jmap`, allowPrivate: true }, ...extra });
 const clientOf = (srv, key = KEY) => new JmapClient(acctOf(srv), { username: 'me@example.org', password: key });
 const until = async (fn, ms = 3000) => { const end = Date.now() + ms; while (!(await fn())) { if (Date.now() > end) throw new Error(`timed out: ${fn}`); await new Promise((r) => setTimeout(r, 10)); } };
 
@@ -416,9 +424,14 @@ test('sendItem: an EmailSubmission with the account\'s identity, Bcc in the enve
     assert.equal(sub.identityId, 'I-me');
     assert.deepEqual(sub.envelope, { mailFrom: { email: 'me@example.org' }, rcptTo: [{ email: 'x@example.com' }, { email: 'hidden@example.com' }] });
     assert.doesNotMatch(sub.raw, /^Bcc:/im);
-    const sent = srv.emails.get(sub.emailId);
-    assert.deepEqual(sent.mailboxIds, { 'mb-sent': true });
+    // the copy in Sent keeps the Bcc (as on IMAP): imported in place of the one submitted
+    assert.equal(srv.emails.has(sub.emailId), false);
+    const inSent = [...srv.emails.values()].filter((e) => e.mailboxIds['mb-sent']);
+    assert.equal(inSent.length, 1);
+    const sent = inSent[0];
     assert.deepEqual(sent.keywords, { $seen: true });
+    assert.match(srv.blobs.get(sent.blobId).buf.toString(), /^Bcc: hidden@example.com/m);
+    assert.deepEqual(sent.messageId, [(await simpleParser(sub.raw)).messageId.replace(/^<|>$/g, '')]);
     assert.notDeepEqual(sent.messageId, srv.emails.get(draftRaw)?.messageId);
     assert.equal(srv.emails.has(draftRaw), false);
     const now = await ac.createMessage({ to: ['y@example.com'], subject: 'Direct', body: 'b', send: true });
@@ -489,7 +502,7 @@ test('errors: a refused key is MAIL_AUTH; a 5xx, an unreachable server and a met
     srv.methodError = 'Email/query';
     await assert.rejects(c.findInbox(), (e) => e.code !== 'MAIL_AUTH' && /refused Email\/query: invalidArguments/.test(e.message));
   } finally { await srv.close(); }
-  const gone = new JmapClient(normalizeAccount('x', { provider: 'jmap', email: 'me@example.org', jmap: { session: srv.url + '/.well-known/jmap' } }), { password: KEY });
+  const gone = new JmapClient(normalizeAccount('x', { provider: 'jmap', email: 'me@example.org', jmap: { session: srv.url + '/.well-known/jmap', allowPrivate: true } }), { password: KEY });
   await assert.rejects(gone.findInbox(), (e) => e.code === 'MAIL_NETWORK');
 });
 
@@ -561,4 +574,214 @@ test('stream: a refused key reaches the auth gate after a refresh; no eventSourc
     await until(() => off.length > 0);
     assert.deepEqual(off, ['off']);
   } finally { await quiet.close(); }
+});
+
+// --- where the key may go (no real server is reached: fetch and DNS are stubbed) -----------------------------
+
+const PUBLIC_ADDR = [{ address: '93.184.216.34', family: 4 }];
+const fakeSession = (over = {}) => ({
+  capabilities: { 'urn:ietf:params:jmap:core': { maxObjectsInGet: 500 }, 'urn:ietf:params:jmap:mail': {}, 'urn:ietf:params:jmap:submission': {} },
+  primaryAccounts: { 'urn:ietf:params:jmap:mail': ACCOUNT, 'urn:ietf:params:jmap:submission': ACCOUNT },
+  apiUrl: 'https://api.mail.example/jmap/api/',
+  downloadUrl: 'https://api.mail.example/jmap/download/{accountId}/{blobId}/{name}?accept={type}',
+  uploadUrl: 'https://api.mail.example/jmap/upload/{accountId}/',
+  eventSourceUrl: 'https://api.mail.example/jmap/event/?types={types}&closeafter={closeafter}&ping={ping}',
+  state: 's1',
+  ...over
+});
+/** A client of https://api.mail.example with fetch answered by `route(url)` and DNS by `addrs(host)`; what was fetched and looked up is recorded. */
+async function stubbed({ session = 'https://api.mail.example/jmap/session', route, addrs = () => PUBLIC_ADDR }, fn) {
+  const fetched = [];
+  const looked = [];
+  const was = globalThis.fetch;
+  globalThis.fetch = async (url, init) => { fetched.push({ url: String(url), auth: init?.headers?.Authorization }); return route(String(url)) || new Response('no', { status: 404 }); };
+  try {
+    const c = new JmapClient(normalizeAccount('x', { provider: 'jmap', email: 'me@example.org', jmap: { session } }), { password: KEY }, { lookup: async (h, o) => { assert.equal(o.all, true); looked.push(h); return addrs(h); } });
+    await fn(c, { fetched, looked });
+  } finally { globalThis.fetch = was; }
+}
+const unsafe = (re) => (e) => e.code === 'JMAP_UNSAFE' && (!re || re.test(e.message));
+
+test('session redirects: never followed to another origin (another host, or http) with the key', async () => {
+  for (const location of ['https://elsewhere.example/jmap/session', 'http://api.mail.example/jmap/session', 'https://api.mail.example:8443/jmap/session']) {
+    await stubbed({ session: 'https://api.mail.example/.well-known/jmap', route: (u) => (u.endsWith('/.well-known/jmap') ? new Response(null, { status: 307, headers: { Location: location } }) : Response.json(fakeSession())) }, async (c, { fetched }) => {
+      await assert.rejects(c.session(), unsafe(/redirects/));
+      assert.deepEqual(fetched.map((f) => f.url), ['https://api.mail.example/.well-known/jmap']);
+    });
+  }
+  // the same origin is followed
+  await stubbed({ session: 'https://api.mail.example/.well-known/jmap', route: (u) => (u.endsWith('/.well-known/jmap') ? new Response(null, { status: 307, headers: { Location: '/jmap/session' } }) : Response.json(fakeSession())) }, async (c, { fetched }) => {
+    assert.equal((await c.session()).url, 'https://api.mail.example/jmap/session');
+    assert.equal(fetched.length, 2);
+  });
+  // and on the 127.0.0.1 mock (allowPrivate) a redirect to another host is refused too
+  const srv = await mockServer();
+  try {
+    srv.redirectTo = `http://localhost:${new URL(srv.url).port}/jmap/session`;
+    await assert.rejects(clientOf(srv).session(), unsafe());
+    assert.deepEqual(srv.requests, ['GET /.well-known/jmap']);
+  } finally { await srv.close(); }
+});
+
+test('session URLs: api, upload and event source https on the session\'s host; download https, elsewhere only on a public name', async () => {
+  const refused = [
+    { apiUrl: 'https://other.example/jmap/api/' },
+    { apiUrl: 'http://api.mail.example/jmap/api/' },
+    { uploadUrl: 'https://other.example/up/{accountId}/' },
+    { eventSourceUrl: 'https://other.example/ev/' },
+    { eventSourceUrl: 'http://api.mail.example/ev/' },
+    { downloadUrl: 'http://api.mail.example/dl/{blobId}' },
+    { downloadUrl: 'https://10.0.0.7/dl/{blobId}' },
+    { downloadUrl: 'https://[fd00::1]/dl/{blobId}' },
+    { downloadUrl: 'https://localhost/dl/{blobId}' },
+    { downloadUrl: 'https://files.local/dl/{blobId}' },
+    { downloadUrl: 'https://blobs.corp.internal/dl/{blobId}' },
+    { downloadUrl: 'https://nas.lan/dl/{blobId}' }
+  ];
+  for (const over of refused) {
+    await stubbed({ route: () => Response.json(fakeSession(over)) }, async (c) => {
+      await assert.rejects(c.session(), unsafe(), JSON.stringify(over));
+    });
+  }
+  // Fastmail's layout: the session on api.fastmail.com, downloads on www.fastmailusercontent.com
+  await stubbed({ session: 'https://api.fastmail.com/jmap/session', route: () => Response.json(fakeSession({ apiUrl: 'https://api.fastmail.com/jmap/api/', uploadUrl: 'https://api.fastmail.com/jmap/upload/{accountId}/', eventSourceUrl: 'https://api.fastmail.com/jmap/event/', downloadUrl: 'https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}' })) }, async (c) => {
+    assert.match((await c.session()).downloadUrl, /fastmailusercontent/);
+  });
+  // a session URL that is an IP literal: only under allowPrivate
+  await stubbed({ session: 'https://93.184.216.34/jmap/session', route: () => Response.json(fakeSession()) }, async (c, { fetched }) => {
+    await assert.rejects(c.session(), unsafe(/IP address/));
+    assert.equal(fetched.length, 0);
+  });
+});
+
+test('private addresses: a host that resolves to one is refused before anything is sent; each host is looked up once', async () => {
+  for (const bad of ['10.1.2.3', '172.20.0.1', '192.168.1.1', '127.0.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', 'fd12:3456::1', 'fe80::1', '::ffff:93.184.216.34']) {
+    await stubbed({ route: () => Response.json(fakeSession()), addrs: () => [PUBLIC_ADDR[0], { address: bad, family: bad.includes(':') ? 6 : 4 }] }, async (c, { fetched }) => {
+      await assert.rejects(c.session(), unsafe(/private address/), bad);
+      assert.equal(fetched.length, 0);
+    });
+  }
+  await stubbed({ route: (u) => (u.includes('/api/') ? Response.json({ methodResponses: [['Email/get', { state: 'x', list: [] }, '0']], sessionState: 's1' }) : Response.json(fakeSession())) }, async (c, { fetched, looked }) => {
+    await c.emailState();
+    await c.emailState();
+    assert.equal(fetched.length, 3);
+    assert.ok(fetched.every((f) => f.auth === `Bearer ${KEY}`));
+    assert.deepEqual(looked, ['api.mail.example']);
+  });
+  // a lookup that fails is a network error, tried again next time
+  let n = 0;
+  await stubbed({ route: () => Response.json(fakeSession()), addrs: () => { if (n++ === 0) throw Object.assign(new Error('nope'), { code: 'ENOTFOUND' }); return PUBLIC_ADDR; } }, async (c) => {
+    await assert.rejects(c.session(), (e) => e.code === 'MAIL_NETWORK');
+    assert.equal((await c.session()).accountId, ACCOUNT);
+  });
+});
+
+test('403: on the session fetch it is MAIL_AUTH; on any other request a failure with its status', async () => {
+  const srv = await mockServer();
+  try {
+    srv.failNext.push(403);
+    await assert.rejects(clientOf(srv).session(), (e) => e.code === 'MAIL_AUTH' && e.status === 403);
+    const c = clientOf(srv);
+    await c.session();
+    srv.failNext.push(403);
+    await assert.rejects(c.findInbox(), (e) => e.code !== 'MAIL_AUTH' && e.status === 403);
+    await c.findInbox();
+  } finally { await srv.close(); }
+});
+
+test('send: an answer that never comes keeps the email (SEND_UNKNOWN); only a refusal destroys it', async () => {
+  const srv = await mockServer();
+  try {
+    const c = clientOf(srv);
+    srv.dropAfter = 'EmailSubmission/set';
+    await assert.rejects(c.createMessage({ to: ['y@example.com'], subject: 'cut', body: 'b', send: true }), (e) => e.code === 'SEND_UNKNOWN' && e.message === 'the server may have sent it: check Sent before sending again');
+    assert.equal(srv.submissions.length, 1);
+    assert.ok(srv.emails.has(srv.submissions[0].emailId)); // kept
+    srv.dropAfter = null;
+    // a timeout, from sendItem: the draft and the copy both stay
+    const ac = new AccountClient('fm', c);
+    const d = await ac.createMessage({ to: ['z@example.com'], subject: 'slow', body: 'b' });
+    srv.hangAfter = 'EmailSubmission/set';
+    c.timeoutMs = 300;
+    await assert.rejects(ac.sendItem(d.draftId, d.changeKey), (e) => e.code === 'SEND_UNKNOWN');
+    assert.ok(srv.emails.has(splitId(d.draftId).rawId));
+    assert.ok(srv.emails.has(srv.submissions[1].emailId));
+    srv.hangAfter = null;
+    c.timeoutMs = 60_000;
+    // notCreated: not sent, the copy goes
+    srv.refuseSubmission = true;
+    const before = srv.emails.size;
+    await assert.rejects(c.createMessage({ to: ['y@example.com'], subject: 'no', body: 'b', send: true }), (e) => e.code !== 'SEND_UNKNOWN' && /forbiddenToSend/.test(e.message));
+    assert.equal(srv.emails.size, before);
+  } finally { await srv.close(); }
+});
+
+test('sending with Bcc: the copy in Sent keeps it; when that copy cannot be made the send still succeeds', async () => {
+  const srv = await mockServer();
+  try {
+    const c = clientOf(srv);
+    const r = await c.createMessage({ to: ['y@example.com'], bcc: ['h@example.com'], subject: 'b', body: 'b', send: true });
+    assert.equal(r.sent, true);
+    assert.equal(srv.emails.has(srv.submissions[0].emailId), false);
+    assert.doesNotMatch(srv.submissions[0].raw, /^Bcc:/im);
+    assert.deepEqual(srv.submissions[0].envelope.rcptTo, [{ email: 'y@example.com' }, { email: 'h@example.com' }]);
+    const kept = srv.emails.get(r.draftId);
+    assert.deepEqual(kept.mailboxIds, { 'mb-sent': true });
+    assert.deepEqual(kept.keywords, { $seen: true });
+    assert.match(srv.blobs.get(kept.blobId).buf.toString(), /^Bcc: h@example.com/m);
+    srv.refuseSentImport = true;
+    const r2 = await c.createMessage({ to: ['y@example.com'], bcc: ['h@example.com'], subject: 'b2', body: 'b', send: true });
+    assert.equal(r2.sent, true);
+    assert.equal(r2.draftId, srv.submissions[1].emailId); // the submitted copy stays in Sent
+    assert.deepEqual(srv.emails.get(r2.draftId).mailboxIds, { 'mb-sent': true });
+  } finally { await srv.close(); }
+});
+
+test('maxObjectsInGet: listings, sentTo and threads get their Emails in chunks the server takes', async () => {
+  const srv = await mockServer();
+  try {
+    srv.maxGet = 2;
+    for (let i = 0; i < 5; i++) await srv.add({ from: 'a@example.com', to: 'me@example.org', subject: `m${i}`, messageId: `<m${i}@x>`, ...(i ? { inReplyTo: '<m0@x>' } : {}) }, { receivedAt: `2026-11-0${i + 1}T00:00:00Z` });
+    for (let i = 0; i < 3; i++) await srv.add({ from: 'me@example.org', to: `p${i}@example.com`, subject: `s${i}` }, { mailbox: 'mb-sent', receivedAt: `2026-11-1${i}T00:00:00Z` });
+    const c = clientOf(srv);
+    assert.deepEqual((await c.findInbox({ limit: 5 })).map((i) => i.subject), ['m4', 'm3', 'm2', 'm1', 'm0']);
+    assert.deepEqual((await c.findInbox({ limit: 2 })).map((i) => i.subject), ['m4', 'm3']);
+    assert.deepEqual((await c.sentTo()).map((s) => s.to[0]), ['p0@example.com', 'p1@example.com', 'p2@example.com']);
+    const thread = srv.emails.get([...srv.emails.keys()][0]).threadId;
+    assert.equal((await c.findThread({ folder: 'inbox', threadId: thread })).length, 5);
+  } finally { await srv.close(); }
+});
+
+test('stream: Email state changes call onDraftsChange next to onNewMail', async () => {
+  const srv = await mockServer();
+  let told = 0;
+  let drafts = 0;
+  const stream = new JmapStream({ account: acctOf(srv), creds: { password: KEY }, onNewMail: () => told++, onDraftsChange: () => drafts++, retryMs: 20 });
+  try {
+    stream.start();
+    await until(() => stream.emailState != null);
+    await new AccountClient('fm', clientOf(srv)).createMessage({ to: ['x@example.com'], subject: 'd', body: 'b' });
+    await until(() => drafts >= 1 && told >= 1);
+  } finally { stream.stop(); await srv.close(); }
+});
+
+test('stream: a failure after the event source opened closes it; a stop during the session fetch opens nothing', async () => {
+  const srv = await mockServer();
+  const stream = new JmapStream({ account: acctOf(srv), creds: { password: KEY }, retryMs: 60_000 });
+  try {
+    srv.methodError = 'Email/get'; // emailState() fails once listening
+    stream.start();
+    await until(() => srv.sseOpened === 1);
+    await until(() => srv.sse.size === 0); // the body was closed, not left open
+  } finally { stream.stop(); await srv.close(); }
+
+  const srv2 = await mockServer();
+  try {
+    const s2 = new JmapStream({ account: acctOf(srv2), creds: { password: KEY }, retryMs: 20 });
+    s2.start();
+    s2.stop();
+    await until(() => srv2.requests.includes('GET /jmap/session'));
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(srv2.sseOpened, 0);
+  } finally { await srv2.close(); }
 });
