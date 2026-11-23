@@ -61,10 +61,7 @@ export class ImapStream {
     let failures = 0;
     while (!this.stopped) {
       if (this.authGate?.blocked?.()) { await sleep(30000); continue; }
-      // a server that stops answering without hanging up is a dead connection: known within seconds, not minutes
-      const client = new ImapFlow({ ...(await imapOptionsNow(this.account, this.creds)), disableAutoIdle: true, socketTimeout: 20000 });
-      this.asker = client;
-      client.on('error', () => {}); // surfaced through the awaiting command
+      let client = null;
       /** Where the inbox stands. A refusal comes back as `false`, not as an error: it is one here. */
       const stand = async () => {
         const s = await client.status(inbox, { uidNext: true, uidValidity: true });
@@ -72,6 +69,11 @@ export class ImapStream {
         return { next: Number(s.uidNext), validity: String(s.uidValidity ?? '') };
       };
       try {
+        // (inside the guard: a sign-in token not to be had just now is one more failure, tried again later)
+        // a server that stops answering without hanging up is a dead connection: known within seconds, not minutes
+        client = new ImapFlow({ ...(await imapOptionsNow(this.account, this.creds)), disableAutoIdle: true, socketTimeout: 20000 });
+        this.asker = client;
+        client.on('error', () => {}); // surfaced through the awaiting command
         await client.connect();
         let at = await stand();
         let healthy = 0;
@@ -95,7 +97,7 @@ export class ImapStream {
         if (++failures === 3) this.log(`asking for new mail keeps failing (${e.message}): waiting to be told meanwhile`);
       } finally {
         this.asker = null;
-        try { client.close(); } catch {}
+        try { client?.close(); } catch {}
       }
       if (!this.stopped) await sleep(Math.min(60000, 2000 * 2 ** Math.min(failures, 5)));
     }

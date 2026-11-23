@@ -38,8 +38,10 @@ export function idTokenClaims(idToken) {
   try {
     const c = JSON.parse(Buffer.from(String(idToken).split('.')[1], 'base64url').toString('utf8'));
     const email = [c.email, c.preferred_username, c.upn].find((v) => typeof v === 'string' && /^[^\s@<>"]{1,64}@[^\s@<>"]{1,253}$/.test(v)) ?? null;
-    return { email: email ? email.toLowerCase() : null, name: typeof c.name === 'string' ? c.name.slice(0, 120) : '', tenant: typeof c.tid === 'string' ? c.tid : null, personal: c.tid === MICROSOFT_PERSONAL_TENANT };
-  } catch { return { email: null, name: '', tenant: null, personal: false }; }
+    // who it is, for good: the tenant and the object id (an address can change hands; these do not)
+    const id = typeof c.tid === 'string' && typeof c.oid === 'string' ? `${c.tid}:${c.oid}` : typeof c.sub === 'string' && typeof c.iss === 'string' ? `${c.iss}#${c.sub}` : null;
+    return { email: email ? email.toLowerCase() : null, name: typeof c.name === 'string' ? c.name.slice(0, 120) : '', tenant: typeof c.tid === 'string' ? c.tid : null, personal: c.tid === MICROSOFT_PERSONAL_TENANT, id };
+  } catch { return { email: null, name: '', tenant: null, personal: false, id: null }; }
 }
 
 export const DEFAULT_MICROSOFT_HINT = () => 'sign in to Microsoft again';
@@ -63,6 +65,18 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
   const tokenStore = () => {
     if (!store || typeof store.get !== 'function' || typeof store.set !== 'function') throw new Error('Microsoft sign-in: no token store');
     return store;
+  };
+  /**
+   * Change what is stored of an account, compared and written in one step when the store can (`update(account,
+   * fn)`: across processes, the daemon renewing while the web app signs in again). `fn(now)` returns what to write,
+   * or undefined to write nothing.
+   */
+  const change = async (account, fn) => {
+    const s = tokenStore();
+    if (typeof s.update === 'function') return s.update(account, fn);
+    const next = fn(await load(account));
+    if (next !== undefined) await s.set(account, next);
+    return next;
   };
   const load = async (account) => {
     const t = await tokenStore().get(account);
@@ -141,8 +155,8 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
         if (abort.signal.aborted) throw cancelled();
         if (!t.refresh_token) throw signInError('Microsoft did not return a refresh token', 'SIGN_IN_FAILED');
         const who = idTokenClaims(t.id_token);
-        if (!who.email) throw signInError('Microsoft did not say which address signed in', 'SIGN_IN_FAILED');
-        let stored = { refresh_token: t.refresh_token, access_token: t.access_token, expires_at: Date.now() + (t.expires_in || 3600) * 1000, scope: t.scope || '', email: who.email, name: who.name, personal: who.personal, tenant: who.tenant, signed_in_at: new Date().toISOString() };
+        if (!who.email || !who.id) throw signInError('Microsoft did not say who signed in', 'SIGN_IN_FAILED');
+        let stored = { refresh_token: t.refresh_token, access_token: t.access_token, expires_at: Date.now() + (t.expires_in || 3600) * 1000, scope: t.scope || '', email: who.email, name: who.name, personal: who.personal, tenant: who.tenant, identity: who.id, signed_in_at: new Date().toISOString() };
         if (accept) {
           const verdict = await accept({ ...stored }, { signal: abort.signal });
           if (abort.signal.aborted) throw cancelled();
@@ -183,16 +197,17 @@ export function microsoftAuth({ store, clientId, client: clientOf, signInHint = 
       if (err.oauthError === 'invalid_grant' || err.oauthError === 'interaction_required') {
         const now = await load(account);
         if (now?.refresh_token && now.refresh_token !== t.refresh_token) return accessToken(account);
-        if (now && !now.refused_at) { try { await tokenStore().set(account, { ...now, refused_at: new Date().toISOString() }); } catch { /* said below */ } }
+        try { await change(account, (cur) => (cur?.refresh_token === t.refresh_token && !cur.refused_at ? { ...cur, refused_at: new Date().toISOString() } : undefined)); } catch { /* said below */ }
         throw authError(`Microsoft no longer accepts the sign-in for "${account}" — ${hint(account)}`);
       }
       throw err;
     }
-    // written over what is stored now, only if it is still the sign-in renewed: never over a newer one
-    const now = await load(account);
-    if (now?.refresh_token !== t.refresh_token) return fresh.access_token;
-    const { refused_at: _r, ...kept } = now;
-    await tokenStore().set(account, { ...kept, access_token: fresh.access_token, refresh_token: fresh.refresh_token || now.refresh_token, expires_at: Date.now() + (fresh.expires_in || 3600) * 1000 });
+    // written over what is stored now, only if it is still the sign-in renewed (never over a newer one, nor a removed one)
+    await change(account, (now) => {
+      if (now?.refresh_token !== t.refresh_token) return undefined;
+      const { refused_at: _r, ...kept } = now;
+      return { ...kept, access_token: fresh.access_token, refresh_token: fresh.refresh_token || now.refresh_token, expires_at: Date.now() + (fresh.expires_in || 3600) * 1000 };
+    });
     return fresh.access_token;
   }
 

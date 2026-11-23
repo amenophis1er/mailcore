@@ -53,7 +53,11 @@ export function imapOptions(acct, creds) {
 export async function imapOptionsNow(acct, creds) {
   if (typeof creds?.oauth !== 'function') return imapOptions(acct, creds);
   let accessToken;
-  try { accessToken = await creds.oauth(); } catch (e) { throw Object.assign(e instanceof Error ? e : new Error(String(e)), { code: e?.code ?? 'MAIL_AUTH' }); }
+  try { accessToken = await creds.oauth(); } catch (e) {
+    // a sign-in refused (MAIL_AUTH) is said as such; anything else (offline, the provider down, a timeout) passes
+    if (e?.code === 'MAIL_AUTH') throw e;
+    throw Object.assign(new Error(`no sign-in token for now (${e?.message || e})`, { cause: e }), { code: 'MAIL_NETWORK' });
+  }
   return imapOptions(acct, { ...creds, accessToken });
 }
 
@@ -866,6 +870,8 @@ export class ImapClient {
     try {
       await transport.sendMail({ raw, envelope });
     } catch (e) {
+      // Microsoft 365 with SMTP sign-in turned off for the mailbox (its organisation's default): not a wrong sign-in
+      if (/5\.7\.139|SmtpClientAuthentication/i.test(String(e?.response || e?.message || ''))) throw new Error('sending is turned off for this mailbox by its organisation (SMTP AUTH): its administrator can turn it on; the draft is kept');
       throw tagAuth(e);
     } finally {
       transport.close();
