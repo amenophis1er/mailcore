@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { z } from 'zod';
 import { createMailcore } from '../src/index.js';
-import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, EFFECTS } from 'mailcore/tools';
+import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, EFFECTS } from '@sideora/mailcore/tools';
 
-// tools/list of MailWatcher's MCP server (allowSend on) before the tools moved here
+// tools/list of an app's MCP server (allowSend on) serving these tools
 const FIXTURE = JSON.parse(fs.readFileSync(new URL('./fixtures/mcp-tools.json', import.meta.url), 'utf8'));
 const core = () => createMailcore({ accounts: { work: { provider: 'ews', host: 'https://x', email: 'me@x' } }, credentials: { getPassword: async () => ({ password: 'x' }) }, dataDir: '/nonexistent/mailcore' });
 
@@ -41,7 +41,7 @@ test('every tool has a name, a description, a zod object schema, an effect and r
 });
 
 test('names, descriptions and schemas match the MCP server they came from', () => {
-  const tools = mailTools({ allowSend: true, attachmentsLabel: '~/.mailwatcher/attachments' });
+  const tools = mailTools({ allowSend: true, attachmentsLabel: '~/.app/attachments' });
   assert.deepEqual(tools.map((t) => t.name), FIXTURE.map((t) => t.name));
   for (const [i, t] of tools.entries()) {
     const f = FIXTURE[i];
@@ -58,8 +58,8 @@ test('without allowSend there is no send_draft, and the instructions say sending
   assert.ok(!names.includes('send_draft'));
   assert.equal(names.length, Object.keys(EXPECTED).length - 1);
   assert.match(mailInstructions({ allowSend: false }), /disabled here \(mcp\.allowSend is off\)/);
-  assert.match(mailInstructions({ allowSend: true }), /^mailwatcher: the user's mailboxes/);
-  assert.match(mailInstructions({ allowSend: true, name: 'deputy' }), /^deputy: /);
+  assert.match(mailInstructions({ allowSend: true }), /^mailcore: the user's mailboxes/);
+  assert.match(mailInstructions({ allowSend: true, name: 'an-app' }), /^an-app: /);
   assert.equal(MAIL_INSTRUCTIONS, mailInstructions({ allowSend: false }));
 });
 

@@ -1,4 +1,4 @@
-// The encrypted cache (src/cache.js) as MailWatcher grew it: the HTML a mail
+// The encrypted cache (src/cache.js) as an app grew it: the HTML a mail
 // does or does not have, flags, sent threads, differences applied, people.
 // Each test gets a throwaway data directory and key.
 

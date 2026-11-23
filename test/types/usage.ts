@@ -1,6 +1,6 @@
 // Compiled (not run) by `npm run typecheck`: the public API as a strict
 // NodeNext TypeScript consumer sees it.
-import { createMailcore, EventLog, matchRule, parseWhen, googleContacts, googleContactOf, type Mailcore, type ListItem, type CredentialsProvider, type GoogleContact, type GoogleContactsResult } from 'mailcore';
+import { createMailcore, EventLog, matchRule, parseWhen, googleContacts, googleContactOf, type Mailcore, type ListItem, type CredentialsProvider, type GoogleContact, type GoogleContactsResult } from '@sideora/mailcore';
 
 const credentials: CredentialsProvider = {
   async getPassword(account, { refresh }) {
@@ -45,7 +45,7 @@ async function main(): Promise<void> {
   const closed: Promise<void> = c.close();
   await closed;
   console.log(cached.length);
-  // what MailWatcher's daemon and panel use
+  // what an app's daemon and panel use
   const flagged = await mc.find('work', { flaggedOnly: true });
   const moved: Map<string, string | null> = await mc.moveItems(flagged.map((i) => i.id), 'archive', { onError: (a, e) => console.error(a, e.message) });
   await mc.setFlag(flagged[0]!.id, false);
@@ -65,7 +65,7 @@ async function main(): Promise<void> {
 }
 void main;
 
-import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, type MailTool, type MailToolEffect } from 'mailcore/tools';
+import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, type MailTool, type MailToolEffect } from '@sideora/mailcore/tools';
 const manifest: MailTool[] = mailTools({ allowSend: false }); // no core needed
 const text: string = MAIL_INSTRUCTIONS;
 void manifest; void text;
@@ -76,6 +76,6 @@ async function tools(core: Mailcore): Promise<void> {
     const effect: MailToolEffect = t.effectFor ? await t.effectFor(core, parsed) : t.effect;
     if (effect !== 'others') console.log(t.name, await t.run(core, parsed, { signal: AbortSignal.timeout(1000) }));
   }
-  console.log(mailInstructions({ allowSend: false, name: 'deputy' }));
+  console.log(mailInstructions({ allowSend: false, name: 'an-app' }));
 }
 void tools;

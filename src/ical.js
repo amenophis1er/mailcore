@@ -1,11 +1,9 @@
-// iCalendar for the CalDAV backend: reading objects into MailWatcher events
+// iCalendar for the CalDAV backend: reading objects into mailcore events
 // (recurrences expanded by node-ical, attendees and the owner's response
 // read from ATTENDEE lines), and writing them — a new event as a whole
 // VCALENDAR, a change made line by line so whatever we do not touch (alarms,
 // a rule's exceptions, a client's own properties) stays as it was.
-//
-// Ported from Amen's buddi calendar plugin (Apache-2.0) and extended with
-// scheduling properties (ORGANIZER, ATTENDEE, PARTSTAT, STATUS).
+// Scheduling properties (ORGANIZER, ATTENDEE, PARTSTAT, STATUS) included.
 
 import ical from 'node-ical';
 
@@ -227,7 +225,7 @@ function localDate(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pa
 
 /**
  * Every occurrence of the VEVENTs in `data` overlapping [from, to), as
- * MailWatcher events (without ids — the caller adds them). `self` is the
+ * mailcore events (without ids — the caller adds them). `self` is the
  * account's address, for myResponse.
  */
 export function occurrences(data, { from, to, timeZone, self, calendarName }) {
@@ -331,7 +329,7 @@ function alarmMinutes(alarm) {
   return (Number(m[1] || 0) * 1440) + (Number(m[2] || 0) * 60) + Number(m[3] || 0);
 }
 
-/** The master event of `uid` in an object, as one MailWatcher event (full). */
+/** The master event of `uid` in an object, as one mailcore event (full). */
 export function readEvent(data, uid, { timeZone, self, calendarName }) {
   const lines = unfold(data);
   const { master, overrides } = veventBlocks(lines, uid);

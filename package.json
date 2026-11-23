@@ -1,7 +1,27 @@
 {
-  "name": "mailcore",
-  "version": "0.1.0",
-  "description": "Mail and calendar accounts (Exchange/EWS, IMAP+SMTP, CalDAV, Google) with push, an encrypted cache, drafts and calendars — configuration and secrets handed in by the caller",
+  "name": "@sideora/mailcore",
+  "version": "0.2.0",
+  "description": "Mail and calendar accounts for Node: Exchange (EWS), IMAP/SMTP, JMAP, CalDAV, Google and Microsoft 365, with push, an encrypted cache, drafts and MCP-ready tools. The caller supplies accounts and secrets.",
+  "keywords": [
+    "email",
+    "imap",
+    "smtp",
+    "jmap",
+    "ews",
+    "exchange",
+    "caldav",
+    "google-calendar",
+    "microsoft-365",
+    "oauth2",
+    "mcp"
+  ],
+  "homepage": "https://github.com/amenophis1er/mailcore#readme",
+  "bugs": {
+    "url": "https://github.com/amenophis1er/mailcore/issues"
+  },
+  "repository": "github:amenophis1er/mailcore",
+  "license": "LICENSE-PENDING",
+  "author": "908 Studio <hello@sideora.com>",
   "type": "module",
   "main": "./src/index.js",
   "types": "./index.d.ts",
@@ -18,8 +38,8 @@
   "files": [
     "src",
     "index.d.ts",
-    "README.md",
-    "tools.d.ts"
+    "tools.d.ts",
+    "README.md"
   ],
   "engines": {
     "node": ">=20"
@@ -28,7 +48,6 @@
     "test": "node --test",
     "typecheck": "tsc -p test/types"
   },
-  "license": "ISC",
   "dependencies": {
     "better-sqlite3-multiple-ciphers": "^13.0.3",
     "fast-xml-parser": "^5.11.2",
@@ -45,5 +64,8 @@
   },
   "peerDependencies": {
     "zod": "^4.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

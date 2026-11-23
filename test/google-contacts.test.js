@@ -184,11 +184,11 @@ test('a contact is added as Google takes it, and comes back as Google keeps it',
   const fetch = async (url, init) => {
     sent.push({ url: new URL(String(url)), init });
     const p = JSON.parse(init.body);
-    return json(200, { resourceName: 'people/c42', ...p, names: [{ displayName: 'Jeune Group Cargo', metadata: { primary: true } }] });
+    return json(200, { resourceName: 'people/c42', ...p, names: [{ displayName: 'Example Co.', metadata: { primary: true } }] });
   };
   const made = await googleCreateContact('gmail', {
-    name: 'Jeune Group Cargo', emails: ['info@cargo.example', 'INFO@cargo.example', 'not an address'], phones: ['+228 70 08 36 36', { number: '+1 929 351 7603', kind: 'WhatsApp' }, 'none'],
-    addresses: [{ text: '623 Melrose Ave\nBronx, NY 10455', kind: 'work' }], company: 'Jeune Group SARL U', note: 'From a flyer', urls: ['javascript:alert(1)', 'https://cargo.example']
+    name: 'Example Co.', emails: ['info@example.com', 'INFO@example.com', 'not an address'], phones: ['+1 555 0100', { number: '+1 555 0101', kind: 'WhatsApp' }, 'none'],
+    addresses: [{ text: '1 Example Street\nSpringfield, ST 00000', kind: 'work' }], company: 'Example Co. Ltd', note: 'A test note', urls: ['javascript:alert(1)', 'https://example.com']
   }, { accessToken: token(), fetch });
   assert.equal(sent.length, 1);
   const { url, init } = sent[0];
@@ -196,15 +196,15 @@ test('a contact is added as Google takes it, and comes back as Google keeps it',
   assert.equal(url.pathname, '/v1/people:createContact');
   assert.match(url.searchParams.get('personFields'), /emailAddresses/);
   const body = JSON.parse(init.body);
-  assert.deepEqual(body.names, [{ unstructuredName: 'Jeune Group Cargo' }]);
-  assert.deepEqual(body.emailAddresses, [{ value: 'info@cargo.example' }]);
-  assert.deepEqual(body.phoneNumbers, [{ value: '+228 70 08 36 36' }, { value: '+1 929 351 7603', type: 'whatsapp' }]);
-  assert.deepEqual(body.addresses, [{ formattedValue: '623 Melrose Ave\nBronx, NY 10455', type: 'work' }]);
-  assert.deepEqual(body.urls, [{ value: 'https://cargo.example' }]);
-  assert.deepEqual(body.organizations, [{ name: 'Jeune Group SARL U' }]);
+  assert.deepEqual(body.names, [{ unstructuredName: 'Example Co.' }]);
+  assert.deepEqual(body.emailAddresses, [{ value: 'info@example.com' }]);
+  assert.deepEqual(body.phoneNumbers, [{ value: '+1 555 0100' }, { value: '+1 555 0101', type: 'whatsapp' }]);
+  assert.deepEqual(body.addresses, [{ formattedValue: '1 Example Street\nSpringfield, ST 00000', type: 'work' }]);
+  assert.deepEqual(body.urls, [{ value: 'https://example.com' }]);
+  assert.deepEqual(body.organizations, [{ name: 'Example Co. Ltd' }]);
   assert.equal(made.id, 'people/c42');
   assert.equal(made.kind, 'saved');
-  assert.equal(made.email, 'info@cargo.example');
+  assert.equal(made.email, 'info@example.com');
 });
 
 test('adding: a company alone, made by Google, is told by its id (not taken for a failure, which would make it again)', async () => {

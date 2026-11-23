@@ -219,7 +219,7 @@ export class MailWatch extends EventEmitter {
     const known = (id) => seen.has(id) || seen.has(id.slice(account.length + 1));
     // A mail moved out of the inbox and back (an archive taken back, a restore from the trash) comes back
     // under a new id. It is the same mail, by its Message-ID: not new, and not to be alerted about again.
-    // The set is shared by all accounts on purpose (as in MailWatcher): one mail delivered to two of my
+    // The set is shared by all accounts on purpose: one mail delivered to two of my
     // accounts is announced once, by whichever account polls first.
     const seenMail = new Set(state.seenMessageIds || []);
     const fresh = items.filter((i) => i.id && !known(i.id) && !(i.messageId && seenMail.has(i.messageId)));
