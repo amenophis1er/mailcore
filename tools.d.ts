@@ -1,4 +1,4 @@
-// Types for '@sideora/mailcore/tools': MCP mail and calendar tools as
+// Types for '@amenophis1er/mailcore/tools': MCP mail and calendar tools as
 // plain objects. Schemas are built with the consumer's zod (a peer dependency, ^4).
 
 import type { z } from 'zod';

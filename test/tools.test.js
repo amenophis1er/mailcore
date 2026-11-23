@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { z } from 'zod';
 import { createMailcore } from '../src/index.js';
-import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, EFFECTS } from '@sideora/mailcore/tools';
+import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, EFFECTS } from '@amenophis1er/mailcore/tools';
 
 // tools/list of an app's MCP server (allowSend on) serving these tools
 const FIXTURE = JSON.parse(fs.readFileSync(new URL('./fixtures/mcp-tools.json', import.meta.url), 'utf8'));

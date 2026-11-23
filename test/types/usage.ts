@@ -1,6 +1,6 @@
 // Compiled (not run) by `npm run typecheck`: the public API as a strict
 // NodeNext TypeScript consumer sees it.
-import { createMailcore, EventLog, matchRule, parseWhen, googleContacts, googleContactOf, type Mailcore, type ListItem, type CredentialsProvider, type GoogleContact, type GoogleContactsResult } from '@sideora/mailcore';
+import { createMailcore, EventLog, matchRule, parseWhen, googleContacts, googleContactOf, type Mailcore, type ListItem, type CredentialsProvider, type GoogleContact, type GoogleContactsResult } from '@amenophis1er/mailcore';
 
 const credentials: CredentialsProvider = {
   async getPassword(account, { refresh }) {
@@ -65,7 +65,7 @@ async function main(): Promise<void> {
 }
 void main;
 
-import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, type MailTool, type MailToolEffect } from '@sideora/mailcore/tools';
+import { mailTools, mailInstructions, MAIL_INSTRUCTIONS, type MailTool, type MailToolEffect } from '@amenophis1er/mailcore/tools';
 const manifest: MailTool[] = mailTools({ allowSend: false }); // no core needed
 const text: string = MAIL_INSTRUCTIONS;
 void manifest; void text;

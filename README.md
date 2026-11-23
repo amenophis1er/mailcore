@@ -1,4 +1,4 @@
-# @sideora/mailcore
+# @amenophis1er/mailcore
 
 Mail and calendar accounts for Node: Exchange (EWS over NTLM), IMAP + SMTP, JMAP (any RFC 8621 server, such as
 Fastmail), CalDAV (iCloud, Fastmail, any RFC 4791 server), Google Calendar, and Microsoft 365 / Outlook.com
@@ -14,15 +14,15 @@ the accounts, a credentials provider, the cache key and a data directory.
 ## Install
 
 ```sh
-npm install @sideora/mailcore
+npm install @amenophis1er/mailcore
 ```
 
-`zod` (^4) is a peer dependency, needed only for the tools (`@sideora/mailcore/tools`).
+`zod` (^4) is a peer dependency, needed only for the tools (`@amenophis1er/mailcore/tools`).
 
 ## Quick start
 
 ```js
-import { createMailcore } from '@sideora/mailcore';
+import { createMailcore } from '@amenophis1er/mailcore';
 
 const mc = createMailcore({
   accounts: {
@@ -144,7 +144,7 @@ Microsoft mailboxes are IMAP + SMTP accounts signed in with OAuth (Microsoft has
 caller keeps them.
 
 ```js
-import { createMailcore, microsoftAuth, microsoftServers } from '@sideora/mailcore';
+import { createMailcore, microsoftAuth, microsoftServers } from '@amenophis1er/mailcore';
 
 const ms = microsoftAuth({
   clientId: '<app id registered in Microsoft Entra>',   // or client: () => ({ clientId })
@@ -244,14 +244,14 @@ purpose: a mail delivered to two of your accounts emits one `mail` event, from w
 rejected: its poll, push stream and calendar refresh all wait while `blocked()`, and each tells the gate how
 sign-in went.
 
-## MCP tools (`@sideora/mailcore/tools`)
+## MCP tools (`@amenophis1er/mailcore/tools`)
 
 Mail and calendar tools as plain objects any agent host can serve in-process, ready to list as MCP tools. They are
 static, so a manifest can declare them before any instance exists; the instance comes with each call. zod (^4) is
 a peer dependency: the schemas are your zod.
 
 ```js
-import { mailTools, mailInstructions, MAIL_INSTRUCTIONS } from '@sideora/mailcore/tools';
+import { mailTools, mailInstructions, MAIL_INSTRUCTIONS } from '@amenophis1er/mailcore/tools';
 
 const tools = mailTools({ allowSend: false });    // [{ name, description, input: z.object, effect, effectFor?, run }]
 const out = await tools[0].run(mc, { limit: 5 }, { signal });   // the data an MCP server sends as JSON text
