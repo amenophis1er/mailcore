@@ -4,8 +4,9 @@
 #
 # npm: trusted publishing (OIDC), no token in the repository. Once, on npmjs.com: @amenophis1er/mailcore →
 # Settings → Trusted Publisher → GitHub Actions: user `amenophis1er`, repository `mailcore`, workflow
-# `release.yml`, no environment, label `release`; allow `npm publish`. (The repository is private: npm makes no
-# provenance statement for it.) A pre-release goes under `next` once a stable version exists, else `latest`.
+# `release.yml`, no environment, label `release`; allow `npm publish`. The package carries npm provenance: a
+# signed statement that it was built here, from this commit. A pre-release goes under `next` once a stable version
+# exists, else `latest`.
 name: release
 on:
   push:
@@ -62,7 +63,7 @@ jobs:
           echo "tgz=$tgz" >> "$GITHUB_OUTPUT"
       - name: Publish to npm
         if: steps.v.outputs.published != 'yes'
-        run: npm publish "${{ steps.pack.outputs.tgz }}" --access public --tag "${{ steps.v.outputs.tag }}"
+        run: npm publish "${{ steps.pack.outputs.tgz }}" --access public --provenance --tag "${{ steps.v.outputs.tag }}"
       - name: Already on npm
         if: steps.v.outputs.published == 'yes'
         run: echo "::notice title=Already on npm::${{ steps.v.outputs.name }}@${{ steps.v.outputs.version }} is published already; the steps after it run."

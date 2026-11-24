@@ -19,7 +19,10 @@
   "bugs": {
     "url": "https://github.com/amenophis1er/mailcore/issues"
   },
-  "repository": "github:amenophis1er/mailcore",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amenophis1er/mailcore.git"
+  },
   "license": "MIT",
   "author": "908 Studio <hello@sideora.com>",
   "type": "module",
