@@ -169,7 +169,8 @@ export class GoogleCalendar {
     return this.full({ ...res.data, etag: res.etag || res.data.etag }, calendarId, name);
   }
 
-  time({ start, end, allDay, timeZone }) {
+  /** A PATCH merges start and end: `clear` nulls the other form, or Google keeps both and refuses ("Invalid start time"). */
+  time({ start, end, allDay, timeZone }, { clear = false } = {}) {
     const tz = timeZone || this.tz;
     const s = new Date(start);
     const e = end ? new Date(end) : new Date(s.getTime() + (allDay ? 86400e3 : 1800e3));
@@ -177,9 +178,11 @@ export class GoogleCalendar {
       const startDate = dateIn(s, tz);
       let endDate = dateIn(e, tz);
       if (endDate <= startDate) endDate = addDays(startDate, 1); // DTEND exclusive; a 24h add is a day short on DST fallback
-      return { start: { date: startDate }, end: { date: endDate } };
+      const none = clear ? { dateTime: null, timeZone: null } : {};
+      return { start: { date: startDate, ...none }, end: { date: endDate, ...none } };
     }
-    return { start: { dateTime: s.toISOString(), timeZone: tz }, end: { dateTime: e.toISOString(), timeZone: tz } };
+    const none = clear ? { date: null } : {};
+    return { start: { dateTime: s.toISOString(), timeZone: tz, ...none }, end: { dateTime: e.toISOString(), timeZone: tz, ...none } };
   }
 
   async createEvent({ subject, start, end, allDay = false, location, body, attendees = [], optionalAttendees = [], reminderMinutes, showAs, calendar, notify = true, timeZone }) {
@@ -205,7 +208,7 @@ export class GoogleCalendar {
     if (reminderMinutes !== undefined) patch.reminders = reminderMinutes == null ? { useDefault: true } : reminderMinutes < 0 ? { useDefault: false, overrides: [] } : { useDefault: false, overrides: [{ method: 'popup', minutes: Math.round(reminderMinutes) }] };
     if (start || end || allDay !== undefined) {
       const cur = await this.getEvent(id);
-      Object.assign(patch, this.time({ start: start || cur.start, end: end || cur.end, allDay: allDay ?? cur.allDay, timeZone }));
+      Object.assign(patch, this.time({ start: start || cur.start, end: end || cur.end, allDay: allDay ?? cur.allDay, timeZone }, { clear: true }));
     }
     if (attendees || optionalAttendees) patch.attendees = [...(attendees || []).map(mb), ...(optionalAttendees || []).map((a) => ({ ...mb(a), optional: true }))];
     if (!Object.keys(patch).length) throw new Error('updateEvent: nothing to change');
