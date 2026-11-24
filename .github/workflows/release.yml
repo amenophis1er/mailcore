@@ -1,0 +1,81 @@
+# A release: a pushed tag v<version>, the version package.json says. The gate (ci.yml) first, then the package is
+# published to npm and a GitHub release is made with its tarball. A re-run after npm took the version skips the
+# publish and does the rest.
+#
+# npm: trusted publishing (OIDC), no token in the repository. Once, on npmjs.com: @amenophis1er/mailcore →
+# Settings → Trusted Publisher → GitHub Actions: user `amenophis1er`, repository `mailcore`, workflow
+# `release.yml`, no environment, label `release`; allow `npm publish`. (The repository is private: npm makes no
+# provenance statement for it.) A pre-release goes under `next` once a stable version exists, else `latest`.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  gate:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write   # the GitHub release
+      id-token: write   # npm trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # trusted publishing needs npm 11.5.1 or newer
+      - run: npm install -g npm@11
+      - name: The tag is package.json's version
+        id: v
+        run: |
+          set -euo pipefail
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          [ "$GITHUB_REF" = "refs/tags/v$version" ] || { echo "::error::The tag is ${GITHUB_REF#refs/tags/}, package.json says $version."; exit 1; }
+          # what npm has: a failure to ask fails the step (a pre-release must not land on latest by accident)
+          versions=$(npm view "$name" versions --json)
+          tag=latest
+          if [[ "$version" == *-* ]] && node -e "process.exit([].concat(JSON.parse(process.argv[1])).some((x) => !String(x).includes('-')) ? 0 : 1)" "$versions"; then
+            tag=next
+          fi
+          published=$(node -e "console.log([].concat(JSON.parse(process.argv[1])).includes(process.argv[2]) ? 'yes' : '')" "$versions" "$version")
+          {
+            echo "name=$name"
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "pre=$([[ "$version" == *-* ]] && echo yes || true)"
+            echo "published=$published"
+          } >> "$GITHUB_OUTPUT"
+      - run: npm ci
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          tgz=$(npm pack --silent | tail -1)
+          [ -f "$tgz" ] || { echo "::error::npm pack made no tarball."; exit 1; }
+          echo "tgz=$tgz" >> "$GITHUB_OUTPUT"
+      - name: Publish to npm
+        if: steps.v.outputs.published != 'yes'
+        run: npm publish "${{ steps.pack.outputs.tgz }}" --access public --tag "${{ steps.v.outputs.tag }}"
+      - name: Already on npm
+        if: steps.v.outputs.published == 'yes'
+        run: echo "::notice title=Already on npm::${{ steps.v.outputs.name }}@${{ steps.v.outputs.version }} is published already; the steps after it run."
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="v${{ steps.v.outputs.version }}"
+          if gh release view "$v" >/dev/null 2>&1; then
+            gh release upload "$v" "${{ steps.pack.outputs.tgz }}" --clobber
+            exit 0
+          fi
+          gh release create "$v" --verify-tag ${{ steps.v.outputs.pre && '--prerelease' || '' }} \
+            --title "mailcore ${{ steps.v.outputs.version }}" \
+            --notes "npm: \`npm install ${{ steps.v.outputs.name }}@${{ steps.v.outputs.version }}\` (dist-tag ${{ steps.v.outputs.tag }})." \
+            "${{ steps.pack.outputs.tgz }}"

@@ -49,6 +49,27 @@ test('every Google auth error ends with the hint given, and a default one withou
   await assert.rejects(plain.google.accessToken('none'), (e) => e.message === 'account "none" is not signed in to Google — sign in to Google again');
 });
 
+test('a sign-in made with another OAuth client is refused like an expired one: noted, and the hint given', async (t) => {
+  for (const error of ['unauthorized_client']) {
+    const tokens = { g: { refresh_token: 'r', access_token: 'old', expires_at: 0 } };
+    const core = createMailcore({ accounts: { g: { provider: 'google', email: 'me@gmail.example' } }, credentials: noCreds(tokens), google: { clientId: 'new-client', clientSecret: 's' } });
+    const f = withFetch(() => json(401, { error, error_description: 'Unauthorized' }));
+    t.after(f.restore);
+    await assert.rejects(core.google.accessToken('g'), (e) => e.code === 'MAIL_AUTH' && e.message === 'Google no longer accepts the sign-in for "g" — sign in to Google again', error);
+    assert.ok(tokens.g.refused_at, `${error}: noted with the tokens`);
+    f.restore();
+  }
+});
+
+test("the app's own client refused (invalid_client): said as such, and no account is marked", async (t) => {
+  const tokens = { g: { refresh_token: 'r', access_token: 'old', expires_at: 0 } };
+  const core = createMailcore({ accounts: { g: { provider: 'google', email: 'me@gmail.example' } }, credentials: noCreds(tokens), google: { clientId: 'broken', clientSecret: 'wrong' } });
+  const f = withFetch(() => json(401, { error: 'invalid_client', error_description: 'Unauthorized' }));
+  t.after(f.restore);
+  await assert.rejects(core.google.accessToken('g'), (e) => e.code !== 'MAIL_AUTH' && /^Google refused the app's OAuth client \(invalid_client\)/.test(e.message));
+  assert.equal(tokens.g.refused_at, undefined);
+});
+
 // --- the loopback sign-in ------------------------------------------------------
 
 /** A GET to the loopback server, as a browser would send it (http, not fetch: fetch is the token endpoint's stand-in). */
