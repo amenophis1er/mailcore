@@ -95,7 +95,7 @@ export interface GoogleTokens {
   /** the scopes granted, space-separated (the token response's `scope`) */
   scope?: string;
   signed_in_at?: string;
-  /** when Google refused to renew it (invalid_grant) */
+  /** when Google refused to renew it (invalid_grant, or unauthorized_client: a sign-in of another OAuth client) */
   refused_at?: string;
   [extra: string]: unknown;
 }
@@ -725,7 +725,7 @@ export class Mailcore {
     beginLogin(account: string, opts?: GoogleSignInOptions): Promise<GoogleSignIn>;
     signedIn(account: string): Promise<boolean>;
     /** What is known of the account's sign-in, without a secret (null: not signed in). */
-    tokens(account: string): Promise<{ scopes: string[]; signedInAt?: string; /** Google refused its renewal (invalid_grant) since */ refusedAt?: string } | null>;
+    tokens(account: string): Promise<{ scopes: string[]; signedInAt?: string; /** Google refused its renewal (invalid_grant or unauthorized_client) since */ refusedAt?: string } | null>;
     /** What a Google auth error of this account tells the user to do. */
     signInHint(account: string): string;
     /** The account's Google contacts (People API: its own, and its "other contacts"), over its tokens. See googleContacts. */

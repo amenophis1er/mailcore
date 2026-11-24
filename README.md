@@ -6,7 +6,7 @@ mailboxes signed in with OAuth. Push (EWS streaming notifications, IMAP IDLE, JM
 local cache (SQLCipher), search, plain-text reads, threads, attachments, drafts and send, calendars (list, events,
 free/busy, free slots, create/update/delete/respond), and MCP-ready tools for agents.
 
-Plain JS ESM, with types in `index.d.ts`. Node 20 or later.
+Plain JS ESM, with types in `index.d.ts`. Node 22 or later.
 
 **mailcore never reads a config file, a keychain, a password manager or the environment.** The caller hands in
 the accounts, a credentials provider, the cache key and a data directory.

@@ -128,7 +128,8 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
   /**
    * What is known of an account's sign-in, without a secret: whether it holds
    * a refresh token, the scopes granted, when it signed in, and whether Google
-   * refused it since (`refusedAt`: an invalid_grant on renewal). null: none.
+   * refused it since (`refusedAt`: an invalid_grant, or an unauthorized_client — a sign-in of another OAuth
+   * client — on renewal). null: none.
    */
   async function tokens(account) {
     let t;
@@ -276,7 +277,13 @@ export function googleAuth({ store, clientId, clientSecret, client: clientOf, si
     try {
       fresh = await tokenRequest({ client_id: clientId, client_secret: clientSecret, refresh_token: t.refresh_token, grant_type: 'refresh_token' });
     } catch (err) {
-      if (/invalid_grant/.test(err.message)) {
+      // invalid_client: the app's own OAuth client is wrong (its id or secret): no sign-in can help, and no account
+      // is marked for it; once the client is right, the next renewal works as before.
+      if (/invalid_client/.test(err.message)) throw new Error(`Google refused the app's OAuth client (invalid_client): check its client id and secret. ${err.message}`);
+      // invalid_grant: the sign-in was revoked or expired; unauthorized_client: it belongs to another OAuth client
+      // than the one asked with now (an app that changed its client). Either way only a new sign-in helps, and the
+      // account says so rather than failing on every call.
+      if (/invalid_grant|unauthorized_client/.test(err.message)) {
         // a sign-in since replaced the tokens that were refused: those are the account's now
         const now = await load(account);
         if (now?.refresh_token && now.refresh_token !== t.refresh_token) return accessToken(account, { force: false });
