@@ -1,6 +1,6 @@
 {
   "name": "@amenophis1er/mailcore",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Mail and calendar accounts for Node: Exchange (EWS), IMAP/SMTP, JMAP, CalDAV, Google and Microsoft 365, with push, an encrypted cache, drafts and MCP-ready tools. The caller supplies accounts and secrets.",
   "keywords": [
     "email",
